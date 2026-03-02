@@ -87,8 +87,8 @@ struct ComposeConfig {
  * Configuration manager singleton
  *
  * Inherits from hshm BaseConfig and manages YAML configuration parsing.
- * Reads configuration from CHI_SERVER_CONF or WRP_RUNTIME_CONF environment variables.
- * CHI_SERVER_CONF is checked first; WRP_RUNTIME_CONF is used as fallback.
+ * Config lookup: CHI_SERVER_CONF env -> WRP_RUNTIME_CONF env ->
+ * ~/.chimaera/chimaera.yaml -> bare minimum defaults.
  * Uses HSHM global cross pointer variable singleton pattern.
  */
 class ConfigManager : public hshm::BaseConfig {
@@ -122,9 +122,13 @@ class ConfigManager : public hshm::BaseConfig {
   bool LoadYaml(const std::string& config_path);
 
   /**
-   * Get server configuration file path from environment
-   * Checks CHI_SERVER_CONF first, then falls back to WRP_RUNTIME_CONF
-   * @return Configuration file path or empty string if neither is set
+   * Get server configuration file path
+   * Lookup order:
+   *   1. CHI_SERVER_CONF env var
+   *   2. WRP_RUNTIME_CONF env var
+   *   3. ~/.chimaera/chimaera.yaml (if it exists)
+   *   4. Empty string (bare minimum defaults, no compose)
+   * @return Configuration file path or empty string if no config found
    */
   std::string GetServerConfigPath() const;
 
@@ -158,6 +162,12 @@ class ConfigManager : public hshm::BaseConfig {
    * @return Port number for networking
    */
   u32 GetPort() const;
+
+  /**
+   * Get server address for client connections
+   * @return Server address (default: "127.0.0.1", overridden by CHI_SERVER_ADDR)
+   */
+  std::string GetServerAddr() const;
 
   /**
    * Get neighborhood size for range query splitting
@@ -226,6 +236,12 @@ class ConfigManager : public hshm::BaseConfig {
    */
   u32 GetMaxSleep() const { return max_sleep_; }
 
+  /**
+   * Get SGD learning rate for task load prediction model
+   * @return Learning rate (default: 0.2)
+   */
+  float GetLearningRate() const { return learning_rate_; }
+
  private:
   /**
    * Set default configuration values (implements hshm::BaseConfig)
@@ -243,12 +259,12 @@ class ConfigManager : public hshm::BaseConfig {
   // Configuration parameters
   u32 num_threads_ = 4;
   u32 queue_depth_ = 1024;
-  u32 process_reaper_workers_ = 1;
 
   size_t main_segment_size_ = hshm::Unit<size_t>::Gigabytes(1);
   size_t client_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);
 
-  u32 port_ = 5555;
+  u32 port_ = 9413;
+  std::string server_addr_ = "127.0.0.1";
   u32 neighborhood_size_ = 32;
 
   // Shared memory segment names with environment variable support
@@ -268,6 +284,9 @@ class ConfigManager : public hshm::BaseConfig {
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
   u32 max_sleep_ = 50000;                    // Default: 50000us (50ms) maximum sleep
+
+  // Task load prediction model
+  float learning_rate_ = 0.2f;               // Default: 0.2 SGD learning rate
 
   // Compose configuration
   ComposeConfig compose_config_;

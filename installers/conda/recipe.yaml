@@ -28,15 +28,15 @@ build:
       # Suppress GCC false positive warnings from aggressive inlining (GCC bugs #99578, #100611)
       CXXFLAGS: "-Wno-array-bounds -Wno-maybe-uninitialized -Wno-stringop-overflow"
       # Force CMake to use only conda packages, not system libraries
-      CMAKE_PREFIX_PATH: ${{ PREFIX }}
-      PKG_CONFIG_PATH: ${{ PREFIX }}/lib/pkgconfig:${{ PREFIX }}/share/pkgconfig
+      CMAKE_PREFIX_PATH: ${PREFIX}
+      PKG_CONFIG_PATH: ${PREFIX}/lib/pkgconfig:${PREFIX}/share/pkgconfig
       # Prevent finding system libraries
-      CMAKE_FIND_ROOT_PATH: ${{ PREFIX }}
+      CMAKE_FIND_ROOT_PATH: ${PREFIX}
       CMAKE_FIND_ROOT_PATH_MODE_LIBRARY: ONLY
       CMAKE_FIND_ROOT_PATH_MODE_INCLUDE: ONLY
       CMAKE_FIND_ROOT_PATH_MODE_PACKAGE: ONLY
     content:
-      - cmake --preset=${{ preset }} -DCMAKE_INSTALL_PREFIX=${{ PREFIX }} -DCMAKE_PREFIX_PATH=${{ PREFIX }} -DCMAKE_FIND_ROOT_PATH=${{ PREFIX }}
+      - cmake --preset=${{ preset }} -DCMAKE_INSTALL_PREFIX=${PREFIX} -DCMAKE_PREFIX_PATH=${PREFIX} -DCMAKE_FIND_ROOT_PATH=${PREFIX} -DWRP_CORE_ENABLE_CONDA=ON
       - cmake --build build --parallel
       - cmake --install build
 
@@ -51,21 +51,28 @@ requirements:
     - zeromq
     - yaml-cpp
     - cereal
+    - msgpack-c
     - hdf5
     - catch2
     - libaio
+    - liburing
   run:
     - python
     - zeromq
     - yaml-cpp
     - cereal
+    - msgpack-c
     - hdf5
     - catch2
     - libaio
+    - liburing
+    - pyyaml
+    - msgpack-python
+    - flask
 
 tests:
   - script:
-      # Just verify the library files exist (chimaera_start_runtime is a daemon)
+      # Just verify the library files exist (chimaera runtime start is a daemon)
       - test -f $PREFIX/lib/libchimaera_cxx.so || test -f $PREFIX/lib/libchimaera_cxx.dylib
 
 about:
@@ -77,7 +84,7 @@ about:
     IOWarp Core provides a unified framework for context-aware data management
     in scientific workflows, including the Context Transfer Engine (CTE),
     Context Assimilation Engine (CAE), and Context Exploration Engine (CEE).
-  repository: https://github.com/iowarp/iowarp-core
+  repository: https://github.com/iowarp/clio-core
   documentation: https://docs.iowarp.ai
 
 extra:

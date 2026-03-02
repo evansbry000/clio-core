@@ -93,8 +93,10 @@ NB_MODULE(wrp_cte_core_ext, m) {
   nb::class_<chi::PoolQuery>(m, "PoolQuery")
       .def(nb::init<>())
       .def_static("Broadcast", &chi::PoolQuery::Broadcast,
+                  "net_timeout"_a = -1.0f,
                   "Create a Broadcast pool query (routes to all nodes)")
       .def_static("Dynamic", &chi::PoolQuery::Dynamic,
+                  "net_timeout"_a = -1.0f,
                   "Create a Dynamic pool query (automatic routing optimization)")
       .def_static("Local", &chi::PoolQuery::Local,
                   "Create a Local pool query (routes to local node only)");
@@ -258,14 +260,15 @@ NB_MODULE(wrp_cte_core_ext, m) {
 
   // Chimaera initialization function (unified)
   m.def("chimaera_init", &chi::CHIMAERA_INIT,
-        "mode"_a, "default_with_runtime"_a = false,
+        "mode"_a, "default_with_runtime"_a = false, "is_restart"_a = false,
         "Initialize Chimaera with specified mode.\n\n"
         "Args:\n"
         "    mode: ChimaeraMode.kClient or ChimaeraMode.kServer/kRuntime\n"
-        "    default_with_runtime: If True, starts runtime in addition to client (default: False)\n\n"
-        "Environment variable CHIMAERA_WITH_RUNTIME overrides default_with_runtime:\n"
-        "    CHIMAERA_WITH_RUNTIME=1 - Start runtime regardless of mode\n"
-        "    CHIMAERA_WITH_RUNTIME=0 - Don't start runtime (client only)\n\n"
+        "    default_with_runtime: If True, starts runtime in addition to client (default: False)\n"
+        "    is_restart: If True, force restart on compose pools and replay WAL (default: False)\n\n"
+        "Environment variable CHI_WITH_RUNTIME overrides default_with_runtime:\n"
+        "    CHI_WITH_RUNTIME=1 - Start runtime regardless of mode\n"
+        "    CHI_WITH_RUNTIME=0 - Don't start runtime (client only)\n\n"
         "Returns:\n"
         "    bool: True if initialization successful, False otherwise");
 

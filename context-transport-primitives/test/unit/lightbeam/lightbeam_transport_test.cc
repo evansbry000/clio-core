@@ -58,7 +58,7 @@ void TestZeroMQ() {
   const std::string magic = "unit_test_magic";
 
   // Client creates metadata and sends
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   Bulk send_bulk = client->Expose(
       hipc::FullPtr<char>(const_cast<char*>(magic.data())),
       magic.size(), BULK_XFER);
@@ -69,7 +69,7 @@ void TestZeroMQ() {
   std::cout << "Client sent data successfully\n";
 
   // Recv with retry loop (does everything - metadata + bulks)
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -86,6 +86,9 @@ void TestZeroMQ() {
                        recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
   std::cout << "Received: " << received << std::endl;
   assert(received == magic);
+
+  // Free the zmq_msg_t handles stored in bulk.desc by zero-copy recv
+  server->ClearRecvHandles(recv_meta);
 
   std::cout << "[ZeroMQ] Test passed!\n";
 #else

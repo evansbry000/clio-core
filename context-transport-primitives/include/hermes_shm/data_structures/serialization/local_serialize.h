@@ -179,7 +179,9 @@ class LocalSerialize {
   LocalSerialize &write_binary(const char *data, size_t size) {
     size_t off = data_.size();
     data_.resize(off + size);
-    memcpy(data_.data() + off, data, size);
+    if (size > 0) {
+      memcpy(data_.data() + off, data, size);
+    }
     return *this;
   }
 };
@@ -243,16 +245,20 @@ class LocalDeserialize {
     return *this;
   }
 
-  /** Save function (binary data) */
+  /** Load function (binary data) */
   HSHM_INLINE_CROSS_FUN
   LocalDeserialize &read_binary(char *data, size_t size) {
     if (cur_off_ + size > data_.size()) {
+#if HSHM_IS_HOST
       HLOG(kError,
            "LocalDeserialize::read_binary: Attempted to read beyond end of "
            "data");
+#endif
       return *this;
     }
-    memcpy(data, data_.data() + cur_off_, size);
+    if (size > 0) {
+      memcpy(data, data_.data() + cur_off_, size);
+    }
     cur_off_ += size;
     return *this;
   }

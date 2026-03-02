@@ -39,6 +39,7 @@
 #include "chimaera/task.h"
 #include "chimaera/ipc_manager.h"
 #include <cstdlib>
+#include <filesystem>
 
 // Global pointer variable definition for Configuration manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::ConfigManager, g_config_manager);
@@ -63,6 +64,18 @@ bool ConfigManager::ClientInit() {
             "Warning: Failed to load configuration from {}, using defaults",
             config_file_path_);
     }
+  }
+
+  // Check CHI_PORT env var (overrides YAML and default)
+  std::string port_env = hshm::SystemInfo::Getenv("CHI_PORT");
+  if (!port_env.empty()) {
+    port_ = std::stoul(port_env);
+  }
+
+  // Check CHI_SERVER_ADDR env var (overrides default 127.0.0.1)
+  std::string addr_env = hshm::SystemInfo::Getenv("CHI_SERVER_ADDR");
+  if (!addr_env.empty()) {
+    server_addr_ = addr_env;
   }
 
   is_initialized_ = true;
@@ -97,6 +110,13 @@ std::string ConfigManager::GetServerConfigPath() const {
     return std::string(wrp_env_path);
   }
 
+  // Fall back to ~/.chimaera/chimaera.yaml (tertiary)
+  std::string home_config =
+      hshm::ConfigParse::ExpandPath("${HOME}/.chimaera/chimaera.yaml");
+  if (std::filesystem::exists(home_config)) {
+    return home_config;
+  }
+
   return std::string();
 }
 
@@ -112,6 +132,8 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
 }
 
 u32 ConfigManager::GetPort() const { return port_; }
+
+std::string ConfigManager::GetServerAddr() const { return server_addr_; }
 
 u32 ConfigManager::GetNeighborhoodSize() const { return neighborhood_size_; }
 
@@ -149,12 +171,11 @@ void ConfigManager::LoadDefault() {
   // Set default configuration values
   num_threads_ = 4;
   queue_depth_ = 1024;
-  process_reaper_workers_ = 1;
 
   main_segment_size_ = 0;                         // 0 means auto-calculate
   client_data_segment_size_ = 512 * 1024 * 1024;  // 512MB
 
-  port_ = 5555;
+  port_ = 9413;
   neighborhood_size_ = 32;
 
   // Set default shared memory segment names with environment variables
@@ -171,6 +192,9 @@ void ConfigManager::LoadDefault() {
   // Set default worker sleep configuration (in microseconds)
   first_busy_wait_ = 50;               // 50us busy wait
   max_sleep_ = 50000;                  // 50000us (50ms) maximum sleep
+
+  // Set default task load prediction model learning rate
+  learning_rate_ = 0.2f;
 }
 
 void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
@@ -184,23 +208,9 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       num_threads_ = runtime["num_threads"].as<u32>();
     }
 
-    // Backward compatibility: auto-convert old format
-    if (runtime["sched_threads"] || runtime["slow_threads"]) {
-      u32 sched = runtime["sched_threads"].as<u32>(0);
-      u32 slow = runtime["slow_threads"].as<u32>(0);
-      num_threads_ = sched + slow;
-      HLOG(kWarning, "sched_threads and slow_threads are deprecated. "
-           "Please use 'num_threads' instead. Auto-converted to num_threads={}", num_threads_);
-    }
-
-    // Queue depth configuration (now actually used)
+    // Queue depth configuration
     if (runtime["queue_depth"]) {
       queue_depth_ = runtime["queue_depth"].as<u32>();
-    }
-
-    // Process reaper threads
-    if (runtime["process_reaper_threads"]) {
-      process_reaper_workers_ = runtime["process_reaper_threads"].as<u32>();
     }
 
     // Local task scheduler
@@ -212,34 +222,19 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     if (runtime["first_busy_wait"]) {
       first_busy_wait_ = runtime["first_busy_wait"].as<u32>();
     }
-    if (runtime["max_sleep"]) {
-      max_sleep_ = runtime["max_sleep"].as<u32>();
-    }
 
     // Configuration directory for persistent runtime config
     if (runtime["conf_dir"]) {
       conf_dir_ = runtime["conf_dir"].as<std::string>();
     }
 
+    // Task load prediction model learning rate
+    if (runtime["learning_rate"]) {
+      learning_rate_ = runtime["learning_rate"].as<float>();
+    }
+
     // Note: stack_size parameter removed (was never used)
     // Note: heartbeat_interval parsing removed (not used by runtime)
-  }
-
-  // Parse memory segments
-  if (yaml_conf["memory"]) {
-    auto memory = yaml_conf["memory"];
-    if (memory["main_segment_size"]) {
-      std::string size_str = memory["main_segment_size"].as<std::string>();
-      if (size_str == "auto") {
-        main_segment_size_ = 0;  // Trigger auto-calculation
-      } else {
-        main_segment_size_ = hshm::ConfigParse::ParseSize(size_str);
-      }
-    }
-    if (memory["client_data_segment_size"]) {
-      client_data_segment_size_ = hshm::ConfigParse::ParseSize(
-          memory["client_data_segment_size"].as<std::string>());
-    }
   }
 
   // Parse networking

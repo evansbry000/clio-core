@@ -4,7 +4,7 @@
 # The iowarp service provides the CTE runtime, and the benchmark service connects to it.
 #
 # Architecture:
-#   1. iowarp-runtime: Runs the CTE runtime daemon (iowarp/iowarp:latest)
+#   1. iowarp-runtime: Runs the CTE runtime daemon (iowarp/deploy-cpu:latest)
 #   2. wrp-cte-bench:  Runs the benchmark client (iowarp/cte-wrp-bench:latest)
 #
 # Usage:
@@ -20,35 +20,30 @@
 #   IO_SIZE              - Size of each I/O operation (default: 1m)
 #                          Supports: b (bytes), k (KB), m (MB), g (GB)
 #   IO_COUNT             - Number of operations to perform (default: 100)
-#   CHIMAERA_WITH_RUNTIME - Initialize CTE runtime in benchmark (default: 0, runtime handled by iowarp service)
-#   WRP_RUNTIME_CONF     - Path to CTE configuration file (default: /etc/iowarp/cte_config.yaml)
+#   CHI_WITH_RUNTIME - Initialize CTE runtime in benchmark (default: 0, runtime handled by iowarp service)
+#   CHI_SERVER_CONF     - Path to CTE configuration file (default: /etc/iowarp/cte_config.yaml)
 
 services:
   # IOWarp Runtime Service
   # Provides the CTE runtime daemon that benchmark clients connect to
   iowarp-runtime:
-    image: iowarp/core:latest
+    image: iowarp/deploy-cpu:latest
     container_name: iowarp-runtime
 
     # Mount shared CTE configuration
     volumes:
-      - ./cte_config.yaml:/etc/iowarp/wrp_conf.yaml:ro
+      - ./cte_config.yaml:/etc/iowarp/chimaera.yaml:ro
+
+    # Config lookup: CHI_SERVER_CONF is checked first by the runtime
+    environment:
+      - CHI_SERVER_CONF=/etc/iowarp/chimaera.yaml
 
     # Expose ZeroMQ port for client connections
     ports:
-      - "5555:5555"
+      - "9413:9413"
 
     # Resource limits
-    # Large shared memory for CTE operations
-    shm_size: 8g
     mem_limit: 8g
-
-    # Make IPC namespace accessible to host so external applications can connect
-    ipc: host
-
-    # Keep container running as a daemon
-    stdin_open: true
-    tty: true
 
     # Restart policy - no restart for benchmark runs
     restart: "no"
@@ -68,7 +63,7 @@ services:
     environment:
       # CTE Runtime Configuration
       # Do NOT initialize runtime in benchmark (runtime service handles this)
-      - CHIMAERA_WITH_RUNTIME=${CHIMAERA_WITH_RUNTIME:-0}
+      - CHI_WITH_RUNTIME=${CHI_WITH_RUNTIME:-0}
 
       # Benchmark Test Parameters
       # Test case selection: Put (write), Get (read), PutGet (mixed)
@@ -94,8 +89,6 @@ services:
     ipc: service:iowarp-runtime
 
     # Resource limits
-    # Match or exceed runtime service limits
-    shm_size: 8g
     mem_limit: 8g
 
     # Clean up container after run
@@ -114,8 +107,8 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
-  #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
+  #     - CHI_WITH_RUNTIME=0
+  #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=4
   #     - DEPTH=8
@@ -123,7 +116,6 @@ services:
   #     - IO_COUNT=100000
   #   network_mode: service:iowarp-runtime
   #   ipc: service:iowarp-runtime
-  #   shm_size: 8g
   #   mem_limit: 8g
   #   restart: "no"
 
@@ -137,8 +129,8 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
-  #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
+  #     - CHI_WITH_RUNTIME=0
+  #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Get
   #     - NUM_PROCS=4
   #     - DEPTH=8
@@ -146,7 +138,6 @@ services:
   #     - IO_COUNT=100000
   #   network_mode: service:iowarp-runtime
   #   ipc: service:iowarp-runtime
-  #   shm_size: 8g
   #   mem_limit: 8g
   #   restart: "no"
 
@@ -160,8 +151,8 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
-  #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
+  #     - CHI_WITH_RUNTIME=0
+  #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=PutGet
   #     - NUM_PROCS=4
   #     - DEPTH=4
@@ -169,7 +160,6 @@ services:
   #     - IO_COUNT=10000
   #   network_mode: service:iowarp-runtime
   #   ipc: service:iowarp-runtime
-  #   shm_size: 8g
   #   mem_limit: 8g
   #   restart: "no"
 
@@ -183,8 +173,8 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
-  #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
+  #     - CHI_WITH_RUNTIME=0
+  #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=1
   #     - DEPTH=2
@@ -192,7 +182,6 @@ services:
   #     - IO_COUNT=1000
   #   network_mode: service:iowarp-runtime
   #   ipc: service:iowarp-runtime
-  #   shm_size: 8g
   #   mem_limit: 8g
   #   restart: "no"
 
@@ -206,8 +195,8 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
-  #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
+  #     - CHI_WITH_RUNTIME=0
+  #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=16
   #     - DEPTH=16
@@ -215,7 +204,6 @@ services:
   #     - IO_COUNT=1000000
   #   network_mode: service:iowarp-runtime
   #   ipc: service:iowarp-runtime
-  #   shm_size: 8g
   #   mem_limit: 8g
   #   restart: "no"
 

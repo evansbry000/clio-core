@@ -38,7 +38,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/comutex.h>
 #include <chimaera/corwlock.h>
-#include <chimaera/unordered_map_ll.h>
+#include <hermes_shm/data_structures/priv/unordered_map_ll.h>
 #include <hermes_shm/data_structures/ipc/ring_buffer.h>
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
 #include <wrp_cte/core/core_client.h>
@@ -71,6 +71,11 @@ public:
    * Returns TaskResume for coroutine-based async operations
    */
   chi::TaskResume Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
+
+  /**
+   * Monitor container state (Method::kMonitor)
+   */
+  chi::TaskResume Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &rctx);
 
   /**
    * Destroy the container (Method::kDestroy)
@@ -149,6 +154,11 @@ public:
    */
   chi::TaskResume GetTagSize(hipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
 
+  /**
+   * Schedule a task by resolving Dynamic pool queries.
+   */
+  chi::PoolQuery ScheduleTask(const hipc::FullPtr<chi::Task> &task) override;
+
   // Pure virtual methods - implementations are in autogen/core_lib_exec.cc
   void Init(const chi::PoolId &pool_id, const std::string &pool_name,
             chi::u32 container_id = 0) override;
@@ -159,7 +169,6 @@ public:
   chi::u64 GetWorkRemaining() const override;
 
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
                 hipc::FullPtr<chi::Task> task_ptr) override;
   void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
@@ -168,14 +177,15 @@ public:
   hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
                                         bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
                      hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method,
                                                chi::LocalLoadTaskArchive &archive) override;
   void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
                      hipc::FullPtr<chi::Task> task_ptr) override;
-  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
-                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
 private:
   // Queue ID constants (REQUIRED: Use semantic names, not raw integers)
@@ -187,32 +197,40 @@ private:
   // Client for this ChiMod
   Client client_;
 
-  // Target management data structures (using chi::unordered_map_ll for
+  // Target management data structures (using hshm::priv::unordered_map_ll for
   // thread-safe concurrent access)
-  chi::unordered_map_ll<chi::PoolId, TargetInfo> registered_targets_;
-  chi::unordered_map_ll<std::string, chi::PoolId>
+  hshm::priv::unordered_map_ll<chi::PoolId, TargetInfo> registered_targets_;
+  hshm::priv::unordered_map_ll<std::string, chi::PoolId>
       target_name_to_id_; // reverse lookup: target_name -> target_id
 
-  // Tag management data structures (using chi::unordered_map_ll for thread-safe
+  // Tag management data structures (using hshm::priv::unordered_map_ll for thread-safe
   // concurrent access)
-  chi::unordered_map_ll<std::string, TagId>
+  hshm::priv::unordered_map_ll<std::string, TagId>
       tag_name_to_id_;                                   // tag_name -> tag_id
-  chi::unordered_map_ll<TagId, TagInfo> tag_id_to_info_; // tag_id -> TagInfo
-  chi::unordered_map_ll<std::string, BlobInfo>
+  hshm::priv::unordered_map_ll<TagId, TagInfo> tag_id_to_info_; // tag_id -> TagInfo
+  hshm::priv::unordered_map_ll<std::string, BlobInfo>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
 
   // Atomic counters for thread-safe ID generation
   std::atomic<chi::u32>
       next_tag_id_minor_; // Minor counter for TagId UniqueId generation
 
+  // Map sizes for data structures (must be large enough for expected entries)
+  static const size_t kBlobMapSize = 1000000;  // 1M blobs
+  static const size_t kTagMapSize = 100000;    // 100K tags
+
   // Synchronization primitives for thread-safe access to data structures
+  // Single lock per data structure ensures all operations synchronize correctly
+  chi::CoRwLock target_lock_;  // For registered_targets_ + target_name_to_id_
+  chi::CoRwLock tag_map_lock_;  // For tag_name_to_id_ + tag_id_to_info_
+  chi::CoRwLock blob_map_lock_;  // For tag_blob_name_to_info_
   // Use a set of locks based on maximum number of lanes for better concurrency
   static const size_t kMaxLocks =
       64; // Maximum number of locks (matches max lanes)
   std::vector<std::unique_ptr<chi::CoRwLock>>
-      target_locks_; // For registered_targets_
+      target_locks_; // For registered_targets_ (DEPRECATED - use target_lock_)
   std::vector<std::unique_ptr<chi::CoRwLock>>
-      tag_locks_; // For tag management structures
+      tag_locks_; // For tag management structures (DEPRECATED - use tag_map_lock_ / blob_map_lock_)
 
   // Storage configuration (parsed from config file)
   std::vector<StorageDeviceConfig> storage_devices_;
@@ -237,12 +255,6 @@ private:
    * Get access to configuration manager
    */
   const Config &GetConfig() const;
-
-  /**
-   * Helper function to update target performance statistics
-   * Returns TaskResume for coroutine-based async operations
-   */
-  chi::TaskResume UpdateTargetStats(const chi::PoolId &target_id, TargetInfo &target_info);
 
   /**
    * Helper function to get manual score for a target from storage device config

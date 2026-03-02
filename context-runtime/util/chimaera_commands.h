@@ -7,9 +7,11 @@
  */
 
 int RuntimeStart(int argc, char** argv);
+int RuntimeRestart(int argc, char** argv);
 int RuntimeStop(int argc, char** argv);
 int Monitor(int argc, char** argv);
 int Compose(int argc, char** argv);
 int Migrate(int argc, char** argv);
+int RefreshRepo(int argc, char** argv);
 
 #endif  // CHIMAERA_COMMANDS_H_

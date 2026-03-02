@@ -7,6 +7,13 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 - **context-assimilation-engine**: Context assimilation engine
 - **context-exploration-engine**: Context exploration engine
 
+## Documentation Updates
+Whenever you modify the configurations for context-runtime, context-transfer-engine, context-assimilation-engine, or bdev, we should update our documentation accordingly.
+First, we should update context-runtime/config/chimaera_default.yaml to have the default parameters -- even just as comments. We should document the parameter options here as well.
+
+After this, we need to update the following doc:
+docs/docs/deployment/configuration.md
+
 ## Testing Updates
 
 Never ever re-run tasks without installing your chanages first.
@@ -17,7 +24,7 @@ We use rpaths for libraries. This stuff does not get overriden by LD_LIBRARY_PAT
 
 When building chimods, make sure to edit chimaera_mod.yaml and chimaera_repo.yaml.
 
-If you add new methods to a chimod, please edit chimaera_mod.yaml and use the chi_refresh_repo binary to autogenerate the relevant autogen files.
+If you add new methods to a chimod, please edit chimaera_mod.yaml and use the chimaera repo refresh binary to autogenerate the relevant autogen files.
 
 
 ## ⚠️ CRITICAL BUILD RULE ⚠️
@@ -54,6 +61,17 @@ Use the Google C++ style guide for C++.
 You should store the pointer returned by the singleton GetInstance method. Avoid dereferencing GetInstance method directly using either -> or *. E.g., do not do ``hshm::Singleton<T>::GetInstance()->var_``. You should do ``auto *x = hshm::Singleton<T>::GetInstance(); x->var_;``.
 
 Whenever you build a new function, always create a docstring for it. It should document what the parameters mean and the point of the function. It should be something easily parsed by doxygen.
+
+### GPU Compiler Macro Rule
+
+**NEVER** use raw GPU compiler-detection macros (`__CUDACC__`, `__HIPCC__`, `__HIP__`, `__CUDA_ARCH__`, `__HIP_DEVICE_COMPILE__`) anywhere except `context-transport-primitives/include/hermes_shm/constants/macros.h`. We do not want code paths to compile just because a GPU compiler is being used — we need the explicit CMake build flags (`HSHM_ENABLE_CUDA`, `HSHM_ENABLE_ROCM`) to be set as well.
+
+**Use these macros instead:**
+- `HSHM_IS_GPU` — true when compiling device code (replaces `__CUDA_ARCH__` / `__HIP_DEVICE_COMPILE__`)
+- `HSHM_IS_HOST` — true when compiling host code
+- `HSHM_IS_GPU_COMPILER` — true when compiled by nvcc or hipcc AND the build flag is set (replaces `__CUDACC__` / `__HIPCC__`)
+- `HSHM_IS_CUDA_COMPILER` — CUDA-specific compiler check (replaces `HSHM_ENABLE_CUDA && __CUDACC__`)
+- `HSHM_IS_ROCM_COMPILER` — ROCm-specific compiler check (replaces `HSHM_ENABLE_ROCM && __HIPCC__`)
 
 ## File Headers
 
@@ -127,14 +145,23 @@ All timing prints MUST include units of measurement in milliseconds (ms). Always
 When Chimaera RuntimeInit is called (via `IpcManager::ServerInit()`), it automatically cleans up leftover shared memory segments from previous runs or crashed processes by calling `IpcManager::ClearUserIpcs()`.
 
 **ClearUserIpcs() Behavior:**
-- Scans `/dev/shm` directory for all files matching the pattern `chimaera_*`
-- Attempts to remove each matching shared memory segment using `shm_unlink()`
+- Scans the per-user chimaera directory (`SystemInfo::GetMemfdDir()`, i.e. `/tmp/chimaera_$USER/`)
+- Removes all memfd symlinks and IPC socket files from that directory
 - Silently ignores permission errors (EACCES, EPERM) to support multi-user systems
 - Other users' active Chimaera processes are not affected
-- Logs successfully removed segments at kInfo level
+- Logs successfully removed segments at kDebug level
 - Returns the count of segments removed
 
 This ensures a clean state for each runtime initialization without requiring manual cleanup scripts.
+
+### IPC Path Convention
+
+**CRITICAL**: Never hardcode `/tmp/chimaera_*` paths in IpcManager or elsewhere. Always use the `SystemInfo` helpers:
+- `hshm::SystemInfo::GetMemfdDir()` — returns `/tmp/chimaera_$USER`
+- `hshm::SystemInfo::GetMemfdPath(name)` — returns `/tmp/chimaera_$USER/<name>` (strips leading `/`)
+- `hshm::SystemInfo::EnsureMemfdDir()` — creates the directory if it doesn't exist
+
+For IPC Unix domain socket paths, use: `hshm::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc")`
 
 ## Workflow
 
@@ -154,28 +181,23 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 
 ### Dependency Management Strategy
 
-**IMPORTANT**: IOWarp Core uses **conda for all major dependencies** to avoid library conflicts.
-
-**Why Conda?**
-- Prevents version conflicts between system and conda libraries (e.g., system HDF5 with conda libcurl)
-- Ensures reproducible builds across different systems
-- All dependencies are installed in the devcontainer: boost, hdf5, yaml-cpp, zeromq, cereal, catch2, poco, nlohmann_json, etc.
-- No need to install system development packages via apt
+**IMPORTANT**: The Docker devcontainer uses **apt + source builds** for all dependencies. Conda is reserved for CI-only installer paths (`installers/conda/`).
 
 **In the Devcontainer:**
-- The conda base environment is auto-activated with all dependencies
-- CMake will automatically find conda packages via `CMAKE_PREFIX_PATH`
-- Do NOT install development libraries via apt (libboost-dev, libhdf5-dev, etc.) - use conda instead
+- All dependencies are installed via apt or built from source in `deps-cpu.Dockerfile`
+- A Python virtual environment is auto-activated at `/home/iowarp/venv`
+- CMake finds packages via standard `/usr/local` and `/usr` paths
+- Do NOT use conda in the devcontainer — it is not configured there
 
 **Outside the Devcontainer:**
-- Option 1 (Recommended): Use conda to install dependencies: `conda install boost hdf5 yaml-cpp zeromq cereal catch2 poco nlohmann_json`
-- Option 2: Run `install.sh` to build dependencies from source
-- Option 3: Use system packages at your own risk (may cause library conflicts)
+- Option 1 (Recommended): Run `install.sh` to build dependencies from source
+- Option 2: Use system packages via apt
+- Option 3: Use conda via `installers/conda/` recipes
 
-**ADIOS2 Exception:**
-- ADIOS2 is built from source (not from conda) to ensure C++20 compatibility
+**ADIOS2:**
+- ADIOS2 is built from source to ensure C++20 compatibility
 - Uses ADIOS2 v2.11.0 which supports both x86_64 and ARM64 architectures
-- Built with MPI, HDF5, and ZeroMQ support (using conda's HDF5 and ZeroMQ libraries)
+- Built with MPI, HDF5, and ZeroMQ support
 - SST is disabled due to ARM64 Linux compatibility issues in the DILL library
 
 ### Component Build Options
@@ -198,12 +220,11 @@ cmake --preset=debug -DWRP_CORE_ENABLE_CTE=ON -DWRP_CORE_ENABLE_CAE=OFF
 - All compilation warnings have been resolved as of the current state
 
 ### RPATH Configuration
-The build system supports **absolute RPATHs** for source-only builds (enabled by default):
+The build system uses **relative RPATHs** (`$ORIGIN`) for portable, relocatable binaries (enabled by default):
 - **Enable/Disable**: Controlled by `WRP_CORE_ENABLE_RPATH` option (default: ON)
-- **Linux**: Uses `${CMAKE_INSTALL_PREFIX}/lib` for runtime library search paths
-- **macOS**: Uses `${CMAKE_INSTALL_PREFIX}/lib` for runtime library search paths
-- Libraries are linked with absolute paths to the installation directory and all dependency locations
-- This configuration is designed for building from source only, not for relocatable binary distributions
+- **Linux**: Uses `$ORIGIN` and `$ORIGIN/../lib` so libraries and binaries find siblings at runtime
+- **macOS**: Uses `@loader_path` and `@loader_path/../lib` (equivalent to `$ORIGIN`)
+- Works for all deployment targets: system installs, pip wheels, conda packages, and relocatable builds
 - **Disable RPATH**: Set `-DWRP_CORE_ENABLE_RPATH=OFF` if you prefer using `LD_LIBRARY_PATH`
 
 ### HSHM Usage
@@ -600,6 +621,8 @@ The chimaera runtime provides two simplified coroutine-aware synchronization pri
 - Supports multiple concurrent readers or a single writer
 - Tasks that cannot acquire the lock call `Yield()` to be placed in the blocked queue
 
+**CRITICAL**: Do NOT add any print, log, or HLOG statements in lock acquire or release paths (Lock, Unlock, ReadLock, ReadUnlock, WriteLock, WriteUnlock). Logging in lock paths causes severe performance degradation and can introduce deadlocks when the logging system itself acquires locks.
+
 ### Task Wait Functionality
 
 **Critical Fix for Infinite Loops**
@@ -702,7 +725,7 @@ REQUIRE(CHI_IPC->IsInitialized());
 **Initialization Parameters:**
 - **Mode**: Always use `chi::ChimaeraMode::kClient` for unit tests
 - **default_with_runtime**: Always use `true` for unit tests (starts runtime automatically)
-- **Environment Variable**: `CHIMAERA_WITH_RUNTIME` is handled automatically by `CHIMAERA_INIT()`
+- **Environment Variable**: `CHI_WITH_RUNTIME` is handled automatically by `CHIMAERA_INIT()`
   - If set to `1`: Runtime will be started
   - If set to `0`: Only client initialization (useful for external runtime scenarios)
   - If not set: Uses the `default_with_runtime` parameter value
@@ -783,7 +806,8 @@ environment:
   - CHI_MAIN_SEGMENT_SIZE=1G
   - CHI_CLIENT_DATA_SEGMENT_SIZE=512M
   - CHI_RUNTIME_DATA_SEGMENT_SIZE=512M
-  - CHI_ZMQ_PORT=5555
+  - CHI_PORT=9413              # Override RPC port (default: 9413)
+  - CHI_SERVER_ADDR=127.0.0.1 # Override server address for clients
   - CHI_IPC_MODE=TCP          # SHM, TCP (default), or IPC
   - CHI_LOG_LEVEL=info
   - CHI_SHM_SIZE=2147483648
@@ -860,7 +884,7 @@ python -m build --wheel
 **What Gets Bundled:**
 - All IOWarp libraries (libchimaera_cxx.so, libhermes_shm_host.so, ChiMod libraries)
 - Dependencies from install.sh (Boost, HDF5, ZeroMQ, yaml-cpp, etc.)
-- Command-line tools (wrp_cte, wrp_cae_omni, chimaera_start_runtime, etc.)
+- Command-line tools (wrp_cte, wrp_cae_omni, chimaera, etc.)
 - Headers and CMake configuration files
 - Conda dependencies (if building in a Conda environment)
 

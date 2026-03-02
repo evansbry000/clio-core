@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 1.0.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 1.0.3 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # Project Options
@@ -25,20 +25,23 @@ option(WRP_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" 
 option(WRP_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
 option(WRP_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
 option(WRP_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
-option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer + LeakSanitizer for debugging" OFF)
+option(WRP_CORE_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer for debugging" OFF)
+option(WRP_CORE_ENABLE_MSAN "Enable MemorySanitizer for debugging (requires instrumented dependencies)" OFF)
 option(WRP_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all components" OFF)
 option(WRP_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
-option(WRP_CORE_ENABLE_RPATH "Enable RPATH configuration with absolute paths" ON)
+option(WRP_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
 option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(WRP_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(WRP_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
+option(WRP_CORE_STATIC_DEPS "Link external dependencies statically (for self-contained wheels)" OFF)
 
 # Installation Prefix Configuration
 # - For Conda builds: Set CMAKE_INSTALL_PREFIX via -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX
 # - For custom installs: Set CMAKE_INSTALL_PREFIX to desired root directory
 # Libraries install to ${CMAKE_INSTALL_PREFIX}/lib
-# Python bindings install to ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
+# Python bindings install to the detected Python's site-packages (venv, conda, or system)
 
 #------------------------------------------------------------------------------
 # Conda Environment Configuration (Explicit)
@@ -92,6 +95,7 @@ option(WRP_CORE_ENABLE_THALLIUM "Build tests which depend on thallium" OFF)
 option(WRP_CORE_ENABLE_CEREAL "Enable serialization using cereal" ON)
 option(WRP_CTE_ENABLE_COMPRESS "Enable compression support (builds compressor chimod and tests)" OFF)
 option(WRP_CORE_ENABLE_ENCRYPT "Enable encryption" OFF)
+option(WRP_CORE_ENABLE_IO_URING "Enable io_uring async I/O backend (Linux 5.1+, requires liburing)" OFF)
 
 # Set internal compression flags from WRP_CTE_ENABLE_COMPRESS
 if(WRP_CTE_ENABLE_COMPRESS)
@@ -155,7 +159,11 @@ option(WRP_CORE_ENABLE_LLAMA_SERVER "Add external/llama.cpp to the build (requir
 # If WRP_CORE_ENABLE_BENCHMARKS is OFF, force all component benchmarks OFF
 # Otherwise, use individual component values
 
-# Apply master test switch (no-op, WRP_CORE_ENABLE_TESTS used directly)
+# Apply master test switch: propagate to CMake's standard BUILD_TESTING variable
+# so components that use if(BUILD_TESTING) are also controlled by this flag.
+if(NOT WRP_CORE_ENABLE_TESTS)
+  set(BUILD_TESTING OFF CACHE BOOL "Build tests (controlled by WRP_CORE_ENABLE_TESTS)" FORCE)
+endif()
 
 # Set HSHM_ENABLE_* aliases for backward compatibility
 # These allow component code to continue using HSHM_ENABLE_* while we transition
@@ -172,6 +180,7 @@ set(HSHM_ENABLE_ENCRYPT ${WRP_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (c
 set(HSHM_ENABLE_ELF ${WRP_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by WRP_CORE_ENABLE_ELF)" FORCE)
 set(HSHM_ENABLE_CUDA ${WRP_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by WRP_CORE_ENABLE_CUDA)" FORCE)
 set(HSHM_ENABLE_ROCM ${WRP_CORE_ENABLE_ROCM} CACHE BOOL "Enable ROCm (controlled by WRP_CORE_ENABLE_ROCM)" FORCE)
+set(HSHM_ENABLE_IO_URING ${WRP_CORE_ENABLE_IO_URING} CACHE BOOL "Enable io_uring (controlled by WRP_CORE_ENABLE_IO_URING)" FORCE)
 # Note: Coverage is handled globally via add_compile_options when WRP_CORE_ENABLE_COVERAGE=ON
 # No need for component-level HSHM_ENABLE_COVERAGE
 
@@ -202,8 +211,17 @@ include(IowarpCoreCommon)
 # 2. System packages via pkg-config
 # 3. CMake find_package() in standard locations
 
+# Static dependency linking (for self-contained pip wheels)
+if(WRP_CORE_STATIC_DEPS)
+    message(STATUS "Static dependency linking enabled")
+endif()
+
 # Pkg-Config
-find_package(PkgConfig REQUIRED)
+if(NOT WIN32)
+    find_package(PkgConfig REQUIRED)
+else()
+    find_package(PkgConfig QUIET)
+endif()
 if(PkgConfig_FOUND)
     message(STATUS "found pkg-config")
     if(IN_CONDA_BUILD)
@@ -227,10 +245,59 @@ if(yaml-cpp_FOUND)
     resolve_yaml_cpp_target()
 endif()
 
+# When static deps are enabled, override yaml-cpp target to use the .a file.
+# find_package creates an imported target whose per-config properties
+# (IMPORTED_LOCATION_RELEASE, IMPORTED_SONAME_RELEASE) take precedence
+# over the generic IMPORTED_LOCATION.  We must override every config that
+# was registered so the linker always picks the static archive.
+if(WRP_CORE_STATIC_DEPS)
+    find_library(YAML_CPP_STATIC_LIB NAMES libyaml-cpp.a REQUIRED)
+    if(YAML_CPP_STATIC_LIB)
+        message(STATUS "Static yaml-cpp: ${YAML_CPP_STATIC_LIB}")
+        # Override every registered configuration
+        get_property(_yaml_configs TARGET yaml-cpp::yaml-cpp
+                     PROPERTY IMPORTED_CONFIGURATIONS)
+        foreach(_cfg ${_yaml_configs})
+            set_property(TARGET yaml-cpp::yaml-cpp
+                         PROPERTY IMPORTED_LOCATION_${_cfg} "${YAML_CPP_STATIC_LIB}")
+            set_property(TARGET yaml-cpp::yaml-cpp
+                         PROPERTY IMPORTED_SONAME_${_cfg} "")
+        endforeach()
+        # Also set the generic fallback
+        set_target_properties(yaml-cpp::yaml-cpp PROPERTIES
+            IMPORTED_LOCATION "${YAML_CPP_STATIC_LIB}")
+    endif()
+endif()
+
 # Cereal - find from system or install.sh installation
 find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
+endif()
+
+# MessagePack C library (pure C, no Boost dependency)
+# Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
+# Try msgpack-c first (v6+, post C/C++ split), then msgpack (v3.x, pre-split).
+find_package(msgpack-c CONFIG QUIET)
+if(NOT msgpack-c_FOUND)
+  find_package(msgpack REQUIRED CONFIG)
+  message(STATUS "found msgpack (legacy v3.x) at ${msgpack_DIR}")
+  # Create alias targets matching the msgpack-c v6+ naming convention
+  if(TARGET msgpackc-static AND NOT TARGET msgpack-c-static)
+    add_library(msgpack-c-static ALIAS msgpackc-static)
+  endif()
+  if(TARGET msgpackc AND NOT TARGET msgpack-c)
+    add_library(msgpack-c ALIAS msgpackc)
+  endif()
+else()
+  message(STATUS "found msgpack-c at ${msgpack-c_DIR}")
+endif()
+if(TARGET msgpack-c-static)
+  set(MSGPACK_TARGET msgpack-c-static)
+  message(STATUS "  using static msgpack-c")
+else()
+  set(MSGPACK_TARGET msgpack-c)
+  message(STATUS "  using shared msgpack-c (static not available)")
 endif()
 
 # MPICH (only find when explicitly enabled)
@@ -268,6 +335,9 @@ if(WRP_CORE_ENABLE_CEREAL)
     set(SERIALIZATION_LIBS cereal::cereal ${SERIALIZATION_LIBS})
 endif()
 
+# Add msgpack-c to serialization libs (always enabled)
+set(SERIALIZATION_LIBS ${MSGPACK_TARGET} ${SERIALIZATION_LIBS})
+
 # Thread support
 find_package(Threads REQUIRED)
 
@@ -275,84 +345,60 @@ find_package(Threads REQUIRED)
 if(WRP_CTE_ENABLE_COMPRESS)
     message(STATUS "WRP_CTE_ENABLE_COMPRESS is ON")
 
-    # Verify conda environment is enabled for compression libraries
-    if(NOT WRP_CORE_ENABLE_CONDA OR NOT IN_CONDA_BUILD)
-        message(FATAL_ERROR "WRP_CTE_ENABLE_COMPRESS requires WRP_CORE_ENABLE_CONDA=ON. Please enable conda or install compression libraries manually.")
-    endif()
-
-    # Libraries with pkg-config support - verify they're from conda
+    # Libraries with pkg-config support
     pkg_check_modules(libzstd REQUIRED libzstd)
-    if(NOT libzstd_INCLUDE_DIRS MATCHES "$ENV{CONDA_PREFIX}")
-        message(FATAL_ERROR "libzstd not from conda: ${libzstd_INCLUDE_DIRS} (expected in $ENV{CONDA_PREFIX})")
-    endif()
     message(STATUS "found zstd.h at ${libzstd_INCLUDE_DIRS}")
 
     pkg_check_modules(liblz4 REQUIRED liblz4)
-    if(NOT liblz4_INCLUDE_DIRS MATCHES "$ENV{CONDA_PREFIX}")
-        message(FATAL_ERROR "liblz4 not from conda: ${liblz4_INCLUDE_DIRS} (expected in $ENV{CONDA_PREFIX})")
-    endif()
     message(STATUS "found lz4.h at ${liblz4_INCLUDE_DIRS}")
 
     pkg_check_modules(zlib REQUIRED zlib)
-    if(NOT zlib_INCLUDE_DIRS MATCHES "$ENV{CONDA_PREFIX}")
-        message(FATAL_ERROR "zlib not from conda: ${zlib_INCLUDE_DIRS} (expected in $ENV{CONDA_PREFIX})")
-    endif()
     message(STATUS "found zlib.h at ${zlib_INCLUDE_DIRS}")
 
     pkg_check_modules(liblzma REQUIRED liblzma)
-    if(NOT liblzma_INCLUDE_DIRS MATCHES "$ENV{CONDA_PREFIX}")
-        message(FATAL_ERROR "liblzma not from conda: ${liblzma_INCLUDE_DIRS} (expected in $ENV{CONDA_PREFIX})")
-    endif()
     message(STATUS "found liblzma.h at ${liblzma_INCLUDE_DIRS}")
 
     pkg_check_modules(libbrotlicommon REQUIRED libbrotlicommon libbrotlidec libbrotlienc)
-    if(NOT libbrotlicommon_INCLUDE_DIRS MATCHES "$ENV{CONDA_PREFIX}")
-        message(FATAL_ERROR "libbrotlicommon not from conda: ${libbrotlicommon_INCLUDE_DIRS} (expected in $ENV{CONDA_PREFIX})")
-    endif()
     message(STATUS "found libbrotli.h at ${libbrotlicommon_INCLUDE_DIRS}")
 
     pkg_check_modules(blosc2 REQUIRED blosc2)
-    if(NOT blosc2_INCLUDE_DIRS MATCHES "$ENV{CONDA_PREFIX}")
-        message(FATAL_ERROR "blosc2 not from conda: ${blosc2_INCLUDE_DIRS} (expected in $ENV{CONDA_PREFIX})")
-    endif()
     message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
 
-    # Libraries without pkg-config - use conda paths directly
     # bzip2
-    find_path(bzip2_INCLUDE_DIR bzlib.h PATHS $ENV{CONDA_PREFIX}/include NO_DEFAULT_PATH REQUIRED)
-    find_library(bzip2_LIBRARY bz2 PATHS $ENV{CONDA_PREFIX}/lib NO_DEFAULT_PATH REQUIRED)
+    find_path(bzip2_INCLUDE_DIR bzlib.h REQUIRED)
+    find_library(bzip2_LIBRARY bz2 REQUIRED)
     if(bzip2_INCLUDE_DIR AND bzip2_LIBRARY)
         set(bzip2_INCLUDE_DIRS ${bzip2_INCLUDE_DIR})
         set(bzip2_LIBRARIES bz2)
-        set(bzip2_LIBRARY_DIRS $ENV{CONDA_PREFIX}/lib)
+        get_filename_component(bzip2_LIBRARY_DIRS "${bzip2_LIBRARY}" DIRECTORY)
         message(STATUS "found bz2.h at ${bzip2_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "bzip2 not found in conda environment. Install with: conda install bzip2")
+        message(FATAL_ERROR "bzip2 not found. Install with: apt-get install libbz2-dev")
     endif()
 
     # lzo
-    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h PATHS $ENV{CONDA_PREFIX}/include NO_DEFAULT_PATH REQUIRED)
-    find_library(lzo2_LIBRARY lzo2 PATHS $ENV{CONDA_PREFIX}/lib NO_DEFAULT_PATH REQUIRED)
+    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h REQUIRED)
+    find_library(lzo2_LIBRARY lzo2 REQUIRED)
     if(lzo2_INCLUDE_DIR AND lzo2_LIBRARY)
         set(lzo2_INCLUDE_DIRS ${lzo2_INCLUDE_DIR})
         set(lzo2_LIBRARIES lzo2)
-        set(lzo2_LIBRARY_DIRS $ENV{CONDA_PREFIX}/lib)
+        get_filename_component(lzo2_LIBRARY_DIRS "${lzo2_LIBRARY}" DIRECTORY)
         get_filename_component(lzo2_dir "${lzo2_INCLUDE_DIRS}" DIRECTORY)
         message(STATUS "found lzo2.h at ${lzo2_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "lzo not found in conda environment. Install with: conda install lzo")
+        message(FATAL_ERROR "lzo not found. Install with: apt-get install liblzo2-dev")
     endif()
 
     # snappy
-    find_path(snappy_INCLUDE_DIR snappy.h PATHS $ENV{CONDA_PREFIX}/include NO_DEFAULT_PATH REQUIRED)
-    find_library(snappy_LIBRARY snappy PATHS $ENV{CONDA_PREFIX}/lib NO_DEFAULT_PATH REQUIRED)
+    find_path(snappy_INCLUDE_DIR snappy.h REQUIRED)
+    find_library(snappy_LIBRARY snappy REQUIRED)
     if(snappy_INCLUDE_DIR AND snappy_LIBRARY)
         set(snappy_INCLUDE_DIRS ${snappy_INCLUDE_DIR})
         set(snappy_LIBRARIES snappy)
-        set(snappy_LIBRARY_DIRS $ENV{CONDA_PREFIX}/lib)
+        get_filename_component(snappy_LIBRARY_DIRS "${snappy_LIBRARY}" DIRECTORY)
         message(STATUS "found snappy.h at ${snappy_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "snappy not found in conda environment. Install with: conda install snappy")
+        message(FATAL_ERROR "snappy not found. Install with: apt-get install libsnappy-dev")
     endif()
 
     # LibPressio - try find_package first (CMake-based), fall back to pkg-config
@@ -443,13 +489,51 @@ endif()
 
 # ZeroMQ (conditional) - try system first, fall back to submodule
 if(WRP_CORE_ENABLE_ZMQ)
-    pkg_check_modules(ZeroMQ QUIET libzmq)
-    if(ZeroMQ_FOUND)
-        message(STATUS "found zmq.h at ${ZeroMQ_INCLUDE_DIRS}")
-        set(ZMQ_LIBS ${ZeroMQ_LIBRARIES})
-        set(ZMQ_INCLUDES ${ZeroMQ_INCLUDE_DIRS})
-        set(ZMQ_LIB_DIRS ${ZeroMQ_LIBRARY_DIRS})
-    else()
+    set(_ZMQ_FOUND FALSE)
+    # Try pkg-config first (Linux/macOS)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ZeroMQ QUIET libzmq)
+        if(ZeroMQ_FOUND)
+            message(STATUS "found zmq.h at ${ZeroMQ_INCLUDE_DIRS}")
+            if(WRP_CORE_STATIC_DEPS)
+                # Find static .a archives directly — pkg-config _STATIC_LIBRARIES
+                # still returns -l flags that the linker resolves to shared libs.
+                find_library(ZMQ_STATIC_LIB NAMES libzmq.a REQUIRED)
+                set(ZMQ_LIBS ${ZMQ_STATIC_LIB})
+                # Pull in zmq's transitive static deps (libsodium, pthreads, etc.)
+                foreach(_dep ${ZeroMQ_STATIC_LIBRARIES})
+                    if(NOT _dep STREQUAL "zmq")
+                        find_library(_dep_path NAMES lib${_dep}.a ${_dep})
+                        if(_dep_path)
+                            list(APPEND ZMQ_LIBS ${_dep_path})
+                        else()
+                            list(APPEND ZMQ_LIBS ${_dep})
+                        endif()
+                        unset(_dep_path CACHE)
+                    endif()
+                endforeach()
+                set(ZMQ_LIB_DIRS "")
+                message(STATUS "Static zmq libs: ${ZMQ_LIBS}")
+            else()
+                set(ZMQ_LIBS ${ZeroMQ_LIBRARIES})
+                set(ZMQ_LIB_DIRS ${ZeroMQ_LIBRARY_DIRS})
+            endif()
+            set(ZMQ_INCLUDES ${ZeroMQ_INCLUDE_DIRS})
+            set(_ZMQ_FOUND TRUE)
+        endif()
+    endif()
+    # Fall back to CMake config mode (vcpkg on Windows)
+    if(NOT _ZMQ_FOUND)
+        find_package(ZeroMQ CONFIG QUIET)
+        if(ZeroMQ_FOUND)
+            message(STATUS "found ZeroMQ via CMake config")
+            set(ZMQ_LIBS libzmq)
+            set(ZMQ_INCLUDES "")
+            set(ZMQ_LIB_DIRS "")
+            set(_ZMQ_FOUND TRUE)
+        endif()
+    endif()
+    if(NOT _ZMQ_FOUND)
         message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run install.sh to build from submodules.")
     endif()
 endif()
@@ -487,6 +571,12 @@ if(WRP_CORE_ENABLE_HDF5)
             endif()
         endif()
 
+        # libhdf5.so (system package) depends on libcurl internally;
+        # the linker needs it listed explicitly due to --as-needed.
+        find_package(CURL QUIET)
+        if(CURL_FOUND)
+            list(APPEND HDF5_LIBRARIES CURL::libcurl)
+        endif()
     else()
         message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run install.sh to build from submodules.")
     endif()
@@ -533,13 +623,30 @@ if(WRP_CORE_ENABLE_PYTHON)
   # Find Python for nanobind
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-  # Add nanobind as subdirectory (git submodule)
-  add_subdirectory(external/nanobind)
+  # Fetch nanobind (no submodule needed)
+  include(FetchContent)
+  FetchContent_Declare(nanobind
+      GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+      GIT_TAG        v2.9.2
+      GIT_SHALLOW    ON
+  )
+  FetchContent_MakeAvailable(nanobind)
+
+  # Determine the real site-packages directory for the detected Python.
+  # Python_SITEARCH is an absolute path (works for venv, conda, and system Python).
+  # Fall back to a relative path under CMAKE_INSTALL_PREFIX if unavailable.
+  if(Python_SITEARCH)
+      set(PYTHON_SITE_PACKAGES "${Python_SITEARCH}" CACHE PATH
+          "Python site-packages directory (absolute)")
+  else()
+      set(PYTHON_SITE_PACKAGES
+          "${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages"
+          CACHE PATH "Python site-packages directory (fallback)")
+  endif()
 
   message(STATUS "Python bindings enabled:")
   message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
-  message(STATUS "  Python bindings:    ${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
-  message(STATUS "  Python_SITEARCH:    ${Python_SITEARCH} (for reference only)")
+  message(STATUS "  Site-packages:      ${PYTHON_SITE_PACKAGES}")
 else()
   message(STATUS "Python bindings disabled")
 endif()
@@ -556,8 +663,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  # Clang 14+ supports coroutines in C++20 mode natively
-  message(STATUS "Clang detected - coroutines enabled via C++20 mode")
+  # GCC's libstdc++ <coroutine> header (the default C++ runtime on Linux)
+  # guards itself with __cpp_impl_coroutine, which GCC sets via -fcoroutines.
+  # Clang does not pass that flag automatically, so we add it explicitly so
+  # the libstdc++ header compiles cleanly under Clang.
+  add_compile_options(-fcoroutines)
+  message(STATUS "Clang detected - enabling coroutines with -fcoroutines (libstdc++ compat)")
 endif()
 
 # Export compile commands for IDE integration - Applied to all subdirectories
@@ -566,105 +677,110 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Position Independent Code - Applied to all subdirectories
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# RPATH configuration - Conditionally enabled based on WRP_CORE_ENABLE_RPATH
-if(WRP_CORE_ENABLE_RPATH)
-message(STATUS "RPATH ENABLED with ABSOLUTE paths including all dependency locations")
-set(CMAKE_SKIP_BUILD_RPATH FALSE)
-set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)  # CRITICAL: Include dependency library paths!
-
-# Build list of ABSOLUTE RPATH entries
-set(ABSOLUTE_RPATH_LIST "")
-
-# 1. Installation lib directory (ABSOLUTE)
-list(APPEND ABSOLUTE_RPATH_LIST "${CMAKE_INSTALL_PREFIX}/lib")
-
-# 2. Conda environment lib directory (if Conda support is enabled)
-if(IN_CONDA_BUILD)
-    list(APPEND ABSOLUTE_RPATH_LIST "$ENV{CONDA_PREFIX}/lib")
-    message(STATUS "  Adding Conda lib to RPATH: $ENV{CONDA_PREFIX}/lib")
-endif()
-
-# 3. Add HDF5 library directories if enabled
-if(WRP_CORE_ENABLE_HDF5 AND HDF5_LIBRARY_DIRS)
-    foreach(HDF5_LIB_DIR ${HDF5_LIBRARY_DIRS})
-        list(APPEND ABSOLUTE_RPATH_LIST "${HDF5_LIB_DIR}")
-        message(STATUS "  Adding HDF5 lib to RPATH: ${HDF5_LIB_DIR}")
-    endforeach()
-endif()
-
-# 5. Add any CMAKE_PREFIX_PATH lib directories
-if(CMAKE_PREFIX_PATH)
-    foreach(PREFIX_PATH ${CMAKE_PREFIX_PATH})
-        if(EXISTS "${PREFIX_PATH}/lib")
-            list(APPEND ABSOLUTE_RPATH_LIST "${PREFIX_PATH}/lib")
-            message(STATUS "  Adding prefix lib to RPATH: ${PREFIX_PATH}/lib")
-        endif()
-        if(EXISTS "${PREFIX_PATH}/lib64")
-            list(APPEND ABSOLUTE_RPATH_LIST "${PREFIX_PATH}/lib64")
-            message(STATUS "  Adding prefix lib64 to RPATH: ${PREFIX_PATH}/lib64")
-        endif()
-    endforeach()
-endif()
-
-# Remove duplicates
-list(REMOVE_DUPLICATES ABSOLUTE_RPATH_LIST)
-
-# Platform-specific RPATH configuration
-if(APPLE)
-    set(CMAKE_MACOSX_RPATH TRUE)
-    set(CMAKE_INSTALL_RPATH "${ABSOLUTE_RPATH_LIST}")
-    set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
-elseif(UNIX)
-    set(CMAKE_INSTALL_RPATH "${ABSOLUTE_RPATH_LIST}")
-    set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
-endif()
-
-message(STATUS "==================================================================")
-message(STATUS "RPATH Configuration (ABSOLUTE paths):")
-message(STATUS "  CMAKE_INSTALL_PREFIX: ${CMAKE_INSTALL_PREFIX}")
-message(STATUS "  Final INSTALL_RPATH: ${CMAKE_INSTALL_RPATH}")
-message(STATUS "  Final BUILD_RPATH: ${CMAKE_BUILD_RPATH}")
-message(STATUS "")
-message(STATUS "IMPORTANT: RPATH is baked in at BUILD time!")
-message(STATUS "  If you install to a different --prefix, you MUST rebuild!")
-message(STATUS "  Example: cmake --preset=release -DCMAKE_INSTALL_PREFIX=/new/path")
-message(STATUS "==================================================================")
-message(STATUS "")
+# ccache — accelerate rebuilds by caching compiled objects
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
 else()
-message(STATUS "RPATH DISABLED - libraries may require LD_LIBRARY_PATH configuration")
+    message(STATUS "ccache not found — install ccache for faster rebuilds")
+endif()
+
+# RPATH configuration - Uses $ORIGIN-relative paths for portability
+# This ensures binaries and libraries can find their dependencies regardless
+# of where the installation is located (works for system installs, pip wheels,
+# conda packages, and relocatable builds).
+if(WRP_CORE_ENABLE_RPATH)
+    set(CMAKE_SKIP_BUILD_RPATH FALSE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+    if(APPLE)
+        set(CMAKE_MACOSX_RPATH TRUE)
+        set(CMAKE_INSTALL_RPATH "@loader_path;@loader_path/../lib")
+        set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+    elseif(UNIX)
+        set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
+        set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+    endif()
+
+    message(STATUS "RPATH: Using relative paths ($ORIGIN/../lib)")
+    message(STATUS "  INSTALL_RPATH: ${CMAKE_INSTALL_RPATH}")
+    message(STATUS "  BUILD_RPATH:   ${CMAKE_BUILD_RPATH}")
+else()
+    message(STATUS "RPATH DISABLED - libraries may require LD_LIBRARY_PATH")
 endif()
 
 #------------------------------------------------------------------------------
 # Compiler Flags
 #------------------------------------------------------------------------------
-# Add compiler flags following Google C++ style guide
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-# Disable warnings that are false positives or from external dependencies
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-reorder")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pedantic -Wno-sign-compare -Wno-missing-field-initializers")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
+if(NOT MSVC)
+    # Add compiler flags following Google C++ style guide
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # Disable warnings that are false positives or from external dependencies
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-reorder")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pedantic -Wno-sign-compare -Wno-missing-field-initializers")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
+    # Suppress GCC false positives in template-heavy shared memory code (Release -O3)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-array-bounds -Wno-stringop-overflow")
+    # Suppress unused-result warnings (freopen/system in test code)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
 
-# Debug configuration
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
+    # Debug configuration
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
 
-# Release configuration
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+    # Release configuration
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
-# AddressSanitizer configuration
-if(WRP_CORE_ENABLE_ASAN)
-    message(STATUS "AddressSanitizer (ASAN) enabled for iowarp-core")
-    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
+    # AddressSanitizer + LeakSanitizer configuration
+    if(WRP_CORE_ENABLE_ASAN)
+        message(STATUS "AddressSanitizer + LeakSanitizer (ASan/LSan) enabled for iowarp-core")
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address)
+    endif()
+
+    # UndefinedBehaviorSanitizer configuration
+    if(WRP_CORE_ENABLE_UBSAN)
+        message(STATUS "UndefinedBehaviorSanitizer (UBSan) enabled for iowarp-core")
+        add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+        add_link_options(-fsanitize=undefined)
+    endif()
+
+    # MemorySanitizer configuration (incompatible with ASan; requires instrumented dependencies)
+    if(WRP_CORE_ENABLE_MSAN)
+        if(WRP_CORE_ENABLE_ASAN)
+            message(FATAL_ERROR "WRP_CORE_ENABLE_MSAN and WRP_CORE_ENABLE_ASAN are mutually exclusive")
+        endif()
+        message(STATUS "MemorySanitizer (MSan) enabled for iowarp-core")
+        message(WARNING "MSan requires all dependencies to be built with -fsanitize=memory; false-positives are expected from uninstrumented libs")
+        add_compile_options(-fsanitize=memory -fno-omit-frame-pointer -fsanitize-recover=memory
+                            -fsanitize-memory-track-origins=2
+                            -fsanitize-ignorelist=${CMAKE_SOURCE_DIR}/CI/msan_ignorelist.txt)
+        add_link_options(-fsanitize=memory)
+    endif()
+
+    # Code Coverage configuration
+    if(WRP_CORE_ENABLE_COVERAGE)
+        message(STATUS "Code coverage instrumentation enabled for iowarp-core")
+        add_compile_options(--coverage -fprofile-arcs -ftest-coverage)
+        add_link_options(--coverage)
+    endif()
+else()
+    # MSVC compiler flags
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Zi /Od /DDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
 endif()
 
-# Code Coverage configuration
-if(WRP_CORE_ENABLE_COVERAGE)
-    message(STATUS "Code coverage instrumentation enabled for iowarp-core")
-    add_compile_options(--coverage -fprofile-arcs -ftest-coverage)
-    add_link_options(--coverage)
+# When building for Python wheels on x86_64, restrict to baseline x86_64 ISA
+# so the wheel runs on any x86_64 CPU. AlmaLinux 9 (manylinux_2_34) defaults
+# to x86_64_v2 (SSE4.2/POPCNT) which auditwheel rejects for x86_64 wheels.
+if(DEFINED SKBUILD AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=x86-64")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64")
+    message(STATUS "Wheel build: restricting to baseline x86_64 ISA (-march=x86-64)")
 endif()
 
 #------------------------------------------------------------------------------
@@ -688,6 +804,27 @@ endforeach()
 if(WRP_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
+
+    # -----------------------------------------------------------------------
+    # Pre-test cleanup fixture
+    # Kills any orphaned Chimaera server processes and removes leftover shared
+    # state (IPC socket files, shared memory, memfd) that a previous crashed
+    # test run may have left behind.  Runs once before any other CTest test.
+    # -----------------------------------------------------------------------
+    add_test(
+        NAME chimaera_pre_test_cleanup
+        COMMAND bash -c
+            "fuser -k 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
+             rm -f /tmp/chimaera_*.ipc 2>/dev/null; \
+             rm -f /tmp/chimaera_server_timing.log 2>/dev/null; \
+             rm -rf /tmp/chimaera_memfd 2>/dev/null; \
+             rm -f /dev/shm/sm_segment.* 2>/dev/null; \
+             exit 0"
+    )
+    set_tests_properties(chimaera_pre_test_cleanup PROPERTIES
+        TIMEOUT 30
+        FIXTURES_SETUP chimaera_pre_test_cleanup_fixture
+    )
 endif()
 
 #------------------------------------------------------------------------------
@@ -761,12 +898,74 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
+# Context Visualizer (pure Python web dashboard)
+if(WRP_CORE_ENABLE_PYTHON)
+    message(STATUS "Building context-visualizer component (Python)")
+    add_subdirectory(context-visualizer)
+else()
+    message(STATUS "Context-visualizer component disabled (requires WRP_CORE_ENABLE_PYTHON)")
+endif()
+
 # Gray-Scott Example Application
 if(WRP_CORE_ENABLE_GRAY_SCOTT)
     message(STATUS "Building Gray-Scott ADIOS2 example")
     add_subdirectory(external/iowarp-gray-scott)
 else()
     message(STATUS "Gray-Scott example disabled")
+endif()
+
+#------------------------------------------------------------------------------
+# Serialize Chimaera runtime tests to prevent port 9413 conflicts
+#------------------------------------------------------------------------------
+# All tests that start a Chimaera server compete for the same default port
+# (9413). Under parallel ctest execution (e.g. ctest -j4) this causes
+# "Address already in use" failures. RESOURCE_LOCK ensures only one such
+# test runs at a time. CTP tests (context-transport-primitives) use different
+# ports or no server, so they are intentionally excluded here.
+#
+# get_directory_property(TESTS) only returns tests from the exact directory
+# scope, not from nested subdirectories. We therefore recurse through the
+# full SUBDIRECTORIES tree of each component to apply the lock.
+if(WRP_CORE_ENABLE_TESTS)
+    # Build the LSAN_OPTIONS value when ASan or combined sanitize is enabled,
+    # so that ctest (run standalone or via run_sanitizers.sh) always finds the
+    # suppressions file and does not falsely fail on known architectural leaks.
+    set(_lsan_opts "")
+    if(WRP_CORE_ENABLE_ASAN AND NOT WRP_CORE_ENABLE_MSAN)
+        set(_lsan_opts
+            "detect_leaks=1:halt_on_error=0:print_stacktrace=1:symbolize=1:suppressions=${CMAKE_SOURCE_DIR}/CI/lsan_suppressions.txt")
+    endif()
+
+    function(_chimaera_lock_tests_recursive dir lsan_opts)
+        get_directory_property(_tests DIRECTORY "${dir}" TESTS)
+        if(_tests)
+            set_tests_properties(${_tests}
+                DIRECTORY "${dir}"
+                PROPERTIES RESOURCE_LOCK "chimaera_runtime_port")
+            if(lsan_opts)
+                set_tests_properties(${_tests}
+                    DIRECTORY "${dir}"
+                    PROPERTIES ENVIRONMENT_MODIFICATION
+                        "LSAN_OPTIONS=set:${lsan_opts}")
+            endif()
+        endif()
+        get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
+        foreach(_sub ${_subdirs})
+            _chimaera_lock_tests_recursive("${_sub}" "${lsan_opts}")
+        endforeach()
+    endfunction()
+
+    foreach(_component_dir
+            context-runtime
+            context-transfer-engine
+            context-assimilation-engine
+            context-exploration-engine)
+        if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+            _chimaera_lock_tests_recursive(
+                "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
+                "${_lsan_opts}")
+        endif()
+    endforeach()
 endif()
 
 # IOWarp KV Cache + Weight Offload libraries (wrp_llm_kvcache, wrp_llm_weights).
@@ -899,15 +1098,96 @@ message(STATUS "    Context Exploration:        ${WRP_CORE_ENABLE_CEE}")
 message(STATUS "  ")
 message(STATUS "  External Examples:")
 message(STATUS "    Gray-Scott (ADIOS2):        ${WRP_CORE_ENABLE_GRAY_SCOTT}")
-message(STATUS "    llama.cpp LLM integration:  ${WRP_CORE_ENABLE_LLAMA}")
 message(STATUS "  ")
 message(STATUS "  Global Options:")
 message(STATUS "    Enable Tests:               ${WRP_CORE_ENABLE_TESTS}")
 message(STATUS "    Python Bindings:            ${WRP_CORE_ENABLE_PYTHON}")
-message(STATUS "    AddressSanitizer:           ${WRP_CORE_ENABLE_ASAN}")
+message(STATUS "    AddressSanitizer (ASan):    ${WRP_CORE_ENABLE_ASAN}")
+message(STATUS "    UndefinedBehaviorSan (UBSan): ${WRP_CORE_ENABLE_UBSAN}")
+message(STATUS "    MemorySanitizer (MSan):     ${WRP_CORE_ENABLE_MSAN}")
 message(STATUS "    Code Coverage:              ${WRP_CORE_ENABLE_COVERAGE}")
 message(STATUS "")
 
+
+#------------------------------------------------------------------------------
+# Pip Package Component
+#------------------------------------------------------------------------------
+set(PIP_PKG_DIR "iowarp_core")
+
+# Shared libraries -> iowarp_core/lib/
+set(PIP_LIB_TARGETS hermes_shm_host chimaera_cxx)
+if(TARGET chimaera_admin_client)
+  list(APPEND PIP_LIB_TARGETS chimaera_admin_client chimaera_admin_runtime)
+endif()
+if(TARGET chimaera_bdev_client)
+  list(APPEND PIP_LIB_TARGETS chimaera_bdev_client chimaera_bdev_runtime)
+endif()
+if(WRP_CORE_ENABLE_CTE AND TARGET wrp_cte_core_client)
+  list(APPEND PIP_LIB_TARGETS wrp_cte_core_client wrp_cte_core_runtime)
+  if(TARGET wrp_cte_cae_config)
+    list(APPEND PIP_LIB_TARGETS wrp_cte_cae_config)
+  endif()
+endif()
+if(WRP_CORE_ENABLE_CAE AND TARGET wrp_cae_core_client)
+  list(APPEND PIP_LIB_TARGETS wrp_cae_core_client wrp_cae_core_runtime)
+endif()
+if(WRP_CORE_ENABLE_CEE AND TARGET wrp_cee_api)
+  list(APPEND PIP_LIB_TARGETS wrp_cee_api)
+endif()
+
+install(TARGETS ${PIP_LIB_TARGETS}
+  COMPONENT pip_package
+  LIBRARY DESTINATION ${PIP_PKG_DIR}/lib
+  ARCHIVE DESTINATION ${PIP_PKG_DIR}/lib
+  RUNTIME DESTINATION ${PIP_PKG_DIR}/bin)
+
+# CLI binary -> iowarp_core/bin/
+if(TARGET chimaera)
+  install(TARGETS chimaera
+    COMPONENT pip_package
+    RUNTIME DESTINATION ${PIP_PKG_DIR}/bin)
+  # Also install to PYTHON_SITE_PACKAGES/iowarp_core/bin/ so that
+  # `sudo make install` keeps the binary in sync with the Python package,
+  # matching how chimaera_runtime_ext.so is installed directly to site-packages.
+  if(WRP_CORE_ENABLE_PYTHON AND PYTHON_SITE_PACKAGES)
+    install(TARGETS chimaera
+      RUNTIME DESTINATION "${PYTHON_SITE_PACKAGES}/iowarp_core/bin")
+  endif()
+endif()
+
+# Python extensions -> iowarp_core/ext/
+if(WRP_CORE_ENABLE_PYTHON)
+  if(TARGET wrp_cte_core_ext)
+    install(TARGETS wrp_cte_core_ext
+      COMPONENT pip_package
+      LIBRARY DESTINATION ${PIP_PKG_DIR}/ext)
+  endif()
+  if(TARGET wrp_cee)
+    install(TARGETS wrp_cee
+      COMPONENT pip_package
+      LIBRARY DESTINATION ${PIP_PKG_DIR}/ext)
+  endif()
+  # Context Visualizer -> iowarp_core/visualizer/
+  install(DIRECTORY context-visualizer/context_visualizer/
+    COMPONENT pip_package
+    DESTINATION ${PIP_PKG_DIR}/visualizer
+    FILES_MATCHING
+      PATTERN "*.py"
+      PATTERN "*.html"
+      PATTERN "*.css"
+      PATTERN "*.js")
+endif()
+
+# Default config -> iowarp_core/data/
+install(FILES context-runtime/config/chimaera_default.yaml
+  COMPONENT pip_package
+  DESTINATION ${PIP_PKG_DIR}/data)
+
+# .pth file at site-packages root so "import wrp_cee" works without
+# explicitly importing iowarp_core first (triggers _setup() at startup).
+install(FILES installers/pip/iowarp_core.pth
+  COMPONENT pip_package
+  DESTINATION .)
 
 #------------------------------------------------------------------------------
 # CPack Configuration

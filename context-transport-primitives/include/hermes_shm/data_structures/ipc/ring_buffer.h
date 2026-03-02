@@ -34,7 +34,11 @@
 #ifndef HSHM_DATA_STRUCTURES_IPC_RING_BUFFER_H_
 #define HSHM_DATA_STRUCTURES_IPC_RING_BUFFER_H_
 
+#ifdef _WIN32
+using pid_t = int;
+#else
 #include <sys/types.h>
+#endif
 
 #include "hermes_shm/constants/macros.h"
 #include "hermes_shm/data_structures/ipc/shm_container.h"
@@ -486,6 +490,30 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   HSHM_INLINE_CROSS_FUN
   bool TryPop(T& val) { return Pop(val); }
+
+  /**
+   * Peek at an element by absolute index (monotonic event ID).
+   * Does NOT advance head. Returns false if idx is out of current range.
+   */
+  HSHM_INLINE_CROSS_FUN
+  bool Peek(u64 idx, T &val) const {
+    u64 head = head_.load();
+    u64 tail = tail_.load();
+    if (idx < head || idx >= tail) return false;
+    size_t slot = idx % queue_.size();
+    const entry_type &entry = queue_[slot];
+    if (!entry.IsReady()) return false;
+    val = entry.data_;
+    return true;
+  }
+
+  /** Get monotonically increasing head (oldest valid event ID) */
+  HSHM_INLINE_CROSS_FUN
+  u64 GetHead() const { return head_.load(); }
+
+  /** Get monotonically increasing tail (next event ID to be written) */
+  HSHM_INLINE_CROSS_FUN
+  u64 GetTail() const { return tail_.load(); }
 
   /**
    * Clear the buffer

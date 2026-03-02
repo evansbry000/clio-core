@@ -17,6 +17,7 @@
 [![License](https://img.shields.io/badge/License-BSD%203--Clause-yellow.svg)](LICENSE)
 [![IoWarp](https://img.shields.io/badge/IoWarp-GitHub-blue.svg)](http://github.com/iowarp)
 [![GRC](https://img.shields.io/badge/GRC-Website-blue.svg)](https://grc.iit.edu/)
+[![codecov](https://codecov.io/gh/iowarp/clio-core/graph/badge.svg)](https://codecov.io/gh/iowarp/clio-core)
 
 ## Overview
 
@@ -136,6 +137,21 @@ Interactive tools and interfaces for exploring scientific data contents and meta
 
 ## Installation
 
+### Cloning the Repository
+
+IOWarp Core uses git submodules for several dependencies. Always clone with `--recurse-submodules`:
+
+```bash
+git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+cd clio-core
+```
+
+If you already cloned without submodules, initialize them with:
+
+```bash
+git submodule update --init --recursive
+```
+
 ### Native
 
 The following command will install conda, rattler-build, and iowarp in a single script.
@@ -155,10 +171,10 @@ Before running our code, start the Chimaera runtime:
 ```bash
 # Start with custom configuration
 export CHI_SERVER_CONF=/workspace/docker/wrp_cte_bench/cte_config.yaml
-chimaera_start_runtime
+chimaera runtime start
 
 # Run in background
-chimaera_start_runtime &
+chimaera runtime start &
 ```
 
 **Environment Variables:**
@@ -180,7 +196,7 @@ memory:
 
 # Network configuration
 networking:
-  port: 5555                              # ZeroMQ port
+  port: 9413                              # ZeroMQ port
   neighborhood_size: 32                   # Max nodes for range queries
 
 # Runtime configuration

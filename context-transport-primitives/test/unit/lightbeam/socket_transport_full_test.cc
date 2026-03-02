@@ -43,14 +43,14 @@
 
 using namespace hshm::lbm;
 
-class TestMeta : public LbmMeta {
+class TestMeta : public LbmMeta<> {
  public:
   int request_id = 0;
   std::string operation;
 
   template <typename Ar>
   void serialize(Ar& ar) {
-    LbmMeta::serialize(ar);
+    LbmMeta<>::serialize(ar);
     ar(request_id, operation);
   }
 };
@@ -130,7 +130,7 @@ void TestMultipleBulks() {
   std::vector<std::string> data_chunks = {"Chunk 1", "Chunk 2 is longer",
                                           "Chunk 3", "Final chunk 4"};
 
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   for (const auto& chunk : data_chunks) {
     send_meta.send.push_back(client->Expose(
         hipc::FullPtr<char>(const_cast<char*>(chunk.data())),
@@ -141,7 +141,7 @@ void TestMultipleBulks() {
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   auto info = RecvWithRetry(server.get(), recv_meta);
   assert(info.rc == 0);
   assert(recv_meta.send.size() == data_chunks.size());
@@ -236,7 +236,7 @@ void TestBulkExpose() {
   const char* data = "expose_only_data";
   size_t size = strlen(data);
 
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   send_meta.send.push_back(client->Expose(
       hipc::FullPtr<char>(const_cast<char*>(data)), size, BULK_EXPOSE));
   send_meta.send_bulks = 0;
@@ -244,7 +244,7 @@ void TestBulkExpose() {
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   auto info = RecvWithRetry(server.get(), recv_meta);
   assert(info.rc == 0);
   assert(recv_meta.recv.size() == 1);
@@ -272,7 +272,7 @@ void TestLargeTransfer() {
     large_data[i] = static_cast<char>('A' + (i % 26));
   }
 
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   send_meta.send.push_back(client->Expose(
       hipc::FullPtr<char>(large_data.data()), large_size, BULK_XFER));
   send_meta.send_bulks = 1;
@@ -283,7 +283,7 @@ void TestLargeTransfer() {
     send_rc = client->Send(send_meta);
   });
 
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   auto info = RecvWithRetry(server.get(), recv_meta);
   assert(info.rc == 0);
   assert(recv_meta.recv.size() == 1);
@@ -318,25 +318,6 @@ void TestGetAddress() {
   std::cout << "[Socket GetAddress] Test passed!\n";
 }
 
-void TestGetFd() {
-  std::cout << "\n==== Testing Socket GetFd ====\n";
-
-  std::string addr = "127.0.0.1";
-  int port = 9106;
-
-  auto server = std::make_unique<SocketTransport>(
-      TransportMode::kServer, addr, "tcp", port);
-  auto client = std::make_unique<SocketTransport>(
-      TransportMode::kClient, addr, "tcp", port);
-
-  // Server returns listen_fd, client returns connected fd
-  assert(server->GetFd() >= 0);
-  assert(client->GetFd() >= 0);
-
-  std::cout << "[Socket GetFd] Test passed! (server=" << server->GetFd()
-            << ", client=" << client->GetFd() << ")\n";
-}
-
 void TestClearRecvHandles() {
   std::cout << "\n==== Testing Socket ClearRecvHandles ====\n";
 
@@ -351,7 +332,7 @@ void TestClearRecvHandles() {
   const char* data = "clear_handles_test";
   size_t size = strlen(data);
 
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   send_meta.send.push_back(client->Expose(
       hipc::FullPtr<char>(const_cast<char*>(data)), size, BULK_XFER));
   send_meta.send_bulks = 1;
@@ -359,7 +340,7 @@ void TestClearRecvHandles() {
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   auto info = RecvWithRetry(server.get(), recv_meta);
   assert(info.rc == 0);
 
@@ -624,7 +605,7 @@ void TestAcceptNewClient() {
   std::cout << "\n==== Testing Socket AcceptNewClient ====\n";
 
   std::string addr = "127.0.0.1";
-  int port = 9115;
+  int port = 9200;
 
   auto server = std::make_unique<SocketTransport>(
       TransportMode::kServer, addr, "tcp", port);
@@ -647,7 +628,21 @@ void TestAcceptNewClient() {
 
   // First Recv triggers accept internally
   TestMeta recv_meta;
-  auto info = RecvWithRetry(server.get(), recv_meta);
+  int attempts = 0;
+  ClientInfo info;
+  while (true) {
+    info = server->Recv(recv_meta);
+    if (info.rc == 0) break;
+    if (info.rc != EAGAIN) {
+      std::cerr << "Recv failed: " << info.rc << "\n";
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (++attempts > 5000) {
+      std::cerr << "Recv timed out after 5000 attempts\n";
+      break;
+    }
+  }
   assert(info.rc == 0);
   assert(recv_meta.request_id == 77);
   // The fd should be a valid accepted client fd
@@ -660,18 +655,25 @@ void TestAcceptNewClient() {
 int main() {
   TestTcpBasic();
   TestMultipleBulks();
+#ifndef _WIN32
   TestUnixDomain();
+#else
+  std::cout << "\n[Skipped] Unix Domain (not supported on Windows)\n";
+#endif
   TestMetadataOnly();
   TestBulkExpose();
   TestLargeTransfer();
   TestGetAddress();
-  TestGetFd();
   TestClearRecvHandles();
   TestBidirectional();
   TestMultiClient();
   TestMultiClientWithEM();
   TestFactoryTcp();
+#ifndef _WIN32
   TestFactoryIpc();
+#else
+  std::cout << "\n[Skipped] Factory IPC (not supported on Windows)\n";
+#endif
   TestFactoryDefault();
   TestFactoryWithDomain();
   TestIsServerIsClient();

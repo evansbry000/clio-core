@@ -1,5 +1,6 @@
 # Introspect tests
 
+if(NOT WIN32)
 # Test for MapMixedMemory functionality
 add_executable(test_mixed_mapping test_mixed_mapping.cc)
 target_link_libraries(test_mixed_mapping hshm::cxx)
@@ -15,8 +16,11 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-# Set timeout for mixed mapping test (multi-process, needs more time)
+# Set timeout and pass build dir so the script finds the binary in any preset
 set_tests_properties(
   ctp_mixed_mapping
-  PROPERTIES TIMEOUT 15
+  PROPERTIES
+    TIMEOUT 15
+    ENVIRONMENT "CMAKE_BINARY_DIR=${CMAKE_BINARY_DIR}"
 )
+endif()

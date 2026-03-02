@@ -44,14 +44,14 @@
 using namespace hshm::lbm;
 
 // Custom metadata class that inherits from LbmMeta
-class TestMeta : public LbmMeta {
+class TestMeta : public LbmMeta<> {
  public:
   int request_id;
   std::string operation;
 
   template <typename Ar>
   void serialize(Ar& ar) {
-    LbmMeta::serialize(ar);
+    LbmMeta<>::serialize(ar);
     ar(request_id, operation);
   }
 };
@@ -124,6 +124,7 @@ void TestBasicTcpTransfer() {
   assert(received1 == data1);
   assert(received2 == data2);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Socket TCP Basic] Test passed!\n";
 }
 
@@ -139,7 +140,7 @@ void TestMultipleBulks() {
   std::vector<std::string> data_chunks = {"Chunk 1", "Chunk 2 is longer",
                                           "Chunk 3", "Final chunk 4"};
 
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   for (const auto& chunk : data_chunks) {
     Bulk bulk = client->Expose(
         hipc::FullPtr<char>(const_cast<char*>(chunk.data())),
@@ -151,7 +152,7 @@ void TestMultipleBulks() {
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   int attempts = 0;
   while (true) {
     auto info = server->Recv(recv_meta);
@@ -176,6 +177,7 @@ void TestMultipleBulks() {
     assert(received == data_chunks[i]);
   }
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Socket Multiple Bulks] Test passed!\n";
 }
 
@@ -227,6 +229,7 @@ void TestUnixDomainSocket() {
   std::cout << "Received: " << received << "\n";
   assert(received == data);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Socket IPC] Test passed!\n";
 }
 
@@ -273,7 +276,11 @@ void TestMetadataOnly() {
 int main() {
   TestBasicTcpTransfer();
   TestMultipleBulks();
+#ifndef _WIN32
   TestUnixDomainSocket();
+#else
+  std::cout << "\n[Skipped] Unix Domain Socket (not supported on Windows)\n";
+#endif
   TestMetadataOnly();
   std::cout << "\nAll socket transport tests passed!" << std::endl;
   return 0;

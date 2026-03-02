@@ -43,14 +43,14 @@
 using namespace hshm::lbm;
 
 // Custom metadata class that inherits from LbmMeta
-class TestMeta : public LbmMeta {
+class TestMeta : public LbmMeta<> {
  public:
   int request_id;
   std::string operation;
 
   template <typename Ar>
   void serialize(Ar& ar) {
-    LbmMeta::serialize(ar);
+    LbmMeta<>::serialize(ar);
     ar(request_id, operation);
   }
 };
@@ -125,6 +125,7 @@ void TestBasicTransfer() {
   assert(received1 == data1);
   assert(received2 == data2);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[New API] Test passed!\n";
 #else
   std::cout << "ZMQ not enabled, skipping test\n";
@@ -149,7 +150,7 @@ void TestMultipleBulks() {
                                           "Chunk 3", "Final chunk 4"};
 
   // Create metadata
-  LbmMeta send_meta;
+  LbmMeta<> send_meta;
   for (const auto& chunk : data_chunks) {
     Bulk bulk = client->Expose(
         hipc::FullPtr<char>(const_cast<char*>(chunk.data())),
@@ -162,7 +163,7 @@ void TestMultipleBulks() {
   assert(rc == 0);
 
   // Recv with retry loop (does everything - metadata + bulks)
-  LbmMeta recv_meta;
+  LbmMeta<> recv_meta;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -183,6 +184,7 @@ void TestMultipleBulks() {
     assert(received == data_chunks[i]);
   }
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Multiple Bulks] Test passed!\n";
 #else
   std::cout << "ZMQ not enabled, skipping test\n";

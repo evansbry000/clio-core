@@ -36,12 +36,13 @@
 
 #include "hermes_shm/introspect/system_info.h"
 
-#include <dlfcn.h>
-
 #include <cstdlib>
+#include <filesystem>
 
 #include "hermes_shm/constants/macros.h"
 #if HSHM_ENABLE_PROCFS_SYSINFO
+#include <dlfcn.h>
+#include <signal.h>
 // LINUX
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -78,11 +79,13 @@ void SystemInfo::RefreshCpuFreqKhz() {
 size_t SystemInfo::GetCpuFreqKhz(int cpu) {
 #if HSHM_IS_HOST
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
-  std::string cpu_str = hshm::Formatter::format(
-      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_cur_freq", cpu);
-  std::ifstream cpu_file(cpu_str);
-  size_t freq_khz;
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_cur_freq
+  // Use snprintf to build the path so MSan can track the buffer as initialized
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
   cpu_file >> freq_khz;
   return freq_khz;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
@@ -96,11 +99,12 @@ size_t SystemInfo::GetCpuFreqKhz(int cpu) {
 size_t SystemInfo::GetCpuMaxFreqKhz(int cpu) {
 #if HSHM_IS_HOST
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
-  std::string cpu_str = hshm::Formatter::format(
-      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu);
-  std::ifstream cpu_file(cpu_str);
-  size_t freq_khz;
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
   cpu_file >> freq_khz;
   return freq_khz;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
@@ -289,6 +293,48 @@ size_t SystemInfo::GetRamCapacity() {
 #endif
 }
 
+size_t SystemInfo::GetRamAvailable() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream meminfo("/proc/meminfo");
+  if (!meminfo.is_open()) return 0;
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      size_t kb = 0;
+      std::sscanf(line.c_str(), "MemAvailable: %zu", &kb);
+      return kb * 1024;  // convert kB to bytes
+    }
+  }
+  return 0;
+#else
+  return 0;
+#endif
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  MEMORYSTATUSEX mem_info;
+  mem_info.dwLength = sizeof(mem_info);
+  GlobalMemoryStatusEx(&mem_info);
+  return static_cast<size_t>(mem_info.ullAvailPhys);
+#else
+  return 0;
+#endif
+}
+
+CpuTimes SystemInfo::GetCpuTimes() {
+  CpuTimes ct = {};
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream stat("/proc/stat");
+  if (stat.is_open()) {
+    std::string cpu_label;
+    stat >> cpu_label >> ct.user >> ct.nice >> ct.system >> ct.idle
+         >> ct.iowait >> ct.irq >> ct.softirq >> ct.steal;
+  }
+#endif
+#endif
+  return ct;
+}
+
 void SystemInfo::YieldThread() {
 #if HSHM_ENABLE_PROCFS_SYSINFO
   sched_yield();
@@ -299,8 +345,11 @@ void SystemInfo::YieldThread() {
 
 bool SystemInfo::CreateTls(ThreadLocalKey &key, void *data) {
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  key.pthread_key_ = pthread_key_create(&key.pthread_key_, nullptr);
-  return key.pthread_key_ == 0;
+  int ret = pthread_key_create(&key.pthread_key_, nullptr);
+  if (ret != 0) {
+    return false;
+  }
+  return SetTls(key, data);
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
   key.windows_key_ = TlsAlloc();
   if (key.windows_key_ == TLS_OUT_OF_INDEXES) {
@@ -326,22 +375,27 @@ void *SystemInfo::GetTls(const ThreadLocalKey &key) {
 #endif
 }
 
-#if HSHM_ENABLE_PROCFS_SYSINFO && __linux__
-static const char *kMemfdDir = "/tmp/chimaera_memfd";
+std::string SystemInfo::GetMemfdDir() {
+  const char *user = getenv("USER");
+  if (!user) user = "unknown";
+  return std::string("/tmp/chimaera_") + user;
+}
 
-static std::string GetMemfdPath(const std::string &name) {
+std::string SystemInfo::GetMemfdPath(const std::string &name) {
   // Strip leading '/' from name if present
   const char *base = name.c_str();
   if (base[0] == '/') {
     base++;
   }
-  return std::string(kMemfdDir) + "/" + base;
+  return GetMemfdDir() + "/" + base;
 }
 
-static void EnsureMemfdDir() {
-  mkdir(kMemfdDir, 0777);
-}
+void SystemInfo::EnsureMemfdDir() {
+  std::string dir = GetMemfdDir();
+#if HSHM_ENABLE_PROCFS_SYSINFO && __linux__
+  mkdir(dir.c_str(), 0700);
 #endif
+}
 
 bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
                                        size_t size) {
@@ -538,6 +592,67 @@ void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {
 #endif
 }
 
+bool SystemInfo::IsProcessAlive(int pid) {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  return kill(pid, 0) != -1 || errno != ESRCH;
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                         static_cast<DWORD>(pid));
+  if (h == NULL) return false;
+  CloseHandle(h);
+  return true;
+#endif
+}
+
+std::string SystemInfo::GetModuleDirectory() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  Dl_info dl_info;
+  void *addr = reinterpret_cast<void *>(&SystemInfo::GetModuleDirectory);
+  if (dladdr(addr, &dl_info) == 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(dl_info.dli_fname, resolved) == nullptr) return "";
+  return std::filesystem::path(resolved).parent_path().string();
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  HMODULE hModule = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&SystemInfo::GetModuleDirectory),
+          &hModule)) {
+    return "";
+  }
+  char path[MAX_PATH];
+  if (GetModuleFileNameA(hModule, path, MAX_PATH) == 0) return "";
+  return std::filesystem::path(path).parent_path().string();
+#endif
+}
+
+std::string SystemInfo::GetLibrarySearchPathVar() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  return "LD_LIBRARY_PATH";
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  return "PATH";
+#endif
+}
+
+char SystemInfo::GetPathListSeparator() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  return ':';
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  return ';';
+#endif
+}
+
+std::string SystemInfo::GetSharedLibExtension() {
+#if HSHM_ENABLE_WINDOWS_SYSINFO
+  return ".dll";
+#elif __APPLE__
+  return ".dylib";
+#else
+  return ".so";
+#endif
+}
+
 std::string SystemInfo::Getenv(const char *name, size_t max_size) {
 #if HSHM_ENABLE_PROCFS_SYSINFO
   char *var = getenv(name);
@@ -548,7 +663,12 @@ std::string SystemInfo::Getenv(const char *name, size_t max_size) {
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
   std::string var;
   var.resize(max_size);
-  GetEnvironmentVariable(name, var.data(), var.size());
+  DWORD len = GetEnvironmentVariable(name, var.data(),
+                                     static_cast<DWORD>(var.size()));
+  if (len == 0) {
+    return "";
+  }
+  var.resize(len);
   return var;
 #endif
   std::cout << "undefined" << std::endl;
