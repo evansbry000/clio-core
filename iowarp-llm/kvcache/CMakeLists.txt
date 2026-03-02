@@ -25,8 +25,11 @@ target_link_libraries(wrp_llm_kvcache
 )
 
 # Enable D2H/H2D staging-copy code paths inside kvcache_manager.cc.
+# Also provide CUDA toolkit include dirs (cuda_runtime.h) for that code.
 if(WRP_CORE_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
     target_compile_definitions(wrp_llm_kvcache PRIVATE IOWARP_LLM_ENABLE_CUDA)
+    target_link_libraries(wrp_llm_kvcache PRIVATE CUDA::cudart)
 endif()
 
 install(TARGETS wrp_llm_kvcache

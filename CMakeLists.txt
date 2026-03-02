@@ -792,6 +792,14 @@ if(WRP_CORE_ENABLE_LLAMA)
         add_subdirectory(external/llama.cpp)
         message(STATUS "llama.cpp server integration enabled")
 
+        # llama.cpp's project("llama.cpp" C CXX) call may partially reset CMake's
+        # CUDA platform variables (_CMAKE_CUDA_WHOLE_FLAG etc.).  Re-enabling CUDA
+        # at the top level forces CMake to re-run CMakeCUDAInformation.cmake and
+        # restore all required device-link variables before generating build rules.
+        if(WRP_CORE_ENABLE_CUDA)
+            enable_language(CUDA)
+        endif()
+
         # Patch llama.cpp targets with IOWarp KV-cache definitions NOW — after
         # add_subdirectory(external/llama.cpp) so that server-context and llama
         # targets actually exist.  The if(TARGET ...) guards in iowarp-llm/
@@ -806,6 +814,22 @@ if(WRP_CORE_ENABLE_LLAMA)
             target_compile_definitions(llama PRIVATE IOWARP_LLM_KVCACHE)
             target_link_libraries(llama PRIVATE wrp_llm_kvcache)
             message(STATUS "iowarp-llm: patched llama with IOWARP_LLM_KVCACHE")
+        endif()
+
+        # IOWarp weight offloading via GpuVmm — requires CUDA and wrp_llm_weights.
+        # wrp_llm_weights is only built when WRP_CORE_ENABLE_CUDA=ON (it depends
+        # on wrp_cte_uvm which needs CUDA driver API).
+        if(WRP_CORE_ENABLE_CUDA AND TARGET wrp_llm_weights)
+            if(TARGET server-context)
+                target_compile_definitions(server-context PRIVATE IOWARP_LLM_WEIGHTS)
+                target_link_libraries(server-context PRIVATE wrp_llm_weights)
+                message(STATUS "iowarp-llm: patched server-context with IOWARP_LLM_WEIGHTS")
+            endif()
+            if(TARGET llama)
+                target_compile_definitions(llama PRIVATE IOWARP_LLM_WEIGHTS)
+                target_link_libraries(llama PRIVATE wrp_llm_weights)
+                message(STATUS "iowarp-llm: patched llama with IOWARP_LLM_WEIGHTS")
+            endif()
         endif()
     else()
         message(STATUS "llama.cpp server integration skipped (set WRP_CORE_ENABLE_LLAMA_SERVER=ON)")
