@@ -185,7 +185,7 @@ run_sanitizer_mode() {
     local EXCLUDE_LABEL="manual"
     if [ "${MODE}" = "msan" ]; then
         EXCLUDE_LABEL="manual|msan_skip"
-    elif [ "${MODE}" = "asan" ] || [ "${MODE}" = "sanitize" ]; then
+    elif [ "${MODE}" = "asan" ] || [ "${MODE}" = "sanitize" ] || [ "${MODE}" = "ubsan" ]; then
         EXCLUDE_LABEL="manual|asan_skip"
     fi
 

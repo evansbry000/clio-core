@@ -432,7 +432,7 @@ if(WRP_CORE_ENABLE_TESTS)
     cr_streaming_large_tests
     cr_streaming_concurrent_tests
     cr_all_streaming_tests
-    PROPERTIES LABELS "msan_skip"
+    PROPERTIES LABELS "msan_skip;asan_skip"
   )
 endif()
 

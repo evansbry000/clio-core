@@ -209,3 +209,15 @@ leak:chi::IpcManager::RouteGlobal
 # through the abandoned coroutine frame.
 # ---------------------------------------------------------------------------
 leak:chimaera::admin::Runtime::SendIn
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Container::DefineModel() and SetMethodNames() allocations
+# DefineModel() resizes four std::vector<float> members (method_model_,
+# method_mape_, method_model_wall_, method_mape_wall_) and SetMethodNames()
+# stores a std::vector<std::string>. Both are virtual / non-virtual methods
+# in chimaera/container.h, called during pool Init. When the server shuts
+# down without destroying container objects, these vectors are never freed.
+# Suppressed via source-file path because GCC 11 LSAN does not reliably
+# substring-match virtual function names in its suppression engine.
+# ---------------------------------------------------------------------------
+leak:chimaera/container.h
