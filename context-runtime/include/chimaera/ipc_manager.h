@@ -145,16 +145,31 @@ struct ClientShmInfo {
 
 /**
  * GPU data transfer object for IpcManager initialization
- * Packs a MemoryBackend and optional TaskQueue pointer for kernel launch
+ * Packs a MemoryBackend, bidirectional queues, and config for kernel launch
  */
-struct IpcManagerGpu {
+struct IpcManagerGpuInfo {
   hipc::MemoryBackend backend;
-  TaskQueue *worker_queue = nullptr;
+  TaskQueue *to_gpu_queue = nullptr;      /**< CPU → GPU queue (megakernel polls) */
+  TaskQueue *from_gpu_queue = nullptr;    /**< GPU → CPU queue (CPU worker polls) */
+  TaskQueue *gpu_to_gpu_queue = nullptr;  /**< GPU → GPU queue (megakernel polls) */
+  char *queue_backend_base = nullptr;     /**< Base of queue backend for ShmPtr resolution */
+  u32 gpu_queue_depth = 16;
 
-  HSHM_CROSS_FUN IpcManagerGpu() = default;
-  HSHM_CROSS_FUN IpcManagerGpu(const hipc::MemoryBackend &b, TaskQueue *wq)
-      : backend(b), worker_queue(wq) {}
+  HSHM_CROSS_FUN IpcManagerGpuInfo() = default;
+  HSHM_CROSS_FUN IpcManagerGpuInfo(const hipc::MemoryBackend &b,
+                                    TaskQueue *to_gpu, TaskQueue *from_gpu,
+                                    u32 depth = 16)
+      : backend(b), to_gpu_queue(to_gpu), from_gpu_queue(from_gpu),
+        gpu_queue_depth(depth) {}
+
+  /** Backward-compatible constructor (2-arg: backend + single queue) */
+  HSHM_CROSS_FUN IpcManagerGpuInfo(const hipc::MemoryBackend &b, TaskQueue *wq)
+      : backend(b), to_gpu_queue(nullptr), from_gpu_queue(wq),
+        gpu_queue_depth(16) {}
 };
+
+/** Backward compatibility alias */
+using IpcManagerGpu = IpcManagerGpuInfo;
 
 /**
  * IPC Manager singleton for inter-process communication
@@ -193,14 +208,17 @@ class IpcManager {
    *   [pointer table (num_threads ptrs)] [arena_0] [arena_1] ... [arena_N-1]
    * Thread 0 creates all allocators; other threads wait on __syncthreads()
    * num_threads is computed automatically by CHIMAERA_GPU_INIT
-   * @param gpu_info IpcManagerGpu with backend and optional worker queue
+   * @param gpu_info IpcManagerGpuInfo with backend and optional queues
    * @param num_threads Total number of GPU threads in the block
    */
   HSHM_CROSS_FUN
-  void ClientInitGpu(IpcManagerGpu &gpu_info, int num_threads) {
+  void ClientInitGpu(IpcManagerGpuInfo &gpu_info, int num_threads) {
     gpu_backend_ = gpu_info.backend;
     gpu_backend_initialized_ = true;
-    gpu_worker_queue_ = gpu_info.worker_queue;
+    gpu_worker_queue_ = gpu_info.from_gpu_queue;
+    gpu_to_gpu_queue_ = gpu_info.to_gpu_queue;
+    gpu_to_gpu_local_queue_ = gpu_info.gpu_to_gpu_queue;
+    gpu_queue_backend_base_ = gpu_info.queue_backend_base;
 
     // Layout: [alloc_table (num_threads pointers)] [arena0] [arena1] ...
     char *base = gpu_backend_.data_;
@@ -236,11 +254,17 @@ class IpcManager {
 
 #if HSHM_IS_HOST
   /**
-   * Pack current GPU backend + queue into an IpcManagerGpu struct
-   * @return IpcManagerGpu for passing to GPU kernels
+   * Pack current GPU backend + queues into an IpcManagerGpuInfo struct
+   * @return IpcManagerGpuInfo for passing to GPU kernels
    */
-  IpcManagerGpu GetIpcManagerGpu() {
-    return IpcManagerGpu(gpu_backend_, gpu_worker_queue_);
+  IpcManagerGpuInfo GetIpcManagerGpuInfo() {
+    return IpcManagerGpuInfo(gpu_backend_, gpu_to_gpu_queue_,
+                              gpu_worker_queue_);
+  }
+
+  /** Backward-compatible alias */
+  IpcManagerGpuInfo GetIpcManagerGpu() {
+    return GetIpcManagerGpuInfo();
   }
 #endif
 
@@ -495,6 +519,70 @@ class IpcManager {
       // spin
     }
     hipc::threadfence();
+  }
+#endif  // HSHM_IS_GPU_COMPILER
+
+#if HSHM_IS_GPU_COMPILER
+  /**
+   * Send a task to the GPU→GPU queue (local megakernel dispatch).
+   *
+   * Same logic as SendGpu but pushes to gpu_to_gpu_local_queue_ instead
+   * of gpu_worker_queue_. Used by GPU kernels to submit follow-up tasks
+   * that should be processed by the megakernel rather than the CPU.
+   *
+   * @tparam TaskT Task type (must derive from Task)
+   * @param task_ptr Task to send
+   * @return Future<TaskT> for polling completion
+   */
+  template <typename TaskT>
+  HSHM_GPU_FUN Future<TaskT> SendGpuLocal(
+      const hipc::FullPtr<TaskT> &task_ptr) {
+    if (task_ptr.shm_.IsNull()) {
+      return Future<TaskT>();
+    }
+
+    // 1. Allocate FutureShm with ring-buffer copy_space
+    size_t copy_space_size = task_ptr->GetCopySpaceSize();
+    if (copy_space_size == 0) copy_space_size = 4096;
+    size_t alloc_size = sizeof(FutureShm) + copy_space_size;
+    hipc::FullPtr<char> buffer = AllocateBuffer(alloc_size);
+    if (buffer.IsNull()) {
+      return Future<TaskT>();
+    }
+
+    // 2. Construct FutureShm
+    FutureShm *future_shm = new (buffer.ptr_) FutureShm();
+    future_shm->pool_id_ = task_ptr->pool_id_;
+    future_shm->method_id_ = task_ptr->method_;
+    future_shm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    future_shm->client_task_vaddr_ = 0;
+    future_shm->input_.copy_space_size_ = copy_space_size;
+    future_shm->output_.copy_space_size_ = copy_space_size;
+    future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
+
+    // 3. Create Future and LbmContext
+    hipc::ShmPtr<FutureShm> fshmptr =
+        buffer.shm_.template Cast<FutureShm>();
+    Future<TaskT> future(fshmptr, task_ptr);
+    hshm::lbm::LbmContext ctx;
+    ctx.copy_space = future_shm->copy_space;
+    ctx.shm_info_ = &future_shm->input_;
+
+    // 4. Enqueue to GPU→GPU queue
+    if (gpu_to_gpu_local_queue_ != nullptr) {
+      auto &lane = gpu_to_gpu_local_queue_->GetLane(0, 0);
+      Future<Task> task_future(future.GetFutureShmPtr());
+      lane.Push(task_future);
+    }
+
+    // 5. Serialize task input via ring buffer
+    auto *alloc = gpu_alloc_table_[GetGpuThreadId()];
+    hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> buf(alloc);
+    LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeIn, buf, alloc);
+    task_ptr->SerializeIn(save_ar);
+    hshm::lbm::ShmTransport::Send(save_ar, ctx);
+
+    return future;
   }
 #endif  // HSHM_IS_GPU_COMPILER
 
@@ -1425,6 +1513,117 @@ class IpcManager {
     gpu_queues_.push_back(queue);
   }
 
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  /**
+   * Get number of CPU→GPU queues
+   * @return Number of to_gpu queues (one per GPU device)
+   */
+  size_t GetToGpuQueueCount() const { return to_gpu_queues_.size(); }
+
+  /**
+   * Get CPU→GPU queue by index
+   * @param gpu_id GPU device ID (0-based)
+   * @return Pointer to TaskQueue or nullptr if invalid gpu_id
+   */
+  TaskQueue *GetToGpuQueue(size_t gpu_id) {
+    if (gpu_id < to_gpu_queues_.size()) {
+      return to_gpu_queues_[gpu_id].ptr_;
+    }
+    return nullptr;
+  }
+
+  /**
+   * Get number of GPU→GPU queues
+   * @return Number of gpu_to_gpu queues (one per GPU device)
+   */
+  size_t GetGpuToGpuQueueCount() const { return gpu_to_gpu_queues_.size(); }
+
+  /**
+   * Get GPU→GPU queue by index
+   * @param gpu_id GPU device ID (0-based)
+   * @return Pointer to TaskQueue or nullptr if invalid gpu_id
+   */
+  TaskQueue *GetGpuToGpuQueue(size_t gpu_id) {
+    if (gpu_id < gpu_to_gpu_queues_.size()) {
+      return gpu_to_gpu_queues_[gpu_id].ptr_;
+    }
+    return nullptr;
+  }
+  /**
+   * Allocate a buffer from the GPU queue backend (pinned host memory).
+   *
+   * Used by SendToGpu to allocate FutureShm in GPU-accessible memory
+   * that both the CPU and the megakernel can access.
+   *
+   * @param size Number of bytes to allocate
+   * @param gpu_id GPU device ID (0-based)
+   * @return FullPtr to allocated buffer, or null on failure
+   */
+  hipc::FullPtr<char> AllocateGpuBuffer(size_t size, u32 gpu_id = 0);
+
+  /**
+   * Submit a task from the CPU to the GPU megakernel.
+   *
+   * Allocates FutureShm in the GPU queue backend (pinned host memory),
+   * serializes the task input via ShmTransport::Send, and pushes
+   * a Future<Task> onto to_gpu_queues_[gpu_id] for the megakernel to pop.
+   *
+   * @tparam TaskT Task type (must derive from Task)
+   * @param task_ptr Task to submit
+   * @param gpu_id Target GPU device ID (0-based)
+   * @return Future<TaskT> for polling completion
+   */
+  template <typename TaskT>
+  Future<TaskT> SendToGpu(const hipc::FullPtr<TaskT> &task_ptr,
+                           u32 gpu_id = 0) {
+    if (task_ptr.IsNull() || gpu_id >= to_gpu_queues_.size()) {
+      return Future<TaskT>();
+    }
+
+    // Allocate FutureShm in GPU queue backend
+    size_t copy_space_size = task_ptr->GetCopySpaceSize();
+    if (copy_space_size == 0) copy_space_size = 4096;
+    size_t alloc_size = sizeof(FutureShm) + copy_space_size;
+    hipc::FullPtr<char> buffer = AllocateGpuBuffer(alloc_size, gpu_id);
+    if (buffer.IsNull()) {
+      return Future<TaskT>();
+    }
+
+    // Construct FutureShm
+    FutureShm *future_shm = new (buffer.ptr_) FutureShm();
+    future_shm->pool_id_ = task_ptr->pool_id_;
+    future_shm->method_id_ = task_ptr->method_;
+    future_shm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    future_shm->client_task_vaddr_ = 0;
+    future_shm->input_.copy_space_size_ = copy_space_size;
+    future_shm->output_.copy_space_size_ = copy_space_size;
+    future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
+
+    // Create Future
+    hipc::ShmPtr<FutureShm> fshmptr =
+        buffer.shm_.template Cast<FutureShm>();
+    Future<TaskT> future(fshmptr, task_ptr);
+
+    // Serialize task input into copy_space ring buffer
+    hshm::lbm::LbmContext ctx;
+    ctx.copy_space = future_shm->copy_space;
+    ctx.shm_info_ = &future_shm->input_;
+    LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeIn);
+    task_ptr->SerializeIn(save_ar);
+    hshm::lbm::ShmTransport::Send(save_ar, ctx);
+
+    // Push to CPU→GPU queue
+    auto &lane = to_gpu_queues_[gpu_id].ptr_->GetLane(0, 0);
+    Future<Task> task_future(future.GetFutureShmPtr());
+    bool pushed = lane.Push(task_future);
+    HLOG(kInfo, "SendToGpu: queue={} pushed={} head={} tail={}",
+         (void *)to_gpu_queues_[gpu_id].ptr_, pushed,
+         lane.GetHead(), lane.GetTail());
+
+    return future;
+  }
+#endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+
   /**
    * Assign all registered GPU queue lanes to the GPU worker.
    * Call after RegisterGpuQueue to make the worker poll GPU lanes.
@@ -1550,6 +1749,22 @@ class IpcManager {
    * @return true if successful, false otherwise
    */
   bool ServerInitGpuQueues();
+
+ public:
+  /**
+   * Launch the persistent GPU megakernel
+   * Must be called after ServerInitGpuQueues and pool manager init
+   * @return true if successful or no GPUs available
+   */
+  bool LaunchMegakernel();
+
+ private:
+
+  /**
+   * Stop the GPU megakernel and free resources
+   */
+  void FinalizeMegakernel();
+
 #endif
 
   /**
@@ -1760,16 +1975,50 @@ class IpcManager {
   /** Pointer to current thread's GPU ArenaAllocator (backward compat) */
   hipc::ArenaAllocator<false> *gpu_thread_allocator_ = nullptr;
 
-  /** Pointer to GPU worker queue for task submission (GPU kernel only) */
+  /** Pointer to GPU→CPU queue for task submission (from_gpu_queue) */
   TaskQueue *gpu_worker_queue_ = nullptr;
+
+  /** Pointer to CPU→GPU queue for megakernel dispatch (to_gpu_queue) */
+  TaskQueue *gpu_to_gpu_queue_ = nullptr;
+
+  /** Pointer to GPU→GPU queue (megakernel polls for local GPU tasks) */
+  TaskQueue *gpu_to_gpu_local_queue_ = nullptr;
+
+  /** Base pointer of queue backend for ShmPtr resolution on GPU */
+  char *gpu_queue_backend_base_ = nullptr;
+
+  /** Stored IpcManagerGpuInfo for megakernel launch */
+  IpcManagerGpuInfo gpu_megakernel_info_;
 
   /** Flag indicating if GPU backend is initialized */
   bool gpu_backend_initialized_ = false;
+
+  /** Opaque pointer to MegakernelLauncher (defined in megakernel_gpu.cc) */
+  void *megakernel_launcher_ = nullptr;
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   // GPU memory backends (one per GPU device, using pinned host memory)
   // Placed at end of class to maintain ABI stability across CUDA/non-CUDA builds
   std::vector<std::unique_ptr<hipc::GpuShmMmap>> gpu_backends_;
+
+  /** CPU → GPU queues (one per GPU, megakernel polls these) */
+  std::vector<hipc::FullPtr<TaskQueue>> to_gpu_queues_;
+
+  /** GPU → GPU queues (one per GPU, megakernel polls these) */
+  std::vector<hipc::FullPtr<TaskQueue>> gpu_to_gpu_queues_;
+
+  /** Megakernel scratch backends (one per GPU, for per-block ArenaAllocators) */
+  std::vector<std::unique_ptr<hipc::GpuShmMmap>> megakernel_backends_;
+
+  /** Register a GPU container with the megakernel's pool manager */
+  void RegisterMegakernelContainer(const PoolId &pool_id,
+                                   void *gpu_container_ptr);
+
+  /** Pause the megakernel to free SMs for GPU container allocation */
+  void PauseMegakernel();
+
+  /** Resume the megakernel after GPU container allocation */
+  void ResumeMegakernel();
 #endif
 
  private:
@@ -1848,8 +2097,32 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
   int thread_id = chi::IpcManager::GetGpuThreadId();                          \
   int num_threads = chi::IpcManager::GetGpuNumThreads();                      \
   if (thread_id == 0) {                                                       \
-    chi::IpcManagerGpu g_gpu_info_ = gpu_info;                                \
+    chi::IpcManagerGpuInfo g_gpu_info_ = gpu_info;                            \
     g_ipc_manager_ptr->ClientInitGpu(g_gpu_info_, num_threads);               \
+  }                                                                           \
+  __syncthreads();                                                            \
+  chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
+
+/**
+ * Megakernel initialization macro — splits the alloc backend per block.
+ *
+ * Each block gets (data_capacity / num_blocks) bytes of scratch memory.
+ * ClientInitGpu further splits each block's region among its threads.
+ * Thread 0 of each block performs initialization; all threads sync.
+ *
+ * @param gpu_info IpcManagerGpuInfo with backend and queue pointers
+ * @param num_blocks Total number of blocks in the megakernel grid
+ */
+#define CHIMAERA_MEGAKERNEL_INIT(gpu_info, num_blocks)                         \
+  chi::IpcManager *g_ipc_manager_ptr = chi::IpcManager::GetBlockIpcManager(); \
+  int thread_id = chi::IpcManager::GetGpuThreadId();                          \
+  int num_threads = chi::IpcManager::GetGpuNumThreads();                      \
+  if (thread_id == 0) {                                                       \
+    chi::IpcManagerGpuInfo block_info = gpu_info;                             \
+    size_t per_block = block_info.backend.data_capacity_ / (num_blocks);      \
+    block_info.backend.data_ += blockIdx.x * per_block;                       \
+    block_info.backend.data_capacity_ = per_block;                            \
+    g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads);                \
   }                                                                           \
   __syncthreads();                                                            \
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr

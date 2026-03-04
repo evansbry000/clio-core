@@ -57,7 +57,7 @@ namespace hshm {
 
 /** Dynamically load shared libraries */
 struct SharedLibrary {
-  void *handle_;
+  void *handle_ = nullptr;
 
   SharedLibrary() = default;
   HSHM_DLL SharedLibrary(const std::string &name);

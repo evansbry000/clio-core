@@ -64,12 +64,26 @@ extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id, chi::u32
 extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
                                           chi::u32 test_value,
                                           chi::u32 *out_result_value);
+extern "C" int run_cpu_to_gpu_test(chi::PoolId pool_id,
+                                    chi::u32 test_value,
+                                    chi::u32 *out_result_value);
+extern "C" int run_gpu_to_cpu_test(chi::PoolId pool_id,
+                                    chi::u32 test_value,
+                                    chi::u32 *out_result_value);
 #else
-extern "C" inline int run_gpu_kernel_task_submission_test(chi::PoolId, chi::u32) {
+extern "C" __attribute__((weak)) int run_gpu_kernel_task_submission_test(chi::PoolId, chi::u32) {
   return -200;  // No GPU support compiled
 }
-extern "C" inline int run_gpu_full_runtime_test(chi::PoolId, chi::u32,
+extern "C" __attribute__((weak)) int run_gpu_full_runtime_test(chi::PoolId, chi::u32,
                                                  chi::u32 *) {
+  return -200;
+}
+extern "C" __attribute__((weak)) int run_cpu_to_gpu_test(chi::PoolId, chi::u32,
+                                           chi::u32 *) {
+  return -200;
+}
+extern "C" __attribute__((weak)) int run_gpu_to_cpu_test(chi::PoolId, chi::u32,
+                                           chi::u32 *) {
   return -200;
 }
 #endif
@@ -313,6 +327,85 @@ TEST_CASE("gpu_full_runtime_roundtrip", "[gpu][runtime][roundtrip]") {
 
   REQUIRE(result == 1);
   REQUIRE(result_value == (test_value * 2) + 0);  // Runtime handler: (test_value*2)+gpu_id
+}
+
+/**
+ * Test: CPU → GPU via SendToGpu with PoolQuery::LocalGpuBcast
+ * CPU creates a GpuSubmitTask, calls SendToGpu to push to megakernel,
+ * megakernel's gpu::Worker dispatches to MOD_NAME GpuRuntime on GPU,
+ * CPU polls FUTURE_COMPLETE and verifies result.
+ */
+TEST_CASE("cpu_to_gpu_local_bcast", "[gpu][cpu_to_gpu]") {
+  // Initialize if not already done
+  if (!g_initialized) {
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    REQUIRE(success);
+    g_initialized = true;
+    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+    std::this_thread::sleep_for(500ms);
+  }
+
+  // Create unique pool ID for this test
+  g_test_counter++;
+  chi::PoolId pool_id(10000, g_test_counter);
+
+  // Create MOD_NAME container (triggers GPU container registration)
+  chimaera::MOD_NAME::Client client(pool_id);
+  std::string pool_name = "cpu_to_gpu_test_" + std::to_string(pool_id.ToU64());
+  auto create_task = client.AsyncCreate(chi::PoolQuery::Dynamic(), pool_name, pool_id);
+  create_task.Wait();
+  REQUIRE(create_task->return_code_ == 0);
+  std::this_thread::sleep_for(200ms);
+
+  // Run the CPU→GPU test via wrapper
+  chi::u32 test_value = 77;
+  chi::u32 result_value = 0;
+  int result = run_cpu_to_gpu_test(pool_id, test_value, &result_value);
+
+  INFO("CPU→GPU test result: " + std::to_string(result));
+  INFO("Result value: " + std::to_string(result_value));
+
+  REQUIRE(result == 1);
+  REQUIRE(result_value == (test_value * 2) + 0);  // GPU: (test_value*2)+gpu_id
+}
+
+/**
+ * Test: GPU → CPU via SendGpu with PoolQuery::ToLocalCpu
+ * GPU kernel creates task with ToLocalCpu routing, calls AsyncGpuSubmit,
+ * CPU worker processes GpuSubmit method, GPU reads result.
+ */
+TEST_CASE("gpu_to_cpu_local", "[gpu][gpu_to_cpu]") {
+  // Initialize if not already done
+  if (!g_initialized) {
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    REQUIRE(success);
+    g_initialized = true;
+    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+    std::this_thread::sleep_for(500ms);
+  }
+
+  // Create unique pool ID for this test
+  g_test_counter++;
+  chi::PoolId pool_id(10000, g_test_counter);
+
+  // Create MOD_NAME container
+  chimaera::MOD_NAME::Client client(pool_id);
+  std::string pool_name = "gpu_to_cpu_test_" + std::to_string(pool_id.ToU64());
+  auto create_task = client.AsyncCreate(chi::PoolQuery::Dynamic(), pool_name, pool_id);
+  create_task.Wait();
+  REQUIRE(create_task->return_code_ == 0);
+  std::this_thread::sleep_for(200ms);
+
+  // Run the GPU→CPU test via wrapper
+  chi::u32 test_value = 88;
+  chi::u32 result_value = 0;
+  int result = run_gpu_to_cpu_test(pool_id, test_value, &result_value);
+
+  INFO("GPU→CPU test result: " + std::to_string(result));
+  INFO("Result value: " + std::to_string(result_value));
+
+  REQUIRE(result == 1);
+  REQUIRE(result_value == (test_value * 2) + 0);  // CPU runtime: (test_value*2)+gpu_id
 }
 
 //==============================================================================

@@ -440,6 +440,31 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   add_test(NAME ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} COMMAND ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET})
+
+  # GPU Runtime test executable (pure host code, compiled by g++)
+  set(GPU_RUNTIME_TEST_TARGET test_chimaera_gpu_runtime)
+  set(GPU_RUNTIME_TEST_SOURCES test_gpu_runtime.cc)
+  add_executable(${GPU_RUNTIME_TEST_TARGET} ${GPU_RUNTIME_TEST_SOURCES})
+  target_include_directories(${GPU_RUNTIME_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test
+  )
+  target_link_libraries(${GPU_RUNTIME_TEST_TARGET}
+    chimaera_cxx
+    hshm::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${GPU_RUNTIME_TEST_TARGET} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_gpu_runtime_tests COMMAND ${GPU_RUNTIME_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_runtime_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    LABELS "msan_skip"
+  )
 endif()
 
 # Enable CTest integration if testing is enabled

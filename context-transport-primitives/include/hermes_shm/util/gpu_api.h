@@ -78,6 +78,46 @@ class GpuApi {
 #endif
   }
 
+  /** Synchronize a specific GPU stream instead of the whole device */
+  static void Synchronize(void *stream) {
+#if HSHM_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipStreamSynchronize(static_cast<hipStream_t>(stream)));
+#endif
+#if HSHM_ENABLE_CUDA
+    CUDA_ERROR_CHECK(
+        cudaStreamSynchronize(static_cast<cudaStream_t>(stream)));
+#endif
+  }
+
+  /** Create a non-blocking GPU stream */
+  static void *CreateStream() {
+    void *stream = nullptr;
+#if HSHM_ENABLE_ROCM
+    hipStream_t s;
+    HIP_ERROR_CHECK(
+        hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
+    stream = s;
+#endif
+#if HSHM_ENABLE_CUDA
+    cudaStream_t s;
+    CUDA_ERROR_CHECK(
+        cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    stream = s;
+#endif
+    return stream;
+  }
+
+  /** Destroy a GPU stream */
+  static void DestroyStream(void *stream) {
+#if HSHM_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipStreamDestroy(static_cast<hipStream_t>(stream)));
+#endif
+#if HSHM_ENABLE_CUDA
+    CUDA_ERROR_CHECK(
+        cudaStreamDestroy(static_cast<cudaStream_t>(stream)));
+#endif
+  }
+
   static void GetIpcMemHandle(GpuIpcMemHandle &ipc, void *data) {
 #if HSHM_ENABLE_ROCM
     HIP_ERROR_CHECK(hipIpcGetMemHandle(&ipc.rocm_, (void *)data));
@@ -107,9 +147,9 @@ class GpuApi {
     return ptr;
 #endif
 #if HSHM_ENABLE_CUDA
-    T *ptr;
-    CUDA_ERROR_CHECK(cudaMalloc(&ptr, size));
-    return ptr;
+    void *vptr;
+    CUDA_ERROR_CHECK(cudaMalloc(&vptr, size));
+    return static_cast<T *>(vptr);
 #endif
   }
 
@@ -121,9 +161,9 @@ class GpuApi {
     return ptr;
 #endif
 #if HSHM_ENABLE_CUDA
-    T *ptr;
-    CUDA_ERROR_CHECK(cudaMallocManaged(&ptr, size));
-    return ptr;
+    void *vptr;
+    CUDA_ERROR_CHECK(cudaMallocManaged(&vptr, size));
+    return static_cast<T *>(vptr);
 #endif
     return nullptr;
   }
@@ -151,7 +191,7 @@ class GpuApi {
   }
 
   template <typename T>
-  static void Memcpy(T *dst, T *src, size_t size) {
+  static void Memcpy(T *dst, const T *src, size_t size) {
 #if HSHM_ENABLE_ROCM
     HIP_ERROR_CHECK(hipMemcpy(dst, src, size, hipMemcpyDefault));
 #endif
@@ -199,7 +239,7 @@ class GpuApi {
 #endif
   }
 
-#if HSHM_ENABLE_CUDA_OR_ROCM
+#if HSHM_IS_GPU_COMPILER
   HSHM_GPU_FUN static size_t GetGlobalThreadId() {
     return threadIdx.x + blockIdx.x * blockDim.x +
            (threadIdx.y + blockIdx.y * blockDim.y) * (blockDim.x * gridDim.x) +

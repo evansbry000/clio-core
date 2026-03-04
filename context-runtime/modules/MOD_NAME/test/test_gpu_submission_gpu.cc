@@ -45,7 +45,11 @@
 #include <chimaera/singletons.h>
 #include <chimaera/task.h>
 #include <chimaera/types.h>
+#include <chimaera/local_task_archives.h>
 #include <hermes_shm/util/gpu_api.h>
+#include <hermes_shm/lightbeam/shm_transport.h>
+#include <chrono>
+#include <thread>
 
 /**
  * GPU kernel that submits a task from within the kernel
@@ -199,6 +203,147 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
 
   gpu_full_runtime_kernel<<<1, 1>>>(gpu_info, pool_id, test_value, d_result,
                                      d_rv);
+
+  cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    hshm::GpuApi::Free(d_result);
+    hshm::GpuApi::Free(d_rv);
+    return -201;
+  }
+
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    hshm::GpuApi::Free(d_result);
+    hshm::GpuApi::Free(d_rv);
+    return -200;
+  }
+
+  hshm::GpuApi::Memcpy(&h_result, d_result, sizeof(int));
+  hshm::GpuApi::Memcpy(&h_rv, d_rv, sizeof(chi::u32));
+
+  *out_result_value = h_rv;
+  hshm::GpuApi::Free(d_result);
+  hshm::GpuApi::Free(d_rv);
+  return h_result;
+}
+
+/**
+ * CPU→GPU test: CPU calls SendToGpu to push task to megakernel.
+ * Megakernel's gpu::Worker dispatches to MOD_NAME GpuRuntime.
+ * CPU polls FUTURE_COMPLETE and deserializes output.
+ */
+extern "C" int run_cpu_to_gpu_test(chi::PoolId pool_id,
+                                    chi::u32 test_value,
+                                    chi::u32 *out_result_value) {
+  auto *ipc = CHI_IPC;
+
+  // Create the task with LocalGpuBcast routing
+  auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::LocalGpuBcast(),
+      0, test_value);
+  if (task.IsNull()) {
+    return -1;  // NewTask failed
+  }
+
+  // Send to GPU megakernel via to_gpu_queue
+  auto future = ipc->SendToGpu(task, 0);
+  if (future.GetFutureShmPtr().IsNull()) {
+    return -2;  // SendToGpu failed
+  }
+
+  // Poll for FUTURE_COMPLETE
+  auto fshm_full = future.GetFutureShm();
+  chi::FutureShm *fshm = fshm_full.ptr_;
+  int attempts = 0;
+  while (!fshm->flags_.Any(chi::FutureShm::FUTURE_COMPLETE)) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    ++attempts;
+    if (attempts > 50000) {  // 5 second timeout
+      return -3;  // Timeout
+    }
+  }
+
+  // Deserialize output from FutureShm ring buffer
+  hshm::lbm::LbmContext ctx;
+  ctx.copy_space = fshm->copy_space;
+  ctx.shm_info_ = &fshm->output_;
+
+  chi::LocalLoadTaskArchive load_ar;
+  hshm::lbm::ShmTransport::Recv(load_ar, ctx);
+  load_ar.SetMsgType(chi::LocalMsgType::kSerializeOut);
+  task.ptr_->SerializeOut(load_ar);
+
+  *out_result_value = task->result_value_;
+  return 1;  // Success
+}
+
+/**
+ * GPU kernel: GPU submits task to CPU with ToLocalCpu routing.
+ * Uses AsyncGpuSubmit → SendGpu → gpu_worker_queue → CPU worker processes.
+ */
+__global__ void gpu_to_cpu_kernel(chi::IpcManagerGpu gpu_info,
+                                   chi::PoolId pool_id,
+                                   chi::u32 test_value,
+                                   int *d_result,
+                                   chi::u32 *d_result_value) {
+  *d_result = 0;
+  CHIMAERA_GPU_INIT(gpu_info);
+
+  chimaera::MOD_NAME::Client client(pool_id);
+  auto future = client.AsyncGpuSubmit(
+      chi::PoolQuery::ToLocalCpu(), 0, test_value);
+  future.Wait();
+
+  *d_result_value = future->result_value_;
+  *d_result = 1;  // success
+}
+
+/**
+ * C++ wrapper to launch the GPU→CPU test kernel.
+ * Sets up GPU backend and queue, launches kernel, waits for result.
+ */
+extern "C" int run_gpu_to_cpu_test(chi::PoolId pool_id,
+                                    chi::u32 test_value,
+                                    chi::u32 *out_result_value) {
+  cudaDeviceSetLimit(cudaLimitStackSize, 131072);
+
+  // Create GPU memory backend for kernel allocations
+  hipc::MemoryBackendId backend_id(5, 0);
+  hipc::GpuShmMmap gpu_backend;
+  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "/gpu_to_cpu", 0))
+    return -100;
+
+  // Create GPU queue in pinned shared memory
+  hipc::MemoryBackendId queue_backend_id(6, 0);
+  hipc::GpuShmMmap queue_backend;
+  if (!queue_backend.shm_init(queue_backend_id, 2 * 1024 * 1024,
+                               "/gpu_to_cpu_q", 0))
+    return -101;
+
+  auto *queue_alloc = queue_backend.MakeAlloc<hipc::ArenaAllocator<false>>(
+      queue_backend.data_capacity_);
+  if (!queue_alloc) return -103;
+
+  auto gpu_queue_ptr = queue_alloc->NewObj<chi::TaskQueue>(
+      queue_alloc, 1, 2, 1024);
+  if (gpu_queue_ptr.IsNull()) return -102;
+
+  // Register queue and assign to GPU worker
+  CHI_IPC->RegisterGpuQueue(gpu_queue_ptr);
+  CHI_IPC->AssignGpuLanesToWorker();
+  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                 gpu_backend.data_capacity_);
+
+  chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue_ptr.ptr_);
+
+  int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
+  chi::u32 *d_rv = hshm::GpuApi::Malloc<chi::u32>(sizeof(chi::u32));
+  int h_result = 0;
+  chi::u32 h_rv = 0;
+  hshm::GpuApi::Memcpy(d_result, &h_result, sizeof(int));
+  hshm::GpuApi::Memcpy(d_rv, &h_rv, sizeof(chi::u32));
+
+  gpu_to_cpu_kernel<<<1, 1>>>(gpu_info, pool_id, test_value, d_result, d_rv);
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {

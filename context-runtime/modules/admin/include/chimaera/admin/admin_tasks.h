@@ -1811,6 +1811,59 @@ struct AnnounceShutdownTask : public chi::Task {
   }
 };
 
+/**
+ * RegisterGpuContainerTask - Register a GPU container with the megakernel's
+ * gpu::PoolManager. Called during pool creation when a ChiMod has a GPU
+ * companion library. The device_ptr is obtained from new_chimod_gpu().
+ *
+ * On GPU: updates gpu::PoolManager::RegisterContainer(pool_id, device_ptr).
+ * On CPU: this is a no-op (megakernel handles it).
+ */
+struct RegisterGpuContainerTask : public chi::Task {
+  IN chi::PoolId target_pool_id_;
+  IN chi::u32 container_id_;
+  IN void *gpu_container_ptr_;  // Device pointer to gpu::Container
+
+  RegisterGpuContainerTask()
+      : chi::Task(), gpu_container_ptr_(nullptr) {}
+
+  explicit RegisterGpuContainerTask(const chi::TaskId &task_node,
+                                     const chi::PoolId &pool_id,
+                                     const chi::PoolQuery &pool_query,
+                                     const chi::PoolId &target_pool_id,
+                                     chi::u32 container_id,
+                                     void *gpu_container_ptr)
+      : chi::Task(task_node, pool_id, pool_query,
+                   Method::kRegisterGpuContainer),
+        target_pool_id_(target_pool_id),
+        container_id_(container_id),
+        gpu_container_ptr_(gpu_container_ptr) {
+  }
+
+  // Serialization support
+  template <class Archive>
+  void save(Archive &ar) const {
+    ar(target_pool_id_, container_id_);
+    // gpu_container_ptr_ is a device pointer, not serializable across nodes
+  }
+
+  template <class Archive>
+  void load(Archive &ar) {
+    ar(target_pool_id_, container_id_);
+    gpu_container_ptr_ = nullptr;
+  }
+
+  void Copy(const hipc::FullPtr<RegisterGpuContainerTask> &other) {
+    target_pool_id_ = other->target_pool_id_;
+    container_id_ = other->container_id_;
+    gpu_container_ptr_ = other->gpu_container_ptr_;
+  }
+
+  void CopyStart(const hipc::FullPtr<chi::Task> &other_base) {
+    Copy(other_base.template Cast<RegisterGpuContainerTask>());
+  }
+};
+
 }  // namespace chimaera::admin
 
 #endif  // ADMIN_TASKS_H_

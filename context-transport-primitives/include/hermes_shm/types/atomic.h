@@ -297,8 +297,12 @@ struct nonatomic {
   }
 };
 
-/** A wrapper for CUDA atomic operations */
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+/** A wrapper for CUDA atomic operations.
+ * Guarded by HSHM_IS_GPU_COMPILER because CUDA device builtins (atomicAdd,
+ * atomicExch, atomicCAS, etc.) are only available when compiling with nvcc/hipcc.
+ * Regular g++/clang++ compilations with HSHM_ENABLE_CUDA set should not parse
+ * this class since it's only used as hipc::atomic<T> inside device code. */
+#if HSHM_IS_GPU_COMPILER
 template <typename T>
 struct rocm_atomic {
   T x;
@@ -332,32 +336,48 @@ struct rocm_atomic {
     return *this;
   }
 
-  /** Atomic fetch_add wrapper*/
+  /** Atomic fetch_add wrapper */
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
   fetch_add(U count, std::memory_order order = std::memory_order_seq_cst) {
+#if HSHM_IS_GPU
     if constexpr (sizeof(T) == 8) {
-      return atomicAdd(reinterpret_cast<unsigned long long*>(&x), static_cast<unsigned long long>(count));
+      return (T)atomicAdd(reinterpret_cast<unsigned long long*>(&x),
+                          static_cast<unsigned long long>(
+                              static_cast<T>(count)));
     } else {
-      return atomicAdd(&x, count);
+      return atomicAdd(&x, static_cast<T>(count));
     }
+#else
+    T old = x;
+    x += static_cast<T>(count);
+    return old;
+#endif
   }
 
-  /** Atomic fetch_sub wrapper*/
+  /** Atomic fetch_sub wrapper */
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
   fetch_sub(U count, std::memory_order order = std::memory_order_seq_cst) {
+#if HSHM_IS_GPU
     if constexpr (sizeof(T) == 8) {
-      return atomicAdd(reinterpret_cast<unsigned long long*>(&x), static_cast<unsigned long long>(-count));
+      return (T)atomicAdd(reinterpret_cast<unsigned long long*>(&x),
+                          static_cast<unsigned long long>(
+                              static_cast<T>(-count)));
     } else {
-      return atomicAdd(&x, -count);
+      return atomicAdd(&x, static_cast<T>(-count));
     }
+#else
+    T old = x;
+    x -= static_cast<T>(count);
+    return old;
+#endif
   }
 
-  /** Atomic load wrapper */
+  /** Atomic load wrapper (volatile to prevent compiler caching in loops) */
   HSHM_INLINE_CROSS_FUN T
   load(std::memory_order order = std::memory_order_seq_cst) const {
-    return x;
+    return *reinterpret_cast<const volatile T*>(&x);
   }
 
   /** Atomic store wrapper */
@@ -371,46 +391,64 @@ struct rocm_atomic {
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
   exchange(U count, std::memory_order order = std::memory_order_seq_cst) {
+#if HSHM_IS_GPU
     if constexpr (sizeof(T) == 8) {
-      return atomicExch(reinterpret_cast<unsigned long long*>(&x), static_cast<unsigned long long>(count));
+      return (T)atomicExch(reinterpret_cast<unsigned long long*>(&x),
+                           static_cast<unsigned long long>(
+                               static_cast<T>(count)));
     } else {
-      return atomicExch(&x, count);
+      return atomicExch(&x, static_cast<T>(count));
     }
+#else
+    T old = x;
+    x = static_cast<T>(count);
+    return old;
+#endif
   }
 
-  /** System-scope atomic store (visible to CPU from GPU) */
+  /** System-scope atomic store (exchange + threadfence on GPU) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN void store_system(U count) {
-#if HSHM_IS_GPU
-    if constexpr (sizeof(T) == 8) {
-      atomicExch_system(reinterpret_cast<unsigned long long*>(&x),
-                        static_cast<unsigned long long>(count));
-    } else {
-      atomicExch_system(reinterpret_cast<unsigned int*>(&x),
-                        static_cast<unsigned int>(count));
-    }
-#else
     exchange(count);
+#if HSHM_IS_GPU
+    __threadfence_system();
 #endif
   }
 
-  /** System-scope atomic load (visible across GPU/CPU boundary).
-   * Uses volatile read since HostNativeAtomicSupported=0 on many GPUs
-   * means atomicAdd_system(ptr,0) won't see CPU-side writes. */
-  HSHM_INLINE_CROSS_FUN T load_system() const {
-#if HSHM_IS_GPU
-    return *reinterpret_cast<const volatile T*>(&x);
-#else
-    return x;
-#endif
-  }
+  /** System-scope atomic load (volatile, same as load) */
+  HSHM_INLINE_CROSS_FUN T load_system() const { return load(); }
 
   /** Atomic compare exchange weak wrapper */
   template <typename U>
   HSHM_INLINE_CROSS_FUN bool compare_exchange_weak(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-    return atomicCAS(const_cast<T *>(&x), expected, desired);
+#if HSHM_IS_GPU
+    if constexpr (sizeof(T) == 8) {
+      auto old = atomicCAS(reinterpret_cast<unsigned long long*>(
+                               const_cast<T*>(&x)),
+                           *reinterpret_cast<unsigned long long*>(&expected),
+                           static_cast<unsigned long long>(
+                               static_cast<T>(desired)));
+      T old_t = *reinterpret_cast<T*>(&old);
+      if (old_t == expected) return true;
+      expected = old_t;
+      return false;
+    } else {
+      T old = atomicCAS(const_cast<T*>(&x), expected,
+                        static_cast<T>(desired));
+      if (old == expected) return true;
+      expected = old;
+      return false;
+    }
+#else
+    if (x == expected) {
+      x = static_cast<T>(desired);
+      return true;
+    }
+    expected = x;
+    return false;
+#endif
   }
 
   /** Atomic compare exchange strong wrapper */
@@ -418,50 +456,81 @@ struct rocm_atomic {
   HSHM_INLINE_CROSS_FUN bool compare_exchange_strong(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-    return atomicCAS(const_cast<T *>(&x), expected, desired);
+#if HSHM_IS_GPU
+    if constexpr (sizeof(T) == 8) {
+      auto old = atomicCAS(reinterpret_cast<unsigned long long*>(
+                               const_cast<T*>(&x)),
+                           *reinterpret_cast<unsigned long long*>(&expected),
+                           static_cast<unsigned long long>(
+                               static_cast<T>(desired)));
+      T old_t = *reinterpret_cast<T*>(&old);
+      if (old_t == expected) return true;
+      expected = old_t;
+      return false;
+    } else {
+      T old = atomicCAS(const_cast<T*>(&x), expected,
+                        static_cast<T>(desired));
+      if (old == expected) return true;
+      expected = old;
+      return false;
+    }
+#else
+    if (x == expected) {
+      x = static_cast<T>(desired);
+      return true;
+    }
+    expected = x;
+    return false;
+#endif
   }
 
   /** Atomic pre-increment operator */
   HSHM_INLINE_CROSS_FUN rocm_atomic &operator++() {
-    atomicAdd(&x, 1);
+    fetch_add(1);
     return *this;
   }
 
   /** Atomic post-increment operator */
-  HSHM_INLINE_CROSS_FUN rocm_atomic operator++(int) { return atomic(x + 1); }
+  HSHM_INLINE_CROSS_FUN rocm_atomic operator++(int) {
+    T old = fetch_add(1);
+    return rocm_atomic(old);
+  }
 
   /** Atomic pre-decrement operator */
   HSHM_INLINE_CROSS_FUN rocm_atomic &operator--() {
-    atomicAdd(&x, (T)(-1));
+    fetch_sub(1);
     return (*this);
   }
 
   /** Atomic post-decrement operator */
-  HSHM_INLINE_CROSS_FUN rocm_atomic operator--(int) { return atomic(x - 1); }
-
-  /** Atomic add operator */
-  template <typename U>
-  HSHM_INLINE_CROSS_FUN rocm_atomic operator+(U count) const {
-    return atomicAdd(&x, count);
+  HSHM_INLINE_CROSS_FUN rocm_atomic operator--(int) {
+    T old = fetch_sub(1);
+    return rocm_atomic(old);
   }
 
-  /** Atomic subtract operator */
+  /** Atomic add operator (non-destructive, reads then adds) */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN rocm_atomic operator+(U count) const {
+    return rocm_atomic(load() + count);
+  }
+
+  /** Atomic subtract operator (non-destructive, reads then subtracts) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic operator-(U count) const {
-    return atomicAdd(&x, (T)(-count));
+    return rocm_atomic(load() - count);
   }
 
   /** Atomic add assign operator */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &operator+=(U count) {
-    atomicAdd(&x, count);
+    fetch_add(count);
     return *this;
   }
 
   /** Atomic subtract assign operator */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &operator-=(U count) {
-    atomicAdd(&x, -count);
+    fetch_sub(count);
     return *this;
   }
 
@@ -472,79 +541,92 @@ struct rocm_atomic {
     return *this;
   }
 
-  /** Equality check (number) */
+  /** Equality check (non-destructive: load then compare) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN bool operator==(U other) const {
-    return atomicCAS(const_cast<T *>(&x), other, other);
+    return load() == static_cast<T>(other);
   }
 
-  /** Inequality check (number) */
+  /** Inequality check (non-destructive: load then compare) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN bool operator!=(U other) const {
-    return !atomicCAS(const_cast<T *>(&x), other, other);
+    return load() != static_cast<T>(other);
   }
 
   /** Equality check */
   HSHM_INLINE_CROSS_FUN bool operator==(const rocm_atomic &other) const {
-    return atomicCAS(const_cast<T *>(&x), other.x, other.x);
+    return load() == other.load();
   }
 
   /** Inequality check */
   HSHM_INLINE_CROSS_FUN bool operator!=(const rocm_atomic &other) const {
-    return !atomicCAS(const_cast<T *>(&x), other.x, other.x);
+    return load() != other.load();
   }
 
-  /** Bitwise and */
+  /** Bitwise and (non-destructive: load then AND) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic operator&(U other) const {
-    T *addr = const_cast<T *>(&x);
-    return atomicAnd(addr, other);
+    return rocm_atomic(load() & static_cast<T>(other));
   }
 
-  /** Bitwise or */
+  /** Bitwise or (non-destructive: load then OR) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic operator|(U other) const {
-    T *addr = const_cast<T *>(&x);
-    return atomicOr(addr, other);
+    return rocm_atomic(load() | static_cast<T>(other));
   }
 
-  /** Bitwise xor */
+  /** Bitwise xor (non-destructive: load then XOR) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic operator^(U other) const {
-    T *addr = const_cast<T *>(&x);
-    return atomicXor(addr, other);
+    return rocm_atomic(load() ^ static_cast<T>(other));
   }
 
-  /** Bitwise and assign */
+  /** Bitwise and assign (device-scope on GPU, plain on host) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &operator&=(U other) {
-    atomicAnd(&x, other);
-    return *this;
-  }
-
-  /** Bitwise or assign */
-  template <typename U>
-  HSHM_INLINE_CROSS_FUN rocm_atomic &operator|=(U other) {
-    atomicOr(&x, other);
-    return *this;
-  }
-
-  /** System-scope bitwise or assign (visible to CPU from GPU) */
-  template <typename U>
-  HSHM_INLINE_CROSS_FUN rocm_atomic &or_system(U other) {
 #if HSHM_IS_GPU
-    atomicOr_system(reinterpret_cast<unsigned int*>(&x),
-                    static_cast<unsigned int>(other));
+    atomicAnd(reinterpret_cast<unsigned int*>(&x),
+              static_cast<unsigned int>(other));
 #else
-    atomicOr(&x, other);
+    x &= static_cast<T>(other);
 #endif
     return *this;
   }
 
-  /** Bitwise xor assign */
+  /** Bitwise or assign (device-scope on GPU, plain on host) */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN rocm_atomic &operator|=(U other) {
+#if HSHM_IS_GPU
+    atomicOr(reinterpret_cast<unsigned int*>(&x),
+             static_cast<unsigned int>(other));
+#else
+    x |= static_cast<T>(other);
+#endif
+    return *this;
+  }
+
+  /** System-scope bitwise or assign (device-scope + threadfence on GPU) */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN rocm_atomic &or_system(U other) {
+#if HSHM_IS_GPU
+    atomicOr(reinterpret_cast<unsigned int*>(&x),
+             static_cast<unsigned int>(other));
+    __threadfence_system();
+#else
+    x |= static_cast<T>(other);
+#endif
+    return *this;
+  }
+
+  /** Bitwise xor assign (device-scope on GPU, plain on host) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &operator^=(U other) {
-    atomicXor(&x, other);
+#if HSHM_IS_GPU
+    atomicXor(reinterpret_cast<unsigned int*>(&x),
+              static_cast<unsigned int>(other));
+#else
+    x ^= static_cast<T>(other);
+#endif
     return *this;
   }
 

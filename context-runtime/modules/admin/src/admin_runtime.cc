@@ -2649,6 +2649,19 @@ chi::TaskResume Runtime::SystemMonitor(hipc::FullPtr<SystemMonitorTask> task,
   co_return;
 }
 
+chi::TaskResume Runtime::RegisterGpuContainer(
+    hipc::FullPtr<RegisterGpuContainerTask> task, chi::RunContext &rctx) {
+  // This task is handled on the CPU side.
+  // The megakernel's gpu::PoolManager is updated via a GPU kernel launch,
+  // not directly from the admin runtime. The pool_manager.cc CreatePool
+  // handles the actual GPU container creation and registration.
+  // This method exists as a no-op placeholder for task routing completeness.
+  HLOG(kDebug, "RegisterGpuContainer: pool_id={}, container_id={}",
+       task->target_pool_id_, task->container_id_);
+  rctx.did_work_ = true;
+  co_return;
+}
+
 //===========================================================================
 // Task Serialization Method Implementations
 //===========================================================================

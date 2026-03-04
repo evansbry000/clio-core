@@ -53,6 +53,10 @@ typedef Container* (*new_chimod_t)(const PoolId* pool_id, const char* pool_name)
 typedef const char* (*get_chimod_name_t)(void);
 typedef void (*destroy_chimod_t)(Container* container);
 
+// GPU ChiMod function types
+typedef void* (*alloc_chimod_gpu_t)();
+typedef void* (*new_chimod_gpu_t)(const PoolId* pool_id, u32 container_id);
+
 /**
  * ChiMod metadata and shared library wrapper
  */
@@ -60,14 +64,19 @@ struct ChiModInfo {
   std::string name;
   std::string lib_path;
   hshm::SharedLibrary lib;
-  
+
   // Function pointers
   alloc_chimod_t alloc_func;
   new_chimod_t new_func;
   get_chimod_name_t name_func;
   destroy_chimod_t destroy_func;
-  
-  ChiModInfo() : alloc_func(nullptr), new_func(nullptr), 
+
+  // GPU function pointers (loaded from _runtime_gpu.so if available)
+  alloc_chimod_gpu_t alloc_func_gpu = nullptr;
+  new_chimod_gpu_t new_func_gpu = nullptr;
+  hshm::SharedLibrary gpu_lib;
+
+  ChiModInfo() : alloc_func(nullptr), new_func(nullptr),
                  name_func(nullptr), destroy_func(nullptr) {}
 };
 

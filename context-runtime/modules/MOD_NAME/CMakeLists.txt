@@ -10,10 +10,13 @@ add_chimod_client(
 )
 
 # Create runtime library
+# Note: src/MOD_NAME_runtime_gpu.cc is automatically detected by add_chimod_runtime
+# and compiled as a GPU companion library when CUDA/ROCm is enabled
 add_chimod_runtime(
   SOURCES
     src/MOD_NAME_runtime.cc
     src/autogen/MOD_NAME_lib_exec.cc
+    src/MOD_NAME_runtime_gpu.cc
   INCLUDE_DIRECTORIES
     ${CHIMAERA_ROOT}/modules/admin/include  # MOD_NAME needs admin headers
 )

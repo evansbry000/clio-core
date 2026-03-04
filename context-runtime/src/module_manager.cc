@@ -142,6 +142,32 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
 
   HLOG(kInfo, "Loaded ChiMod: {} from {}", chimod_info->name, lib_path);
 
+  // Probe for GPU companion library (_runtime_gpu.so)
+  // Convention: if runtime is "foo_runtime.so", GPU lib is "foo_runtime_gpu.so"
+  {
+    std::string gpu_lib_path = lib_path;
+    size_t pos = gpu_lib_path.rfind("_runtime.so");
+    if (pos != std::string::npos) {
+      gpu_lib_path = gpu_lib_path.substr(0, pos) + "_runtime_gpu.so";
+      if (std::filesystem::exists(gpu_lib_path)) {
+        chimod_info->gpu_lib.Load(gpu_lib_path);
+        if (!chimod_info->gpu_lib.IsNull()) {
+          chimod_info->alloc_func_gpu = reinterpret_cast<alloc_chimod_gpu_t>(
+              chimod_info->gpu_lib.GetSymbol("alloc_chimod_gpu"));
+          chimod_info->new_func_gpu = reinterpret_cast<new_chimod_gpu_t>(
+              chimod_info->gpu_lib.GetSymbol("new_chimod_gpu"));
+          if (chimod_info->alloc_func_gpu && chimod_info->new_func_gpu) {
+            HLOG(kInfo, "Loaded GPU ChiMod companion: {}", gpu_lib_path);
+          } else {
+            HLOG(kDebug, "GPU lib {} missing required symbols", gpu_lib_path);
+            chimod_info->alloc_func_gpu = nullptr;
+            chimod_info->new_func_gpu = nullptr;
+          }
+        }
+      }
+    }
+  }
+
   // Store in map
   chimods_[chimod_info->name] = std::move(chimod_info);
   return true;

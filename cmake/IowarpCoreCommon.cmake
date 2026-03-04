@@ -554,8 +554,41 @@ function(add_chimod_runtime)
   # Create target name
   set(TARGET_NAME "${CHIMAERA_NAMESPACE}_${CHIMAERA_MODULE_NAME}_runtime")
 
-  # Create the library
-  add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
+  # Separate _gpu.cc sources from regular sources
+  set(CPU_SOURCES "")
+  set(GPU_SOURCES "")
+  foreach(SRC ${ARG_SOURCES})
+    if(SRC MATCHES "_gpu\\.cc$")
+      list(APPEND GPU_SOURCES ${SRC})
+    else()
+      list(APPEND CPU_SOURCES ${SRC})
+    endif()
+  endforeach()
+
+  # Create the library (CPU sources only)
+  add_library(${TARGET_NAME} SHARED ${CPU_SOURCES})
+
+  # Build GPU companion library if GPU sources exist and GPU is enabled
+  set(GPU_TARGET_NAME "${TARGET_NAME}_gpu")
+  if(GPU_SOURCES)
+    if(WRP_CORE_ENABLE_CUDA)
+      add_cuda_library(${GPU_TARGET_NAME} SHARED TRUE ${GPU_SOURCES})
+      target_link_libraries(${GPU_TARGET_NAME} PUBLIC ${TARGET_NAME} hshm::cuda_cxx)
+      target_include_directories(${GPU_TARGET_NAME} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      )
+      message(STATUS "GPU companion ${GPU_TARGET_NAME} created with CUDA for: ${GPU_SOURCES}")
+    elseif(WRP_CORE_ENABLE_ROCM)
+      add_rocm_gpu_library(${GPU_TARGET_NAME} SHARED TRUE ${GPU_SOURCES})
+      target_link_libraries(${GPU_TARGET_NAME} PUBLIC ${TARGET_NAME} hshm::cxx)
+      target_include_directories(${GPU_TARGET_NAME} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      )
+      message(STATUS "GPU companion ${GPU_TARGET_NAME} created with ROCm for: ${GPU_SOURCES}")
+    else()
+      message(STATUS "GPU sources found but no GPU backend enabled, skipping: ${GPU_SOURCES}")
+    endif()
+  endif()
 
   # Set C++ standard
   set(CHIMAERA_CXX_STANDARD 20)

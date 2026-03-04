@@ -104,6 +104,7 @@ struct RingBufferEntry {
   HSHM_INLINE_CROSS_FUN
   bool IsReady() const { return flags_.Any(1); }
 
+
   /**
    * Mark entry as ready (release semantics)
    * Call this AFTER writing data to ensure visibility
@@ -490,6 +491,7 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   HSHM_INLINE_CROSS_FUN
   bool TryPop(T& val) { return Pop(val); }
+
 
   /**
    * Peek at an element by absolute index (monotonic event ID).

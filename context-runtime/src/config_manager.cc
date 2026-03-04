@@ -237,6 +237,20 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Note: heartbeat_interval parsing removed (not used by runtime)
   }
 
+  // Parse GPU megakernel configuration
+  if (yaml_conf["gpu"]) {
+    auto gpu = yaml_conf["gpu"];
+    if (gpu["blocks"]) {
+      gpu_blocks_ = gpu["blocks"].as<u32>();
+    }
+    if (gpu["threads_per_block"]) {
+      gpu_threads_per_block_ = gpu["threads_per_block"].as<u32>();
+    }
+    if (gpu["queue_depth"]) {
+      gpu_queue_depth_ = gpu["queue_depth"].as<u32>();
+    }
+  }
+
   // Parse networking
   if (yaml_conf["networking"]) {
     auto networking = yaml_conf["networking"];

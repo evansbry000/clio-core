@@ -123,9 +123,15 @@
 #define HSHM_IS_GPU_COMPILER 0
 #endif
 
-/** Includes for CUDA and ROCm */
+/** Includes for CUDA and ROCm.
+ * nvcc/hipcc get the full runtime header (includes device builtins).
+ * Regular g++/clang++ with HSHM_ENABLE_CUDA/ROCM get the runtime API header
+ * which provides host-callable functions (cudaMalloc, cudaMemcpy, etc.)
+ * without device builtins (atomicAdd, threadIdx, etc.). */
 #if HSHM_IS_CUDA_COMPILER
 #include <cuda_runtime.h>
+#elif HSHM_ENABLE_CUDA
+#include <cuda_runtime_api.h>
 #endif
 
 #if HSHM_IS_ROCM_COMPILER

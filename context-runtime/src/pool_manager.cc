@@ -40,6 +40,7 @@
 #include "chimaera/admin/admin_tasks.h"
 #include "chimaera/config_manager.h"
 #include "chimaera/container.h"
+#include "chimaera/module_manager.h"
 #include "chimaera/task.h"
 
 #include <chrono>
@@ -565,7 +566,9 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // nested pool creation (e.g., CTE Create calling bdev Create).
     // By using co_await, we properly suspend and resume, allowing the worker
     // to process nested tasks while we wait.
+    HLOG(kInfo, "CreatePool: Running Create method for pool {}", target_pool_id);
     co_await container->Run(0, task, *run_ctx);  // Method::kCreate = 0
+    HLOG(kInfo, "CreatePool: Create method completed for pool {}", target_pool_id);
 
     if (task->GetReturnCode() != 0) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
@@ -575,6 +578,44 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       module_manager->DestroyContainer(chimod_name, container);
       pool_metadata_.erase(target_pool_id);
       co_return;
+    }
+
+    // Create GPU container if ChiMod has a GPU companion library
+    ChiModInfo *chimod_info = module_manager->GetChiMod(chimod_name);
+    HLOG(kInfo, "CreatePool: Checking GPU companion for {} (has_gpu={})",
+         chimod_name, chimod_info && chimod_info->new_func_gpu ? 1 : 0);
+    if (chimod_info && chimod_info->new_func_gpu) {
+      HLOG(kInfo, "CreatePool: Calling new_func_gpu for pool {}", target_pool_id);
+      // Pause megakernel to free SMs for GPU container allocation kernels
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+      ipc_manager2->PauseMegakernel();
+#endif
+      void *gpu_container_ptr =
+          chimod_info->new_func_gpu(&target_pool_id, node_id);
+      HLOG(kInfo, "CreatePool: new_func_gpu returned {}", gpu_container_ptr);
+      if (gpu_container_ptr) {
+        HLOG(kInfo,
+             "PoolManager: Created GPU container for pool {} (device_ptr={})",
+             target_pool_id, gpu_container_ptr);
+        // Store the GPU container pointer in pool metadata
+        auto it = pool_metadata_.find(target_pool_id);
+        if (it != pool_metadata_.end()) {
+          it->second.gpu_container_ptr_ = gpu_container_ptr;
+        }
+        // Register with the megakernel's gpu::PoolManager
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+        ipc_manager2->RegisterMegakernelContainer(target_pool_id,
+                                                   gpu_container_ptr);
+#endif
+      } else {
+        HLOG(kWarning,
+             "PoolManager: Failed to create GPU container for ChiMod: {}",
+             chimod_name);
+      }
+      // Resume megakernel after GPU container allocation is done
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+      ipc_manager2->ResumeMegakernel();
+#endif
     }
 
   } catch (const std::exception& e) {

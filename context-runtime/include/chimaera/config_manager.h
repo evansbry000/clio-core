@@ -242,6 +242,24 @@ class ConfigManager : public hshm::BaseConfig {
    */
   float GetLearningRate() const { return learning_rate_; }
 
+  /**
+   * Get number of GPU blocks for megakernel
+   * @return Number of blocks (default: 32)
+   */
+  u32 GetGpuBlocks() const { return gpu_blocks_; }
+
+  /**
+   * Get number of threads per block for megakernel
+   * @return Threads per block (default: 32)
+   */
+  u32 GetGpuThreadsPerBlock() const { return gpu_threads_per_block_; }
+
+  /**
+   * Get GPU queue depth for megakernel task queues
+   * @return Queue depth (default: 16)
+   */
+  u32 GetGpuQueueDepth() const { return gpu_queue_depth_; }
+
  private:
   /**
    * Set default configuration values (implements hshm::BaseConfig)
@@ -287,6 +305,11 @@ class ConfigManager : public hshm::BaseConfig {
 
   // Task load prediction model
   float learning_rate_ = 0.2f;               // Default: 0.2 SGD learning rate
+
+  // GPU megakernel configuration
+  u32 gpu_blocks_ = 32;                      // Default: 32 blocks
+  u32 gpu_threads_per_block_ = 32;           // Default: 32 threads per block
+  u32 gpu_queue_depth_ = 16;                 // Default: 16 tasks per queue
 
   // Compose configuration
   ComposeConfig compose_config_;

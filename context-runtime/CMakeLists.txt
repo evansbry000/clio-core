@@ -111,8 +111,14 @@ if(TARGET cereal)
     set(_CEREAL_TARGET cereal)
 endif()
 
-# Install main library
-install(TARGETS ${CHIMAERA_NAMESPACE}_cxx ${_CEREAL_TARGET}
+# Collect GPU target if it exists
+set(_GPU_TARGET "")
+if(TARGET ${CHIMAERA_NAMESPACE}_cxx_gpu)
+  set(_GPU_TARGET ${CHIMAERA_NAMESPACE}_cxx_gpu)
+endif()
+
+# Install main library (and GPU library if built)
+install(TARGETS ${CHIMAERA_NAMESPACE}_cxx ${_GPU_TARGET} ${_CEREAL_TARGET}
   EXPORT ${MAIN_EXPORT_NAME}
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib

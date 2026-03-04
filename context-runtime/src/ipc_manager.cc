@@ -69,6 +69,10 @@
 #include "chimaera/pool_manager.h"
 #include "chimaera/scheduler/scheduler_factory.h"
 
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+#include "chimaera/megakernel.h"
+#endif
+
 // Global pointer variable definition for IPC manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::IpcManager, g_ipc_manager);
 
@@ -271,6 +275,9 @@ bool IpcManager::ServerInit() {
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   // Initialize GPU queues (one ring buffer per GPU)
+  // Megakernel launch is deferred to after all initial pools are created
+  // (see ChimaeraManager::ServerInit) to avoid cudaMalloc deadlocks
+  // during GPU container allocation.
   if (!ServerInitGpuQueues()) {
     return false;
   }
@@ -366,6 +373,11 @@ void IpcManager::ServerFinalize() {
   if (!is_initialized_) {
     return;
   }
+
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  // Finalize megakernel before cleaning up GPU resources
+  FinalizeMegakernel();
+#endif
 
   // Close persistent outbound DEALER sockets before resetting transports
   ClearClientPool();
@@ -596,14 +608,14 @@ bool IpcManager::ServerInitGpuQueues() {
     ConfigManager *config = CHI_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
 
-    // Get configured GPU segment size (default to 64MB per GPU)
-    size_t gpu_segment_size = config && config->IsValid()
-                                  ? config->GetMemorySegmentSize("gpu_segment")
-                                  : hshm::Unit<size_t>::Megabytes(64);
+    // GPU segment size (64MB per GPU)
+    size_t gpu_segment_size = hshm::Unit<size_t>::Megabytes(64);
 
     // Reserve space for GPU backends and queues
     gpu_backends_.reserve(num_gpus);
     gpu_queues_.reserve(num_gpus);
+    to_gpu_queues_.reserve(num_gpus);
+    gpu_to_gpu_queues_.reserve(num_gpus);
 
     // Create one segment and ring buffer per GPU
     for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
@@ -644,12 +656,66 @@ bool IpcManager::ServerInitGpuQueues() {
         return false;
       }
 
+      // Create CPU→GPU queue (megakernel polls this)
+      hipc::FullPtr<TaskQueue> to_gpu_queue =
+          gpu_allocator->template NewObj<TaskQueue>(
+              gpu_allocator, 1, 2, queue_depth);
+      if (to_gpu_queue.IsNull()) {
+        HLOG(kError, "Failed to create to_gpu TaskQueue for GPU {}", gpu_id);
+        return false;
+      }
+
+      // Create GPU→GPU queue (megakernel polls this)
+      hipc::FullPtr<TaskQueue> g2g_queue =
+          gpu_allocator->template NewObj<TaskQueue>(
+              gpu_allocator, 1, 2, queue_depth);
+      if (g2g_queue.IsNull()) {
+        HLOG(kError, "Failed to create gpu_to_gpu TaskQueue for GPU {}", gpu_id);
+        return false;
+      }
+
       HLOG(kInfo, "GPU {} queue initialized: segment_size={}, queue_depth={}",
            gpu_id, gpu_segment_size, queue_depth);
 
-      // Store backend and queue
+      // Register gpu_backend's allocator for host-side ShmPtr resolution
+      // so ToFullPtr can resolve FutureShm pointers from SendToGpu
+      RegisterGpuAllocator(backend_id, gpu_backend->data_,
+                           gpu_backend->data_capacity_);
+
+      // Store backend and queues
       gpu_backends_.push_back(std::move(gpu_backend));
       gpu_queues_.push_back(gpu_queue);
+      to_gpu_queues_.push_back(to_gpu_queue);
+      gpu_to_gpu_queues_.push_back(g2g_queue);
+    }
+
+    // Create megakernel scratch backends (one per GPU)
+    megakernel_backends_.reserve(num_gpus);
+    size_t mk_segment_size = hshm::Unit<size_t>::Megabytes(64);
+    for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+      std::string mk_url = "/chi_megakernel_" + std::to_string(gpu_id);
+      hipc::MemoryBackendId mk_backend_id(2000 + gpu_id, 0);
+      auto mk_backend = std::make_unique<hipc::GpuShmMmap>();
+      if (!mk_backend->shm_init(mk_backend_id, mk_segment_size, mk_url,
+                                 gpu_id)) {
+        HLOG(kError, "Failed to initialize megakernel backend for GPU {}",
+             gpu_id);
+        return false;
+      }
+      HLOG(kInfo, "GPU {} megakernel scratch backend initialized: {}",
+           gpu_id, mk_segment_size);
+      megakernel_backends_.push_back(std::move(mk_backend));
+    }
+
+    // Populate gpu_megakernel_info_ for GPU 0 (used by megakernel launch)
+    if (num_gpus > 0) {
+      gpu_megakernel_info_.backend =
+          static_cast<hipc::MemoryBackend &>(*megakernel_backends_[0]);
+      gpu_megakernel_info_.to_gpu_queue = to_gpu_queues_[0].ptr_;
+      gpu_megakernel_info_.from_gpu_queue = gpu_queues_[0].ptr_;
+      gpu_megakernel_info_.gpu_to_gpu_queue = gpu_to_gpu_queues_[0].ptr_;
+      gpu_megakernel_info_.queue_backend_base = gpu_backends_[0]->data_;
+      gpu_megakernel_info_.gpu_queue_depth = queue_depth;
     }
 
     return true;
@@ -657,6 +723,72 @@ bool IpcManager::ServerInitGpuQueues() {
     HLOG(kError, "Exception during GPU queue initialization: {}", e.what());
     return false;
   }
+}
+
+bool IpcManager::LaunchMegakernel() {
+  int num_gpus = hshm::GpuApi::GetDeviceCount();
+  if (num_gpus == 0) {
+    return true;  // No GPUs, nothing to do
+  }
+
+  ConfigManager *config = CHI_CONFIG_MANAGER;
+  u32 blocks = config->GetGpuBlocks();
+  u32 threads_per_block = config->GetGpuThreadsPerBlock();
+
+  auto *launcher = new MegakernelLauncher();
+  if (!launcher->Launch(gpu_megakernel_info_, blocks, threads_per_block)) {
+    HLOG(kError, "Failed to launch megakernel");
+    delete launcher;
+    return false;
+  }
+
+  megakernel_launcher_ = launcher;
+  return true;
+}
+
+void IpcManager::FinalizeMegakernel() {
+  if (megakernel_launcher_) {
+    auto *launcher = static_cast<MegakernelLauncher *>(megakernel_launcher_);
+    launcher->Finalize();
+    delete launcher;
+    megakernel_launcher_ = nullptr;
+  }
+}
+
+hipc::FullPtr<char> IpcManager::AllocateGpuBuffer(size_t size, u32 gpu_id) {
+  if (gpu_id >= gpu_backends_.size()) {
+    return hipc::FullPtr<char>::GetNull();
+  }
+  auto *alloc = gpu_backends_[gpu_id]->template AttachAlloc<CHI_MAIN_ALLOC_T>();
+  if (!alloc) {
+    return hipc::FullPtr<char>::GetNull();
+  }
+  return alloc->AllocateObjs<char>(size);
+}
+
+void IpcManager::RegisterMegakernelContainer(const PoolId &pool_id,
+                                              void *gpu_container_ptr) {
+  if (!megakernel_launcher_) {
+    return;
+  }
+  auto *launcher = static_cast<MegakernelLauncher *>(megakernel_launcher_);
+  launcher->RegisterGpuContainer(pool_id, gpu_container_ptr);
+}
+
+void IpcManager::PauseMegakernel() {
+  if (!megakernel_launcher_) {
+    return;
+  }
+  auto *launcher = static_cast<MegakernelLauncher *>(megakernel_launcher_);
+  launcher->Pause();
+}
+
+void IpcManager::ResumeMegakernel() {
+  if (!megakernel_launcher_) {
+    return;
+  }
+  auto *launcher = static_cast<MegakernelLauncher *>(megakernel_launcher_);
+  launcher->Resume(gpu_megakernel_info_);
 }
 #endif
 
@@ -2195,6 +2327,14 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> &task_ptr,
       // These modes should have been resolved to Physical queries by now
       // If we still see them here, they are not local
       return false;
+
+    case RoutingMode::LocalGpuBcast:
+    case RoutingMode::ToLocalGpu:
+    case RoutingMode::ToLocalCpu:
+      return true;  // GPU routing modes are always local
+
+    case RoutingMode::Null:
+      return true;  // Null mode is a no-op, treat as local
   }
 
   return false;
@@ -2327,6 +2467,13 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
       break;
     case RoutingMode::Physical:
       result = ResolvePhysicalQuery(query, pool_id, task_ptr);
+      break;
+    case RoutingMode::LocalGpuBcast:
+    case RoutingMode::ToLocalGpu:
+    case RoutingMode::ToLocalCpu:
+    case RoutingMode::Null:
+      // GPU routing modes are handled by the megakernel, not CPU routing
+      result = {query};
       break;
   }
 

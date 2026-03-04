@@ -295,6 +295,16 @@ bool Chimaera::ServerInit() {
     }
   }
 
+  // Launch megakernel after all initial pools are created, so that
+  // cudaMalloc calls during GPU container allocation don't deadlock
+  // against the persistent megakernel.
+  if (!ipc_manager->LaunchMegakernel()) {
+    HLOG(kError, "Failed to launch GPU megakernel");
+    is_runtime_mode_ = false;
+    runtime_is_initializing_ = false;
+    return false;
+  }
+
   // Start local server last - after all other initialization is complete
   // This ensures clients can connect only when runtime is fully ready
   if (!ipc_manager->StartLocalServer()) {
