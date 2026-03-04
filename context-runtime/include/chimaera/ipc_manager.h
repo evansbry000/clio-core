@@ -149,9 +149,9 @@ struct ClientShmInfo {
  */
 struct IpcManagerGpuInfo {
   hipc::MemoryBackend backend;
-  TaskQueue *to_gpu_queue = nullptr;      /**< CPU → GPU queue (megakernel polls) */
+  TaskQueue *to_gpu_queue = nullptr;      /**< CPU → GPU queue (orchestrator polls) */
   TaskQueue *from_gpu_queue = nullptr;    /**< GPU → CPU queue (CPU worker polls) */
-  TaskQueue *gpu_to_gpu_queue = nullptr;  /**< GPU → GPU queue (megakernel polls) */
+  TaskQueue *gpu_to_gpu_queue = nullptr;  /**< GPU → GPU queue (orchestrator polls) */
   char *queue_backend_base = nullptr;     /**< Base of queue backend for ShmPtr resolution */
   u32 gpu_queue_depth = 16;
 
@@ -358,6 +358,13 @@ class IpcManager {
     if (buffer_ptr.IsNull()) {
       return;
     }
+#if HSHM_IS_GPU
+    // GPU→GPU (SendGpuLocal) stores absolute UVA pointer with null alloc_id.
+    // ArenaAllocators use bulk Reset(), so individual frees are no-ops.
+    if (buffer_ptr.alloc_id_ == hipc::AllocatorId::GetNull()) {
+      return;
+    }
+#endif
     // Convert hipc::ShmPtr<> to FullPtr<char> and call main FreeBuffer
     hipc::FullPtr<char> full_ptr(ToFullPtr<char>(buffer_ptr));
     FreeBuffer(full_ptr);
@@ -497,8 +504,17 @@ class IpcManager {
    */
   template <typename TaskT>
   HSHM_GPU_FUN void RecvGpu(Future<TaskT> &future, TaskT *task_ptr) {
-    hipc::FullPtr<FutureShm> fshm = future.GetFutureShm();
-    FutureShm *future_shm = fshm.ptr_;
+    // Resolve FutureShm: if alloc_id_ is null, off_ is an absolute UVA
+    // pointer (GPU→GPU path via SendGpuLocal). Otherwise, use normal
+    // ToFullPtr resolution (GPU→CPU path via SendGpu).
+    hipc::ShmPtr<FutureShm> sptr = future.GetFutureShmPtr();
+    FutureShm *future_shm;
+    if (sptr.alloc_id_ == hipc::AllocatorId::GetNull()) {
+      future_shm = reinterpret_cast<FutureShm *>(sptr.off_.load());
+    } else {
+      hipc::FullPtr<FutureShm> fshm = future.GetFutureShm();
+      future_shm = fshm.ptr_;
+    }
 
     // Build LbmContext for output ring buffer
     hshm::lbm::LbmContext ctx;
@@ -524,11 +540,11 @@ class IpcManager {
 
 #if HSHM_IS_GPU_COMPILER
   /**
-   * Send a task to the GPU→GPU queue (local megakernel dispatch).
+   * Send a task to the GPU→GPU queue (local orchestrator dispatch).
    *
    * Same logic as SendGpu but pushes to gpu_to_gpu_local_queue_ instead
    * of gpu_worker_queue_. Used by GPU kernels to submit follow-up tasks
-   * that should be processed by the megakernel rather than the CPU.
+   * that should be processed by the orchestrator rather than the CPU.
    *
    * @tparam TaskT Task type (must derive from Task)
    * @param task_ptr Task to send
@@ -560,9 +576,13 @@ class IpcManager {
     future_shm->output_.copy_space_size_ = copy_space_size;
     future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
-    // 3. Create Future and LbmContext
-    hipc::ShmPtr<FutureShm> fshmptr =
-        buffer.shm_.template Cast<FutureShm>();
+    // 3. Create Future with absolute UVA pointer
+    //    Store the absolute pointer (UVA-accessible pinned host memory) in
+    //    ShmPtr.off_ instead of a relative offset. The orchestrator's
+    //    gpu::Worker resolves GPU→GPU FutureShm directly without base
+    //    arithmetic.
+    hipc::ShmPtr<FutureShm> fshmptr;
+    fshmptr.off_ = reinterpret_cast<size_t>(buffer.ptr_);
     Future<TaskT> future(fshmptr, task_ptr);
     hshm::lbm::LbmContext ctx;
     ctx.copy_space = future_shm->copy_space;
@@ -683,12 +703,41 @@ class IpcManager {
    * @param awake_event Whether to awaken worker after enqueueing
    * @return Future<TaskT> for polling completion and retrieving results
    */
+#if HSHM_IS_GPU_COMPILER
+  /** GPU-side RouteTask: determine whether task stays on GPU or crosses to CPU */
+  HSHM_GPU_FUN RouteResult RouteTask(const hipc::FullPtr<Task> &task_ptr) {
+    RoutingMode mode = task_ptr->pool_query_.GetRoutingMode();
+    if (mode == RoutingMode::Local ||
+        mode == RoutingMode::LocalGpuBcast ||
+        mode == RoutingMode::ToLocalGpu) {
+      return RouteResult::Local;  // Stay on GPU
+    }
+    return RouteResult::Network;  // Cross to CPU
+  }
+#endif
+
   template <typename TaskT>
   HSHM_CROSS_FUN Future<TaskT> Send(const hipc::FullPtr<TaskT> &task_ptr,
                                     bool awake_event = true) {
 #if HSHM_IS_GPU
-    return SendGpu(task_ptr);
+    {
+      RouteResult result = RouteTask(task_ptr.template Cast<Task>());
+      if (result == RouteResult::Local) {
+        return SendGpuLocal(task_ptr);
+      }
+      return SendGpu(task_ptr);
+    }
 #else  // HOST PATH
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+    {
+      RoutingMode mode = task_ptr->pool_query_.GetRoutingMode();
+      if (mode == RoutingMode::LocalGpuBcast || mode == RoutingMode::ToLocalGpu) {
+        u32 gpu_id = (mode == RoutingMode::ToLocalGpu)
+            ? task_ptr->pool_query_.GetNodeId() : 0;
+        return SendToGpu(task_ptr, gpu_id);
+      }
+    }
+#endif
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
     Worker *worker = CHI_CUR_WORKER;
 
@@ -732,7 +781,7 @@ class IpcManager {
   /** Route a task: resolve pool query, determine local vs global.
    * If force_enqueue is true, always enqueue to the destination worker's lane
    * (used by SendRuntime which cannot execute tasks directly). */
-  bool RouteTask(Future<Task> &future, bool force_enqueue = false);
+  RouteResult RouteTask(Future<Task> &future, bool force_enqueue = false);
 
   /** Resolve a pool query into concrete physical addresses */
   std::vector<PoolQuery> ResolvePoolQuery(const PoolQuery &query,
@@ -745,11 +794,18 @@ class IpcManager {
 
   /** Route task locally.
    * If force_enqueue is true, always enqueue even if dest == current worker. */
-  bool RouteLocal(Future<Task> &future, bool force_enqueue = false);
+  RouteResult RouteLocal(Future<Task> &future, bool force_enqueue = false);
 
   /** Route task globally via network */
-  bool RouteGlobal(Future<Task> &future,
+  RouteResult RouteGlobal(Future<Task> &future,
                    const std::vector<PoolQuery> &pool_queries);
+
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  /** Route a task from CPU to GPU orchestrator (non-template, type-erased).
+   * Uses Container::LocalSaveTask for serialization. */
+  void RouteToGpu(const hipc::FullPtr<Task> &task_ptr, Container *container,
+                  u32 gpu_id = 0);
+#endif
 
   /**
    * Send a task via SHM lightbeam transport
@@ -1553,7 +1609,7 @@ class IpcManager {
    * Allocate a buffer from the GPU queue backend (pinned host memory).
    *
    * Used by SendToGpu to allocate FutureShm in GPU-accessible memory
-   * that both the CPU and the megakernel can access.
+   * that both the CPU and the orchestrator can access.
    *
    * @param size Number of bytes to allocate
    * @param gpu_id GPU device ID (0-based)
@@ -1562,11 +1618,11 @@ class IpcManager {
   hipc::FullPtr<char> AllocateGpuBuffer(size_t size, u32 gpu_id = 0);
 
   /**
-   * Submit a task from the CPU to the GPU megakernel.
+   * Submit a task from the CPU to the GPU orchestrator.
    *
    * Allocates FutureShm in the GPU queue backend (pinned host memory),
    * serializes the task input via ShmTransport::Send, and pushes
-   * a Future<Task> onto to_gpu_queues_[gpu_id] for the megakernel to pop.
+   * a Future<Task> onto to_gpu_queues_[gpu_id] for the orchestrator to pop.
    *
    * @tparam TaskT Task type (must derive from Task)
    * @param task_ptr Task to submit
@@ -1615,10 +1671,7 @@ class IpcManager {
     // Push to CPU→GPU queue
     auto &lane = to_gpu_queues_[gpu_id].ptr_->GetLane(0, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
-    bool pushed = lane.Push(task_future);
-    HLOG(kInfo, "SendToGpu: queue={} pushed={} head={} tail={}",
-         (void *)to_gpu_queues_[gpu_id].ptr_, pushed,
-         lane.GetHead(), lane.GetTail());
+    lane.Push(task_future);
 
     return future;
   }
@@ -1752,18 +1805,28 @@ class IpcManager {
 
  public:
   /**
-   * Launch the persistent GPU megakernel
+   * Launch the persistent GPU work orchestrator
    * Must be called after ServerInitGpuQueues and pool manager init
    * @return true if successful or no GPUs available
    */
-  bool LaunchMegakernel();
+  bool LaunchGpuOrchestrator();
+
+  /**
+   * Allocate a GPU container via the work orchestrator.
+   * @param pool_id Pool identifier
+   * @param container_id Container ID (typically node_id)
+   * @param chimod_name Name of the ChiMod
+   * @return Device pointer to allocated gpu::Container, or nullptr
+   */
+  void *AllocGpuContainer(const PoolId &pool_id, u32 container_id,
+                            const std::string &chimod_name);
 
  private:
 
   /**
-   * Stop the GPU megakernel and free resources
+   * Stop the GPU work orchestrator and free resources
    */
-  void FinalizeMegakernel();
+  void FinalizeGpuOrchestrator();
 
 #endif
 
@@ -1978,49 +2041,48 @@ class IpcManager {
   /** Pointer to GPU→CPU queue for task submission (from_gpu_queue) */
   TaskQueue *gpu_worker_queue_ = nullptr;
 
-  /** Pointer to CPU→GPU queue for megakernel dispatch (to_gpu_queue) */
+  /** Pointer to CPU→GPU queue for orchestrator dispatch (to_gpu_queue) */
   TaskQueue *gpu_to_gpu_queue_ = nullptr;
 
-  /** Pointer to GPU→GPU queue (megakernel polls for local GPU tasks) */
+  /** Pointer to GPU→GPU queue (orchestrator polls for local GPU tasks) */
   TaskQueue *gpu_to_gpu_local_queue_ = nullptr;
 
   /** Base pointer of queue backend for ShmPtr resolution on GPU */
   char *gpu_queue_backend_base_ = nullptr;
 
-  /** Stored IpcManagerGpuInfo for megakernel launch */
-  IpcManagerGpuInfo gpu_megakernel_info_;
+  /** Stored IpcManagerGpuInfo for GPU orchestrator launch */
+  IpcManagerGpuInfo gpu_orchestrator_info_;
 
   /** Flag indicating if GPU backend is initialized */
   bool gpu_backend_initialized_ = false;
 
-  /** Opaque pointer to MegakernelLauncher (defined in megakernel_gpu.cc) */
-  void *megakernel_launcher_ = nullptr;
+  /** Opaque pointer to gpu::WorkOrchestrator (defined in work_orchestrator_gpu.cc) */
+  void *gpu_orchestrator_ = nullptr;
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   // GPU memory backends (one per GPU device, using pinned host memory)
   // Placed at end of class to maintain ABI stability across CUDA/non-CUDA builds
   std::vector<std::unique_ptr<hipc::GpuShmMmap>> gpu_backends_;
 
-  /** CPU → GPU queues (one per GPU, megakernel polls these) */
+  /** CPU → GPU queues (one per GPU, orchestrator polls these) */
   std::vector<hipc::FullPtr<TaskQueue>> to_gpu_queues_;
 
-  /** GPU → GPU queues (one per GPU, megakernel polls these) */
+  /** GPU → GPU queues (one per GPU, orchestrator polls these) */
   std::vector<hipc::FullPtr<TaskQueue>> gpu_to_gpu_queues_;
 
-  /** Megakernel scratch backends (one per GPU, for per-block ArenaAllocators) */
-  std::vector<std::unique_ptr<hipc::GpuShmMmap>> megakernel_backends_;
+  /** GPU orchestrator scratch backends (one per GPU, for per-block ArenaAllocators) */
+  std::vector<std::unique_ptr<hipc::GpuShmMmap>> gpu_orchestrator_backends_;
 
-  /** Register a GPU container with the megakernel's pool manager */
-  void RegisterMegakernelContainer(const PoolId &pool_id,
-                                   void *gpu_container_ptr,
-                                   const std::string &chimod_name);
+  /** Register a GPU container with the orchestrator's pool manager */
+  void RegisterGpuOrchestratorContainer(const PoolId &pool_id,
+                                         void *gpu_container_ptr);
 #endif
 
-  /** Pause the megakernel to free SMs for other GPU kernels */
-  void PauseMegakernel();
+  /** Pause the GPU orchestrator to free SMs for other GPU kernels */
+  void PauseGpuOrchestrator();
 
-  /** Resume the megakernel after other GPU kernels complete */
-  void ResumeMegakernel();
+  /** Resume the GPU orchestrator after other GPU kernels complete */
+  void ResumeGpuOrchestrator();
 
  private:
 #if HSHM_IS_HOST
@@ -2105,16 +2167,16 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
 
 /**
- * Megakernel initialization macro — splits the alloc backend per block.
+ * GPU orchestrator initialization macro — splits the alloc backend per block.
  *
  * Each block gets (data_capacity / num_blocks) bytes of scratch memory.
  * ClientInitGpu further splits each block's region among its threads.
  * Thread 0 of each block performs initialization; all threads sync.
  *
  * @param gpu_info IpcManagerGpuInfo with backend and queue pointers
- * @param num_blocks Total number of blocks in the megakernel grid
+ * @param num_blocks Total number of blocks in the orchestrator grid
  */
-#define CHIMAERA_MEGAKERNEL_INIT(gpu_info, num_blocks)                         \
+#define CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks)                         \
   chi::IpcManager *g_ipc_manager_ptr = chi::IpcManager::GetBlockIpcManager(); \
   int thread_id = chi::IpcManager::GetGpuThreadId();                          \
   int num_threads = chi::IpcManager::GetGpuNumThreads();                      \
@@ -2238,6 +2300,18 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec) {
                               .count();
           if (elapsed >= max_sec) return false;
         }
+      }
+
+      // Deserialize output from GPU FutureShm ring buffer (SendToGpu path)
+      if (flags.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) &&
+          future_full->output_.copy_space_size_ > 0) {
+        hshm::lbm::LbmContext ctx;
+        ctx.copy_space = future_full->copy_space;
+        ctx.shm_info_ = &future_full->output_;
+        LocalLoadTaskArchive load_ar;
+        load_ar.SetMsgType(LocalMsgType::kSerializeOut);
+        hshm::lbm::ShmTransport::Recv(load_ar, ctx);
+        task_ptr_->SerializeOut(load_ar);
       }
     } else {
       // CLIENT PATH: Call Recv() to handle SHM lightbeam or ZMQ streaming
