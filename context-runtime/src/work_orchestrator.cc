@@ -40,6 +40,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "chimaera/container.h"
 #include "chimaera/pool_manager.h"
@@ -158,29 +160,42 @@ void WorkOrchestrator::StopWorkers() {
 
   HLOG(kDebug, "Stopping {} worker threads...", all_workers_.size());
 
-  // Stop all workers
+  // Signal all workers to stop and wake them if blocked in epoll_wait
+  pid_t my_pid = static_cast<pid_t>(getpid());
   for (auto *worker : all_workers_) {
-    if (worker) {
-      worker->Stop();
+    if (!worker) continue;
+    worker->Stop();
+    // Wake up the worker if it's blocked in epoll_wait via SIGUSR1
+    TaskLane *lane = worker->GetLane();
+    if (lane) {
+      pid_t tid = lane->GetTid();
+      if (tid != 0) {
+        hshm::lbm::EventManager::Signal(my_pid, tid);
+      }
     }
   }
 
-  // Wait for worker threads to finish using HSHM thread model with timeout
+  // Join all threads with per-thread 5-second timed timeout
   auto thread_model = HSHM_THREAD_MODEL;
-  auto start_time = std::chrono::steady_clock::now();
-  const auto timeout_duration = std::chrono::seconds(5); // 5 second timeout
-
   size_t joined_count = 0;
   for (auto &thread : worker_threads_) {
-    auto elapsed = std::chrono::steady_clock::now() - start_time;
-    if (elapsed > timeout_duration) {
-      HLOG(kError, "Warning: Worker thread join timeout reached. Some threads "
-                    "may not have stopped gracefully.");
-      break;
-    }
+#if HSHM_ENABLE_PTHREADS
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 5;  // 5-second deadline per thread
 
+    int ret = pthread_timedjoin_np(thread.pthread_thread_, nullptr, &deadline);
+    if (ret == ETIMEDOUT) {
+      HLOG(kError, "Warning: Worker thread join timed out; force-canceling.");
+      pthread_cancel(thread.pthread_thread_);
+      pthread_join(thread.pthread_thread_, nullptr);
+    } else {
+      joined_count++;
+    }
+#else
     thread_model->Join(thread);
     joined_count++;
+#endif
   }
 
   HLOG(kDebug, "Joined {} of {} worker threads", joined_count,
