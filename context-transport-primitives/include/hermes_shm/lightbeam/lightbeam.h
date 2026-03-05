@@ -159,6 +159,8 @@ struct LbmContext {
   char* copy_space = nullptr;                      /**< Shared buffer for chunked transfer */
   ShmTransferInfo* shm_info_ = nullptr;            /**< Transfer info in shared memory */
   int server_pid_ = 0;                             /**< Server PID for SHM liveness check */
+  int dst_fd_ = -1;                                /**< Destination file descriptor for CPU→storage (-1 = none) */
+  size_t dst_offset_ = 0;                          /**< Offset within destination file for CPU→storage */
 
   HSHM_CROSS_FUN LbmContext() : flags(0), timeout_ms(0) {}
 
@@ -166,12 +168,18 @@ struct LbmContext {
 
   HSHM_CROSS_FUN LbmContext(uint32_t f, int timeout) : flags(f), timeout_ms(timeout) {}
 
+  /** Construct context for CPU→storage transfers via file descriptor. */
+  HSHM_CROSS_FUN LbmContext(uint32_t f, int timeout, int dst_fd, size_t dst_offset)
+      : flags(f), timeout_ms(timeout), dst_fd_(dst_fd), dst_offset_(dst_offset) {}
+
   HSHM_CROSS_FUN bool IsSync() const { return (flags & LBM_SYNC) != 0; }
   HSHM_CROSS_FUN bool HasTimeout() const { return timeout_ms > 0; }
+  /** Returns true if this context targets a file descriptor destination. */
+  HSHM_CROSS_FUN bool HasFileDst() const { return dst_fd_ >= 0; }
 };
 
 // --- Transport Type Enum ---
-enum class TransportType { kZeroMq, kSocket, kShm };
+enum class TransportType { kZeroMq, kSocket, kShm, kNixl };
 
 // --- Transport Mode Enum ---
 enum class TransportMode { kClient, kServer };

@@ -550,6 +550,19 @@ HSHM (HermesShm/context-transport-primitives) provides modular INTERFACE library
   - Compile definitions: `HSHM_ENABLE_ROCM=1`, `HSHM_ENABLE_CUDA=0`
   - Note: Only available when `HSHM_ENABLE_ROCM=ON` at build time
 
+- **`hshm::nixl`** - NIXL (NVIDIA Inference Xfer Library) transport
+  - Provides: NIXL-backed data movement (DRAM→FILE via POSIX, DRAM→DRAM via memcpy)
+  - Use for: High-performance CPU→storage transfers and future GPU→storage (GDS)
+  - Compile definitions: `HSHM_ENABLE_NIXL=1`
+  - Build option: `WRP_CORE_ENABLE_NIXL=ON`
+  - Note: Requires NIXL installed at `/usr/local` (built with POSIX backend)
+
+- **`hshm::nvshmem`** - NVSHMEM GPU-to-GPU communication
+  - Provides: NVSHMEM compile definitions for GPU peer-to-peer communication
+  - Compile definitions: `HSHM_ENABLE_NVSHMEM=1`
+  - Build option: `WRP_CORE_ENABLE_NVSHMEM=ON`
+  - Note: Requires NVSHMEM from NVIDIA developer portal
+
 **Linking Guidelines:**
 
 1. **Never link to yaml-cpp directly** - Use `hshm::configure` instead (except within hshm::configure itself)

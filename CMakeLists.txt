@@ -112,6 +112,8 @@ option(WRP_CORE_ENABLE_ELF "Enable ELF support (required for CTE adapters)" OFF)
 option(WRP_CORE_ENABLE_OPENMP "Enable the use of OpenMP" OFF)
 option(WRP_CORE_ENABLE_CUDA "Enable CUDA support" OFF)
 option(WRP_CORE_ENABLE_ROCM "Enable ROCm support" OFF)
+option(WRP_CORE_ENABLE_NIXL "Enable NIXL (NVIDIA Inference Xfer Library) transport" OFF)
+option(WRP_CORE_ENABLE_NVSHMEM "Enable NVSHMEM GPU-to-GPU communication library" OFF)
 option(WRP_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 
 #------------------------------------------------------------------------------
@@ -179,6 +181,8 @@ set(HSHM_ENABLE_ELF ${WRP_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by
 set(HSHM_ENABLE_CUDA ${WRP_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by WRP_CORE_ENABLE_CUDA)" FORCE)
 set(HSHM_ENABLE_ROCM ${WRP_CORE_ENABLE_ROCM} CACHE BOOL "Enable ROCm (controlled by WRP_CORE_ENABLE_ROCM)" FORCE)
 set(HSHM_ENABLE_IO_URING ${WRP_CORE_ENABLE_IO_URING} CACHE BOOL "Enable io_uring (controlled by WRP_CORE_ENABLE_IO_URING)" FORCE)
+set(HSHM_ENABLE_NIXL ${WRP_CORE_ENABLE_NIXL} CACHE BOOL "Enable NIXL (controlled by WRP_CORE_ENABLE_NIXL)" FORCE)
+set(HSHM_ENABLE_NVSHMEM ${WRP_CORE_ENABLE_NVSHMEM} CACHE BOOL "Enable NVSHMEM (controlled by WRP_CORE_ENABLE_NVSHMEM)" FORCE)
 # Note: Coverage is handled globally via add_compile_options when WRP_CORE_ENABLE_COVERAGE=ON
 # No need for component-level HSHM_ENABLE_COVERAGE
 
