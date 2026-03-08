@@ -184,6 +184,7 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
       break;
     }
     case Method::kRegisterGpuContainer: {
+      // Cast task FullPtr to specific type
       hipc::FullPtr<RegisterGpuContainerTask> typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
       co_await RegisterGpuContainer(typed_task, rctx);
       break;
@@ -640,6 +641,7 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kRegisterGpuContainer: {
       auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      // Use archive operator which respects msg_type
       archive >> *typed_task.ptr_;
       break;
     }
@@ -813,6 +815,7 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
     }
     case Method::kRegisterGpuContainer: {
       auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
     }
@@ -1106,8 +1109,10 @@ hipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, hipc::FullPtr<chi
       break;
     }
     case Method::kRegisterGpuContainer: {
+      // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<RegisterGpuContainerTask>();
       if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
         auto task_typed = orig_task_ptr.template Cast<RegisterGpuContainerTask>();
         new_task_ptr->Copy(task_typed);
         return new_task_ptr.template Cast<chi::Task>();

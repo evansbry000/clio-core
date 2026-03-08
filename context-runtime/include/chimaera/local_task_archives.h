@@ -142,8 +142,8 @@ namespace chi {
 using LocalLbmBase = hshm::lbm::LbmMeta<>;
 using LocalTaskInfoVec = std::vector<LocalTaskInfo>;
 #else
-using LocalLbmBase = hshm::lbm::LbmMeta<HSHM_DEFAULT_ALLOC_GPU_T>;
-using LocalTaskInfoVec = hshm::priv::vector<LocalTaskInfo, HSHM_DEFAULT_ALLOC_GPU_T>;
+using LocalLbmBase = hshm::lbm::LbmMeta<CHI_GPU_HEAP_T>;
+using LocalTaskInfoVec = hshm::priv::vector<LocalTaskInfo, CHI_GPU_HEAP_T>;
 #endif
 
 /**
@@ -155,6 +155,8 @@ using LocalTaskInfoVec = hshm::priv::vector<LocalTaskInfo, HSHM_DEFAULT_ALLOC_GP
 class LocalSaveTaskArchive : public LocalLbmBase {
   using Base = LocalLbmBase;
 public:
+  using is_saving = std::true_type;
+  using is_loading = std::false_type;
   LocalTaskInfoVec task_infos_;
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
 
@@ -163,7 +165,7 @@ private:
   std::vector<char> buffer_;
   hshm::ipc::LocalSerialize<std::vector<char>> serializer_;
 #else
-  using GpuVec = hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T>;
+  using GpuVec = hshm::priv::vector<char, CHI_GPU_HEAP_T>;
   GpuVec &buffer_;
   hshm::ipc::LocalSerialize<GpuVec> serializer_;
 #endif
@@ -202,8 +204,8 @@ public:
    */
   HSHM_CROSS_FUN explicit LocalSaveTaskArchive(
       LocalMsgType msg_type,
-      hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> &buffer,
-      HSHM_DEFAULT_ALLOC_GPU_T *alloc)
+      hshm::priv::vector<char, CHI_GPU_HEAP_T> &buffer,
+      CHI_GPU_HEAP_T *alloc)
       :
 #if HSHM_IS_GPU
       Base(alloc), task_infos_(alloc),
@@ -304,6 +306,11 @@ private:
   }
 
 public:
+  /** Write raw binary data to the serializer */
+  HSHM_CROSS_FUN void write_binary(const char *data, size_t size) {
+    serializer_.write_binary(data, size);
+  }
+
   /**
    * Bulk transfer support for ShmPtr - just serialize the pointer value
    *
@@ -427,6 +434,8 @@ public:
 class LocalLoadTaskArchive : public LocalLbmBase {
   using Base = LocalLbmBase;
 public:
+  using is_saving = std::false_type;
+  using is_loading = std::true_type;
   LocalTaskInfoVec task_infos_;
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
 
@@ -437,7 +446,7 @@ private:
   hshm::ipc::LocalDeserialize<std::vector<char>> deserializer_;
   size_t current_task_index_;
 #else
-  using GpuVec = hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T>;
+  using GpuVec = hshm::priv::vector<char, CHI_GPU_HEAP_T>;
   GpuVec data_;
   hshm::ipc::LocalDeserialize<GpuVec> deserializer_;
 #endif
@@ -491,7 +500,7 @@ public:
    * @param alloc Allocator for LbmMeta, task_infos_, and data_
    */
   HSHM_CROSS_FUN explicit LocalLoadTaskArchive(
-      HSHM_DEFAULT_ALLOC_GPU_T *alloc)
+      CHI_GPU_HEAP_T *alloc)
       :
 #if HSHM_IS_GPU
       Base(alloc), task_infos_(alloc),
@@ -514,8 +523,8 @@ public:
    * @param alloc Allocator for LbmMeta, task_infos_, and data_
    */
   HSHM_CROSS_FUN explicit LocalLoadTaskArchive(
-      const hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> &ext_data,
-      HSHM_DEFAULT_ALLOC_GPU_T *alloc)
+      const hshm::priv::vector<char, CHI_GPU_HEAP_T> &ext_data,
+      CHI_GPU_HEAP_T *alloc)
       :
 #if HSHM_IS_GPU
       Base(alloc), task_infos_(alloc),
@@ -641,6 +650,11 @@ private:
   }
 
 public:
+  /** Read raw binary data from the deserializer */
+  HSHM_CROSS_FUN void read_binary(char *data, size_t size) {
+    deserializer_.read_binary(data, size);
+  }
+
   /**
    * Bulk transfer support for ShmPtr - deserialize the pointer value
    *

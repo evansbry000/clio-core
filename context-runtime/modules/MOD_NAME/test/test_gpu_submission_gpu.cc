@@ -165,7 +165,6 @@ __global__ void gpu_full_runtime_kernel(chi::IpcManagerGpu gpu_info,
 extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
                                           chi::u32 test_value,
                                           chi::u32 *out_result_value) {
-  cudaDeviceSetLimit(cudaLimitStackSize, 131072);  // 128KB stack for deep template chains
 
   // Create GPU memory backend for kernel allocations
   hipc::MemoryBackendId backend_id(3, 0);
@@ -178,14 +177,14 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
                                  gpu_backend.data_capacity_);
 
   // Set up IpcManagerGpuInfo for GPU→GPU path:
-  // - from_gpu_queue = nullptr (not using GPU→CPU)
-  // - to_gpu_queue = nullptr (not receiving CPU→GPU)
-  // - gpu_to_gpu_queue = GPU orchestrator's GPU→GPU queue
+  // - gpu2cu_queue = nullptr (not using GPU→CPU in this test)
+  // - cpu2gpu_queue = nullptr (not receiving CPU→GPU in this test)
+  // - gpu2gpu_queue = GPU orchestrator's GPU→GPU queue
   chi::IpcManagerGpuInfo gpu_info;
   gpu_info.backend = gpu_backend;
-  gpu_info.from_gpu_queue = nullptr;
-  gpu_info.to_gpu_queue = nullptr;
-  gpu_info.gpu_to_gpu_queue = CHI_IPC->GetGpuToGpuQueue(0);
+  gpu_info.gpu2cpu_queue = nullptr;
+  gpu_info.cpu2gpu_queue = nullptr;
+  gpu_info.gpu2gpu_queue = CHI_IPC->GetGpuToGpuQueue(0);
 
   // Use pinned host memory so CPU can poll result directly without
   // cudaStreamSynchronize (which can hang with persistent GPU orchestrator).
@@ -283,6 +282,11 @@ extern "C" int run_cpu_to_gpu_test(chi::PoolId pool_id,
   ctx.copy_space = fshm->copy_space;
   ctx.shm_info_ = &fshm->output_;
 
+  fprintf(stderr, "[CPU2GPU-DIAG] output total_written=%zu copy_space_size=%zu flags=%u\n",
+          (size_t)fshm->output_.total_written_.load(),
+          (size_t)fshm->output_.copy_space_size_.load(),
+          (unsigned)fshm->flags_.bits_.load());
+
   chi::LocalLoadTaskArchive load_ar;
   hshm::lbm::ShmTransport::Recv(load_ar, ctx);
   load_ar.SetMsgType(chi::LocalMsgType::kSerializeOut);
@@ -320,36 +324,31 @@ __global__ void gpu_to_cpu_kernel(chi::IpcManagerGpu gpu_info,
 extern "C" int run_gpu_to_cpu_test(chi::PoolId pool_id,
                                     chi::u32 test_value,
                                     chi::u32 *out_result_value) {
-  cudaDeviceSetLimit(cudaLimitStackSize, 131072);
 
-  // Create GPU memory backend for kernel allocations
+  // Primary backend: GPU kernel task allocations (NewTask objects)
   hipc::MemoryBackendId backend_id(5, 0);
   hipc::GpuShmMmap gpu_backend;
   if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "/gpu_to_cpu", 0))
     return -100;
 
-  // Create GPU queue in pinned shared memory
-  hipc::MemoryBackendId queue_backend_id(6, 0);
-  hipc::GpuShmMmap queue_backend;
-  if (!queue_backend.shm_init(queue_backend_id, 2 * 1024 * 1024,
-                               "/gpu_to_cpu_q", 0))
-    return -101;
+  // FutureShm backend: GPU allocates FutureShm here (UVM, CPU+GPU accessible).
+  // Separate from queue_backend so InitAllocTable doesn't overwrite the queue.
+  hipc::MemoryBackendId g2c_backend_id(9, 0);
+  hipc::GpuShmMmap g2c_backend;
+  if (!g2c_backend.shm_init(g2c_backend_id, 4 * 1024 * 1024,
+                              "/gpu_to_cpu_g2c", 0))
+    return -104;
 
-  auto *queue_alloc = queue_backend.MakeAlloc<hipc::ArenaAllocator<false>>(
-      queue_backend.data_capacity_);
-  if (!queue_alloc) return -103;
-
-  auto gpu_queue_ptr = queue_alloc->NewObj<chi::TaskQueue>(
-      queue_alloc, 1, 2, 1024);
-  if (gpu_queue_ptr.IsNull()) return -102;
-
-  // Register queue and assign to GPU worker
-  CHI_IPC->RegisterGpuQueue(gpu_queue_ptr);
-  CHI_IPC->AssignGpuLanesToWorker();
   CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue_ptr.ptr_);
+  // Use the system's pre-existing GPU→CPU queue (backend 4000).
+  // The CPU GPU worker (worker 2) already polls it via AssignGpuLanesToWorker
+  // called during runtime startup. No need to register a custom queue.
+  chi::IpcManagerGpuInfo gpu_info;
+  gpu_info.backend = static_cast<hipc::MemoryBackend &>(gpu_backend);
+  gpu_info.gpu2cpu_queue = CHI_IPC->GetGpuQueue(0);
+  gpu_info.gpu2cpu_backend = static_cast<hipc::MemoryBackend &>(g2c_backend);
 
   int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
   chi::u32 *d_rv = hshm::GpuApi::Malloc<chi::u32>(sizeof(chi::u32));
@@ -405,7 +404,29 @@ extern "C" int run_async_gpu_submit_local_gpu_bcast_test(
   auto future = client.AsyncGpuSubmit(
       chi::PoolQuery::LocalGpuBcast(), 0, test_value);
 
+  // Diagnostic: check FutureShm state before waiting
+  auto fshm_full = future.GetFutureShm();
+  chi::FutureShm *fshm = fshm_full.ptr_;
+  fprintf(stderr, "[ASYNC-BCAST-DIAG] fshm=%p future_shm_null=%d to_gpu_size=%zu\n",
+          (void*)fshm,
+          (int)future.GetFutureShmPtr().IsNull(),
+          (size_t)CHI_IPC->cpu2gpu_queues_.size());
+  if (fshm) {
+    fprintf(stderr, "[ASYNC-BCAST-DIAG] flags=%u copy_from_client=%u in.size=%zu out.size=%zu\n",
+            (unsigned)fshm->flags_.bits_.load(),
+            (unsigned)chi::FutureShm::FUTURE_COPY_FROM_CLIENT,
+            (size_t)fshm->input_.copy_space_size_.load(),
+            (size_t)fshm->output_.copy_space_size_.load());
+  }
+
   bool completed = future.Wait(10.0f);
+
+  if (fshm) {
+    fprintf(stderr, "[ASYNC-BCAST-DIAG] after wait: flags=%u total_written=%zu\n",
+            (unsigned)fshm->flags_.bits_.load(),
+            (size_t)fshm->output_.total_written_.load());
+  }
+
   if (!completed) {
     return -3;  // Timeout
   }
@@ -444,37 +465,31 @@ extern "C" int run_async_gpu_submit_to_local_cpu_test(
     chi::PoolId pool_id,
     chi::u32 test_value,
     chi::u32 *out_result_value) {
-  cudaDeviceSetLimit(cudaLimitStackSize, 131072);
 
-  // Create GPU memory backend for kernel allocations
+  // Primary backend: GPU kernel task allocations (NewTask objects)
   hipc::MemoryBackendId backend_id(7, 0);
   hipc::GpuShmMmap gpu_backend;
   if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024,
                              "/async_gpu_to_cpu", 0))
     return -100;
 
-  // Create GPU queue in pinned shared memory
-  hipc::MemoryBackendId queue_backend_id(8, 0);
-  hipc::GpuShmMmap queue_backend;
-  if (!queue_backend.shm_init(queue_backend_id, 2 * 1024 * 1024,
-                               "/async_gpu_to_cpu_q", 0))
-    return -101;
+  // FutureShm backend: GPU allocates FutureShm here (UVM, CPU+GPU accessible)
+  hipc::MemoryBackendId g2c_backend_id(10, 0);
+  hipc::GpuShmMmap g2c_backend;
+  if (!g2c_backend.shm_init(g2c_backend_id, 4 * 1024 * 1024,
+                              "/async_gpu_to_cpu_g2c", 0))
+    return -104;
 
-  auto *queue_alloc = queue_backend.MakeAlloc<hipc::ArenaAllocator<false>>(
-      queue_backend.data_capacity_);
-  if (!queue_alloc) return -103;
-
-  auto gpu_queue_ptr = queue_alloc->NewObj<chi::TaskQueue>(
-      queue_alloc, 1, 2, 1024);
-  if (gpu_queue_ptr.IsNull()) return -102;
-
-  // Register queue and assign to GPU worker
-  CHI_IPC->RegisterGpuQueue(gpu_queue_ptr);
-  CHI_IPC->AssignGpuLanesToWorker();
   CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue_ptr.ptr_);
+  // Use the system's pre-existing GPU→CPU queue (backend 4000).
+  // The CPU GPU worker (worker 2) already polls it via AssignGpuLanesToWorker
+  // called during runtime startup. No need to register a custom queue.
+  chi::IpcManagerGpuInfo gpu_info;
+  gpu_info.backend = static_cast<hipc::MemoryBackend &>(gpu_backend);
+  gpu_info.gpu2cpu_queue = CHI_IPC->GetGpuQueue(0);
+  gpu_info.gpu2cpu_backend = static_cast<hipc::MemoryBackend &>(g2c_backend);
 
   int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
   chi::u32 *d_rv = hshm::GpuApi::Malloc<chi::u32>(sizeof(chi::u32));

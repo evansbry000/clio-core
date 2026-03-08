@@ -97,8 +97,10 @@ struct Host {
   /**
    * Default constructor
    */
-  Host() : node_id(0), state(NodeState::kAlive),
-           state_changed_at(std::chrono::steady_clock::now()) {}
+  Host()
+      : node_id(0),
+        state(NodeState::kAlive),
+        state_changed_at(std::chrono::steady_clock::now()) {}
 
   /**
    * Constructor with IP address and node ID (required)
@@ -107,7 +109,9 @@ struct Host {
    * @param id Node ID (typically offset in hostfile)
    */
   Host(const std::string &ip, u64 id)
-      : ip_address(ip), node_id(id), state(NodeState::kAlive),
+      : ip_address(ip),
+        node_id(id),
+        state(NodeState::kAlive),
         state_changed_at(std::chrono::steady_clock::now()) {}
 
   bool IsAlive() const { return state == NodeState::kAlive; }
@@ -121,10 +125,18 @@ struct Host {
   friend std::ostream &operator<<(std::ostream &os, const Host &host) {
     const char *state_name = "unknown";
     switch (host.state) {
-      case NodeState::kAlive: state_name = "alive"; break;
-      case NodeState::kProbeFailed: state_name = "probe_failed"; break;
-      case NodeState::kSuspected: state_name = "suspected"; break;
-      case NodeState::kDead: state_name = "dead"; break;
+      case NodeState::kAlive:
+        state_name = "alive";
+        break;
+      case NodeState::kProbeFailed:
+        state_name = "probe_failed";
+        break;
+      case NodeState::kSuspected:
+        state_name = "suspected";
+        break;
+      case NodeState::kDead:
+        state_name = "dead";
+        break;
     }
     os << "Host(ip=" << host.ip_address << ", node_id=" << host.node_id
        << ", state=" << state_name << ")";
@@ -218,7 +230,7 @@ struct TaskId {
   u32 replica_id_;  ///< Replica identifier (for replicated tasks)
   u32 unique_;      ///< Unique identifier incremented for both root tasks and
                     ///< subtasks
-  u64 node_id_;     ///< Node identifier for distributed execution
+  u32 node_id_;     ///< Node identifier for distributed execution
   size_t net_key_;  ///< Network key for send/recv map lookup (pointer-based)
 
   HSHM_CROSS_FUN TaskId()
@@ -291,7 +303,7 @@ struct LockOwnerId {
       : worker_id_(0), pid_(0), tid_(0), major_(0), node_id_(0) {}
 
   HSHM_CROSS_FUN LockOwnerId(u32 worker_id, u32 pid, u32 tid, u32 major,
-                              u64 node_id)
+                             u64 node_id)
       : worker_id_(worker_id),
         pid_(pid),
         tid_(tid),
@@ -428,11 +440,46 @@ constexpr PoolId kAdminPoolId =
     UniqueId(1, 0);  // Admin ChiMod pool ID (reserved)
 
 // Allocator type aliases using HSHM conventions
-#define CHI_MAIN_ALLOC_T hipc::ArenaAllocator<false>
-#define CHI_CDATA_ALLOC_T hipc::MultiProcessAllocator
+//
+// CHI_QUEUE_ALLOC_T: BuddyAllocator on both CPU and GPU (queue ring buffers)
+//
+// CHI_TASK_ALLOC_T: allocator for task data and chi::priv structures
+//   CPU: MultiProcessAllocator — shared across processes in the main SHM segment
+//   GPU: BuddyAllocator       — per-thread GPU allocator
+//
+// CHI_PRIV_ALLOC_T / CHI_PRIV_ALLOC: private data allocator and instance
+//   CPU: MallocAllocator / HSHM_MALLOC
+//   GPU: CHI_TASK_ALLOC_T   / CHI_IPC->GetMainAllocator()
+//        (task constructors are never called from GPU kernels, so the GPU
+//         CHI_PRIV_ALLOC is only used for dynamic chi::priv operations in kernels)
+#define CHI_QUEUE_ALLOC_T hipc::BuddyAllocator
+
+#if HSHM_IS_HOST
+#define CHI_TASK_ALLOC_T  hipc::MultiProcessAllocator
+#define CHI_PRIV_ALLOC_T  hipc::MallocAllocator
+#define CHI_PRIV_ALLOC    HSHM_MALLOC
+#else
+#define CHI_TASK_ALLOC_T  hipc::BuddyAllocator
+#define CHI_PRIV_ALLOC_T  CHI_TASK_ALLOC_T
+#define CHI_PRIV_ALLOC    (CHI_IPC->GetMainAllocator())
+#endif
+
+// CHI_GPU_HEAP_T: allocator for GPU serialization scratch buffers.
+// Options: hipc::BuddyAllocator (managed pool) or hipc::MallocAllocator
+//          (CUDA device heap malloc/free, no pre-allocated buffer needed).
+// Separate from HSHM_DEFAULT_ALLOC_GPU_T (ArenaAllocator) used for FutureShm.
+#define CHI_GPU_HEAP_T hipc::BuddyAllocator
+
+// CHI_GPU_HEAP: per-thread BuddyAllocator from the GpuMalloc heap table.
+// Valid in GPU device code after CHIMAERA_GPU_ORCHESTRATOR_INIT.
+#define CHI_GPU_HEAP (CHI_IPC->GetGpuHeap())
 
 // Memory segment identifiers
-enum MemorySegment { kMainSegment = 0, kClientDataSegment = 1 };
+enum MemorySegment {
+  kMainSegment = 0,
+  kClientDataSegment = 1,
+  kQueueSegment = 2
+};
 
 // Input/Output parameter macros
 #define IN
@@ -516,36 +563,35 @@ struct RecoveryAssignment {
   u32 dest_node_id_;
   u32 dead_node_id_;
 
-  RecoveryAssignment()
-      : container_id_(0), dest_node_id_(0), dead_node_id_(0) {}
+  RecoveryAssignment() : container_id_(0), dest_node_id_(0), dead_node_id_(0) {}
 
   template <typename Ar>
   void serialize(Ar &ar) {
-    ar(pool_id_, chimod_name_, pool_name_, chimod_params_,
-       container_id_, dest_node_id_, dead_node_id_);
+    ar(pool_id_, chimod_name_, pool_name_, chimod_params_, container_id_,
+       dest_node_id_, dead_node_id_);
   }
 };
 
 }  // namespace chi
 
 namespace chi::priv {
-// Private data structures use MallocAllocator (heap memory, not shared)
-typedef hshm::priv::string<hipc::MallocAllocator> string;
+typedef hshm::priv::string<CHI_PRIV_ALLOC_T> string;
 
 template <typename T>
-using vector = hshm::priv::vector<T, hipc::MallocAllocator>;
+using vector = hshm::priv::vector<T, CHI_PRIV_ALLOC_T>;
 }  // namespace chi::priv
 
 namespace chi::ipc {
+// Queue structures use CHI_QUEUE_ALLOC_T (BuddyAllocator)
 template <typename T>
 using multi_mpsc_ring_buffer =
-    hipc::multi_mpsc_ring_buffer<T, CHI_MAIN_ALLOC_T>;
+    hipc::multi_mpsc_ring_buffer<T, CHI_QUEUE_ALLOC_T>;
 
 template <typename T>
-using mpsc_ring_buffer = hipc::mpsc_ring_buffer<T, CHI_MAIN_ALLOC_T>;
+using mpsc_ring_buffer = hipc::mpsc_ring_buffer<T, CHI_QUEUE_ALLOC_T>;
 
 template <typename T>
-using vector = hipc::vector<T, CHI_MAIN_ALLOC_T>;
+using vector = hipc::vector<T, CHI_QUEUE_ALLOC_T>;
 }  // namespace chi::ipc
 
 // Hash function specializations for std::unordered_map

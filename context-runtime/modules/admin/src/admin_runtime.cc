@@ -1025,6 +1025,32 @@ chi::TaskResume Runtime::ClientConnect(hipc::FullPtr<ClientConnectTask> task,
                                        chi::RunContext &rctx) {
   task->response_ = 0;
   task->server_generation_ = CHI_IPC->GetServerGeneration();
+  task->worker_queues_off_ = CHI_IPC->GetWorkerQueuesOffset();
+
+  // Populate GPU queue info for client attachment
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  auto *ipc = CHI_IPC;
+  chi::u32 num_gpus = static_cast<chi::u32>(ipc->GetToGpuQueueCount());
+  if (num_gpus > kMaxGpuDevices) num_gpus = kMaxGpuDevices;
+  task->num_gpus_ = num_gpus;
+  task->gpu_queue_depth_ = CHI_CONFIG_MANAGER->GetQueueDepth();
+
+  for (chi::u32 i = 0; i < num_gpus; ++i) {
+    // Queue offsets within their respective backends
+    task->cpu2gpu_queue_off_[i] = ipc->GetCpu2GpuQueueOffset(i);
+    task->gpu2cpu_queue_off_[i] = ipc->GetGpu2CpuQueueOffset(i);
+    task->gpu2gpu_queue_off_[i] = ipc->GetGpu2GpuQueueOffset(i);
+    task->cpu2gpu_backend_size_[i] = ipc->GetCpu2GpuBackendSize(i);
+    task->gpu2cpu_backend_size_[i] = ipc->GetGpu2CpuBackendSize(i);
+
+    // IPC handle for gpu2gpu GpuMalloc backend (device memory)
+    ipc->GetGpu2GpuIpcHandle(i, task->gpu2gpu_ipc_handle_bytes_[i]);
+  }
+#else
+  task->num_gpus_ = 0;
+  task->gpu_queue_depth_ = 0;
+#endif
+
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   co_return;
@@ -1751,14 +1777,51 @@ chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
 chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
                                         chi::RunContext &rctx) {
   auto *ipc_manager = CHI_IPC;
-  hipc::AllocatorId alloc_id(task->alloc_major_, task->alloc_minor_);
+  MemoryType mem_type = static_cast<MemoryType>(task->memory_type_);
 
-  HLOG(kInfo, "Admin::RegisterMemory: Registering alloc_id ({}.{})",
-       alloc_id.major_, alloc_id.minor_);
+  switch (mem_type) {
+    case MemoryType::kCpuMemory: {
+      // Existing path: POSIX shared memory registration
+      hipc::AllocatorId alloc_id(task->alloc_major_, task->alloc_minor_);
+      HLOG(kInfo, "Admin::RegisterMemory: Registering CPU alloc_id ({}.{})",
+           alloc_id.major_, alloc_id.minor_);
+      task->success_ = ipc_manager->RegisterMemory(alloc_id);
+      break;
+    }
+    case MemoryType::kGpuDeviceMemory: {
+      // GPU device memory: open IPC handle and register in gpu_alloc_map_
+      hipc::MemoryBackendId backend_id(task->alloc_major_, task->alloc_minor_);
+      HLOG(kInfo, "Admin::RegisterMemory: Registering GPU device memory ({}.{})"
+           " capacity={}", backend_id.major_, backend_id.minor_,
+           task->data_capacity_);
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+      hshm::GpuIpcMemHandle ipc_handle;
+      memcpy(&ipc_handle, task->ipc_handle_bytes_, sizeof(ipc_handle));
+      task->success_ = ipc_manager->RegisterGpuMemoryFromClient(
+          backend_id, ipc_handle, task->data_capacity_);
+#else
+      HLOG(kError, "Admin::RegisterMemory: GPU memory not supported (no CUDA/ROCm)");
+      task->success_ = false;
+#endif
+      break;
+    }
+    case MemoryType::kPinnedHostMemory: {
+      // Pinned host memory: attach to GpuShmMmap
+      hipc::MemoryBackendId backend_id(task->alloc_major_, task->alloc_minor_);
+      HLOG(kInfo, "Admin::RegisterMemory: Registering pinned host memory ({}.{})",
+           backend_id.major_, backend_id.minor_);
+      // For pinned host memory, the client creates a GpuShmMmap with a URL
+      // and the server attaches by URL like regular SHM
+      task->success_ = false;  // TODO: implement if needed
+      break;
+    }
+    default:
+      HLOG(kError, "Admin::RegisterMemory: Unknown memory type {}", task->memory_type_);
+      task->success_ = false;
+      break;
+  }
 
-  task->success_ = ipc_manager->RegisterMemory(alloc_id);
   task->SetReturnCode(task->success_ ? 0 : 1);
-
   (void)rctx;
   co_return;
 }
@@ -2652,7 +2715,7 @@ chi::TaskResume Runtime::SystemMonitor(hipc::FullPtr<SystemMonitorTask> task,
 chi::TaskResume Runtime::RegisterGpuContainer(
     hipc::FullPtr<RegisterGpuContainerTask> task, chi::RunContext &rctx) {
   // This task is handled on the CPU side.
-  // The megakernel's gpu::PoolManager is updated via a GPU kernel launch,
+  // The GPU orchestrator's gpu::PoolManager is updated via a GPU kernel launch,
   // not directly from the admin runtime. The pool_manager.cc CreatePool
   // handles the actual GPU container creation and registration.
   // This method exists as a no-op placeholder for task routing completeness.

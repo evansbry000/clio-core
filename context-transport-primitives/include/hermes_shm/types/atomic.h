@@ -173,6 +173,14 @@ struct nonatomic {
     }
   }
 
+  /** System-scope compare exchange strong (same as strong for nonatomic) */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN bool compare_exchange_strong_system(
+      T &expected, U desired,
+      std::memory_order order = std::memory_order_seq_cst) {
+    return compare_exchange_strong(expected, desired, order);
+  }
+
   /** Atomic pre-increment operator */
   HSHM_INLINE_CROSS_FUN nonatomic &operator++() {
     ++x;
@@ -406,17 +414,43 @@ struct rocm_atomic {
 #endif
   }
 
-  /** System-scope atomic store (exchange + threadfence on GPU) */
+  /** System-scope atomic store: fence first so prior writes are globally
+   *  visible before the signal value is updated. Uses system-scope exchange
+   *  so CPU can observe the new value without going through GPU L2. */
   template <typename U>
   HSHM_INLINE_CROSS_FUN void store_system(U count) {
-    exchange(count);
 #if HSHM_IS_GPU
     __threadfence_system();
+    if constexpr (sizeof(T) == 8) {
+      atomicExch_system(reinterpret_cast<unsigned long long*>(&x),
+                        static_cast<unsigned long long>(static_cast<T>(count)));
+    } else {
+      atomicExch_system(reinterpret_cast<unsigned int*>(&x),
+                        static_cast<unsigned int>(static_cast<T>(count)));
+    }
+#else
+    x = static_cast<T>(count);
 #endif
   }
 
-  /** System-scope atomic load (volatile, same as load) */
-  HSHM_INLINE_CROSS_FUN T load_system() const { return load(); }
+  /** System-scope atomic load: bypasses GPU L2 cache so GPU can observe
+   *  CPU-written values in pinned host memory without stale L2 reads.
+   *  Uses atomicAdd_system(&x, 0) as the standard CUDA trick for this. */
+  HSHM_INLINE_CROSS_FUN T load_system() const {
+#if HSHM_IS_GPU
+    if constexpr (sizeof(T) == 8) {
+      return (T)atomicAdd_system(
+          reinterpret_cast<unsigned long long*>(const_cast<T*>(&x)),
+          (unsigned long long)0);
+    } else {
+      return (T)atomicAdd_system(
+          reinterpret_cast<unsigned int*>(const_cast<T*>(&x)),
+          (unsigned int)0);
+    }
+#else
+    return *reinterpret_cast<const volatile T*>(&x);
+#endif
+  }
 
   /** Atomic compare exchange weak wrapper */
   template <typename U>
@@ -605,17 +639,51 @@ struct rocm_atomic {
     return *this;
   }
 
-  /** System-scope bitwise or assign (device-scope + threadfence on GPU) */
+  /** System-scope bitwise or assign: fence first (prior GPU writes globally
+   *  visible), then system-scope OR so CPU can observe the flag update. */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &or_system(U other) {
 #if HSHM_IS_GPU
-    atomicOr(reinterpret_cast<unsigned int*>(&x),
-             static_cast<unsigned int>(other));
     __threadfence_system();
+    atomicOr_system(reinterpret_cast<unsigned int*>(&x),
+                    static_cast<unsigned int>(other));
 #else
     x |= static_cast<T>(other);
 #endif
     return *this;
+  }
+
+  /** System-scope compare-exchange strong: bypasses GPU L2 so GPU can
+   *  atomically claim entries written by CPU in pinned host memory. */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN bool compare_exchange_strong_system(
+      T &expected, U desired,
+      std::memory_order order = std::memory_order_seq_cst) {
+#if HSHM_IS_GPU
+    if constexpr (sizeof(T) == 8) {
+      auto old = atomicCAS_system(
+          reinterpret_cast<unsigned long long*>(const_cast<T*>(&x)),
+          *reinterpret_cast<unsigned long long*>(&expected),
+          static_cast<unsigned long long>(static_cast<T>(desired)));
+      T old_t = *reinterpret_cast<T*>(&old);
+      if (old_t == expected) return true;
+      expected = old_t;
+      return false;
+    } else {
+      T old = atomicCAS_system(const_cast<T*>(&x), expected,
+                               static_cast<T>(desired));
+      if (old == expected) return true;
+      expected = old;
+      return false;
+    }
+#else
+    if (x == expected) {
+      x = static_cast<T>(desired);
+      return true;
+    }
+    expected = x;
+    return false;
+#endif
   }
 
   /** Bitwise xor assign (device-scope on GPU, plain on host) */
@@ -742,6 +810,14 @@ struct std_atomic {
   /** Atomic compare exchange strong wrapper */
   template <typename U>
   HSHM_INLINE bool compare_exchange_strong(
+      T &expected, U desired,
+      std::memory_order order = std::memory_order_seq_cst) {
+    return x.compare_exchange_strong(expected, desired, order);
+  }
+
+  /** System-scope compare exchange strong (same as strong for std_atomic) */
+  template <typename U>
+  HSHM_INLINE bool compare_exchange_strong_system(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
     return x.compare_exchange_strong(expected, desired, order);

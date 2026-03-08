@@ -133,7 +133,7 @@ class _BuddyAllocator : public Allocator {
    * @param region_size Size of the region in bytes. If 0, defaults to backend.data_capacity_
    * @return true on success, false on failure
    */
-  bool shm_init(const MemoryBackend &backend, size_t region_size = 0) {
+  HSHM_CROSS_FUN bool shm_init(const MemoryBackend &backend, size_t region_size = 0) {
     // Store backend
     SetBackend(backend);
     alloc_header_size_ = sizeof(_BuddyAllocator);
@@ -314,7 +314,7 @@ class _BuddyAllocator : public Allocator {
    * @param region Offset pointer to the new region
    * @param region_size Size of the new region in bytes
    */
-  void Expand(OffsetPtr<> region, size_t region_size) {
+  HSHM_CROSS_FUN void Expand(OffsetPtr<> region, size_t region_size) {
     if (region.IsNull() || region_size == 0) {
       return;
     }
@@ -503,7 +503,7 @@ class _BuddyAllocator : public Allocator {
    * the arena space into free pages, adding them to the appropriate free lists.
    * After this function, the arena is marked as fully consumed.
    */
-  void DivideArenaIntoPages(Heap<false> &heap) {
+  HSHM_CROSS_FUN void DivideArenaIntoPages(Heap<false> &heap) {
     // Get the arena bounds from the heap
     // After Init(), heap_ points to the beginning and hasn't moved yet
     size_t arena_begin = heap.GetOffset();

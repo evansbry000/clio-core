@@ -340,8 +340,8 @@ public:
   chi::TaskResume SystemMonitor(hipc::FullPtr<SystemMonitorTask> task, chi::RunContext &rctx);
 
   /**
-   * Handle RegisterGpuContainer - Register a GPU container with the megakernel
-   * The megakernel's gpu::PoolManager will be updated with the new container
+   * Handle RegisterGpuContainer - Register a GPU container with the GPU orchestrator
+   * The GPU orchestrator's gpu::PoolManager will be updated with the new container
    */
   chi::TaskResume RegisterGpuContainer(hipc::FullPtr<RegisterGpuContainerTask> task, chi::RunContext &rctx);
 

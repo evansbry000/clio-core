@@ -181,6 +181,9 @@ public:
  * Inherits from NetTaskArchive to integrate with Lightbeam networking
  */
 class SaveTaskArchive : public NetTaskArchive {
+public:
+  using is_saving = std::true_type;
+  using is_loading = std::false_type;
 private:
   friend class cereal::access;
 
@@ -291,6 +294,14 @@ public:
   void bulk(hipc::ShmPtr<> ptr, size_t size, uint32_t flags);
 
   /**
+   * Write raw binary data to the archive
+   */
+  void write_binary(const char *data, size_t size) {
+    auto binary = cereal::binary_data(data, size);
+    (*archive_)(binary);
+  }
+
+  /**
    * Get serialized data as string
    * @return The serialized data
    */
@@ -347,6 +358,9 @@ public:
  * Inherits from NetTaskArchive to integrate with Lightbeam networking
  */
 class LoadTaskArchive : public NetTaskArchive {
+public:
+  using is_saving = std::false_type;
+  using is_loading = std::true_type;
 private:
   friend class cereal::access;
 
@@ -533,6 +547,14 @@ public:
    * @param lbm_server Pointer to the Lightbeam server
    */
   void SetTransport(hshm::lbm::Transport *lbm_transport) { lbm_transport_ = lbm_transport; }
+
+  /**
+   * Read raw binary data from the archive
+   */
+  void read_binary(char *data, size_t size) {
+    auto binary = cereal::binary_data(data, size);
+    (*archive_)(binary);
+  }
 
   /**
    * Access underlying cereal archive

@@ -295,11 +295,11 @@ bool Chimaera::ServerInit() {
     }
   }
 
-  // Launch megakernel after all initial pools are created, so that
+  // Launch GPU work orchestrator after all initial pools are created, so that
   // cudaMalloc calls during GPU container allocation don't deadlock
-  // against the persistent megakernel.
-  if (!ipc_manager->LaunchMegakernel()) {
-    HLOG(kError, "Failed to launch GPU megakernel");
+  // against the persistent GPU work orchestrator.
+  if (!ipc_manager->LaunchGpuOrchestrator()) {
+    HLOG(kError, "Failed to launch GPU work orchestrator");
     is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;

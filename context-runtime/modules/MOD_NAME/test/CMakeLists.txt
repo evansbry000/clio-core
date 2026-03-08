@@ -25,6 +25,12 @@ set(STREAMING_TEST_SOURCES
   test_streaming.cc
 )
 
+# GPU Client Process test executable
+set(GPU_CLIENT_PROCESS_TEST_TARGET chimaera_gpu_client_process_tests)
+set(GPU_CLIENT_PROCESS_TEST_SOURCES
+  test_gpu_client_process.cc
+)
+
 # GPU Submission test executable (Part 3)
 set(GPU_SUBMISSION_TEST_TARGET chimaera_gpu_submission_tests)
 set(GPU_SUBMISSION_TEST_CPU_SOURCES
@@ -434,6 +440,18 @@ if(WRP_CORE_ENABLE_TESTS)
     cr_all_streaming_tests
     PROPERTIES LABELS "msan_skip;asan_skip"
   )
+
+  # GPU Client Process Tests
+  add_test(
+    NAME cr_gpu_client_process_tests
+    COMMAND ${GPU_CLIENT_PROCESS_TEST_TARGET} "[gpu][client_process]"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_client_process_tests PROPERTIES
+    TIMEOUT 180
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1"
+    LABELS "msan_skip;asan_skip"
+  )
 endif()
 
 # Custom targets for MOD_NAME tests
@@ -526,6 +544,31 @@ add_custom_target(test_streaming_concurrent
   DEPENDS ${STREAMING_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera concurrent streaming tests"
+)
+
+# GPU Client Process test executable (fork-based, CPU-only)
+add_executable(${GPU_CLIENT_PROCESS_TEST_TARGET} ${GPU_CLIENT_PROCESS_TEST_SOURCES})
+
+target_include_directories(${GPU_CLIENT_PROCESS_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/admin/include  # For admin tasks
+  ${CHIMAERA_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks and client
+)
+
+target_link_libraries(${GPU_CLIENT_PROCESS_TEST_TARGET}
+  chimaera_admin_runtime          # Admin module runtime
+  chimaera_admin_client           # Admin module client
+  chimaera_MOD_NAME_runtime       # MOD_NAME module runtime
+  chimaera_MOD_NAME_client        # MOD_NAME module client
+  hshm::cxx                       # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+)
+
+set_target_properties(${GPU_CLIENT_PROCESS_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 # Create GPU Submission test executable
@@ -637,6 +680,13 @@ add_custom_target(test_gpu_submission
   COMMENT "Running Chimaera Part 3 GPU submission tests"
 )
 
+add_custom_target(test_gpu_client_process
+  COMMAND ${GPU_CLIENT_PROCESS_TEST_TARGET}
+  DEPENDS ${GPU_CLIENT_PROCESS_TEST_TARGET}
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  COMMENT "Running Chimaera GPU client process tests"
+)
+
 # Migrate test executable (integration test binary for container migration)
 set(MIGRATE_TEST_TARGET chimaera_migrate_tests)
 set(MIGRATE_TEST_SOURCES
@@ -728,7 +778,7 @@ set_target_properties(${RECONNECT_TEST_TARGET} PROPERTIES
 )
 
 # Install test executables
-install(TARGETS ${FLUSH_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${STREAMING_TEST_TARGET} ${GPU_SUBMISSION_TEST_TARGET} ${MIGRATE_TEST_TARGET} ${RECOVERY_TEST_TARGET} ${RECONNECT_TEST_TARGET}
+install(TARGETS ${FLUSH_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${STREAMING_TEST_TARGET} ${GPU_SUBMISSION_TEST_TARGET} ${GPU_CLIENT_PROCESS_TEST_TARGET} ${MIGRATE_TEST_TARGET} ${RECOVERY_TEST_TARGET} ${RECONNECT_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 
@@ -738,6 +788,7 @@ message(STATUS "  CoMutex test target: ${COMUTEX_TEST_TARGET}")
 message(STATUS "  Wait Functionality test target: ${WAIT_FUNCTIONALITY_TEST_TARGET}")
 message(STATUS "  Streaming test target: ${STREAMING_TEST_TARGET}")
 message(STATUS "  GPU Submission test target: ${GPU_SUBMISSION_TEST_TARGET}")
+message(STATUS "  GPU Client Process test target: ${GPU_CLIENT_PROCESS_TEST_TARGET}")
 message(STATUS "  Migrate test target: ${MIGRATE_TEST_TARGET}")
 message(STATUS "  Recovery test target: ${RECOVERY_TEST_TARGET}")
 message(STATUS "  Reconnect test target: ${RECONNECT_TEST_TARGET}")

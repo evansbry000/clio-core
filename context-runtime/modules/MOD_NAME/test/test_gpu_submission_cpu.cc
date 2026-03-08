@@ -333,7 +333,9 @@ TEST_CASE("gpu_full_runtime_roundtrip", "[gpu][runtime][roundtrip]") {
   chimaera::MOD_NAME::Client client(pool_id);
   std::string pool_name = "gpu_rt_test_" + std::to_string(pool_id.ToU64());
   auto create_task = client.AsyncCreate(chi::PoolQuery::Dynamic(), pool_name, pool_id);
+  HLOG(kInfo, "TEST: before create_task.Wait()");
   create_task.Wait();
+  HLOG(kInfo, "TEST: after create_task.Wait(), return_code={}", create_task->return_code_);
   REQUIRE(create_task->return_code_ == 0);
   std::this_thread::sleep_for(100ms);
 

@@ -31,10 +31,11 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_MEGAKERNEL_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_MEGAKERNEL_H_
+#ifndef CHIMAERA_INCLUDE_CHIMAERA_GPU_WORK_ORCHESTRATOR_H_
+#define CHIMAERA_INCLUDE_CHIMAERA_GPU_WORK_ORCHESTRATOR_H_
 
 #include "chimaera/types.h"
+#include "chimaera/task.h"
 #include <string>
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
@@ -44,24 +45,26 @@ namespace chi {
 // Forward declare IpcManagerGpuInfo (defined in ipc_manager.h)
 struct IpcManagerGpuInfo;
 
+namespace gpu {
+
 /**
- * Control structure for megakernel lifecycle (pinned host memory)
+ * Control structure for GPU work orchestrator lifecycle (pinned host memory)
  * Shared between CPU and GPU for signaling exit
  */
-struct MegakernelControl {
+struct WorkOrchestratorControl {
   volatile int exit_flag;
   volatile int running_flag;
 };
 
 /**
- * Host-side megakernel launcher
- * Manages lifecycle of the persistent GPU megakernel
+ * Host-side GPU work orchestrator
+ * Manages lifecycle of the persistent GPU orchestrator kernel
  */
-class MegakernelLauncher {
+class WorkOrchestrator {
  public:
-  MegakernelControl *control_ = nullptr;
+  WorkOrchestratorControl *control_ = nullptr;
   void *d_pool_mgr_ = nullptr;  // gpu::PoolManager* on device (opaque for header)
-  void *stream_ = nullptr;      // cudaStream_t for dedicated megakernel stream
+  void *stream_ = nullptr;      // cudaStream_t for dedicated orchestrator stream
   bool is_launched_ = false;
 
   // Saved launch parameters for Pause/Resume
@@ -69,7 +72,7 @@ class MegakernelLauncher {
   u32 threads_per_block_ = 0;
 
   /**
-   * Launch the megakernel on the GPU
+   * Launch the GPU work orchestrator
    * @param gpu_info IPC info with queue pointers
    * @param blocks Number of GPU blocks
    * @param threads_per_block Threads per block
@@ -79,39 +82,62 @@ class MegakernelLauncher {
               u32 threads_per_block);
 
   /**
-   * Stop the megakernel and free resources
+   * Stop the orchestrator and free resources
    */
   void Finalize();
 
   /**
-   * Pause the megakernel (signal exit + wait for completion).
+   * Pause the orchestrator (signal exit + wait for completion).
    * Frees SMs so other kernels (e.g., GPU container allocation) can run.
    * The device-side PoolManager and control structure are preserved.
    */
   void Pause();
 
   /**
-   * Resume a paused megakernel with the same parameters.
+   * Resume a paused orchestrator with the same parameters.
    * @param gpu_info IPC info with queue pointers
    */
   void Resume(const IpcManagerGpuInfo &gpu_info);
 
   /**
    * Register a GPU container with the device-side PoolManager.
-   * Also fixes up the container's function pointer dispatch table with
-   * addresses from the megakernel's CUDA module context (required because
-   * device function pointers from companion .so libraries are not callable
-   * from the megakernel's persistent kernel).
+   * Since all containers are allocated within this CUDA module,
+   * vtables are already correct -- no fixup needed.
    *
    * @param pool_id Pool identifier
    * @param gpu_container_ptr Device pointer to gpu::Container
-   * @param chimod_name Name of the ChiMod (e.g., "chimaera_admin")
    */
-  void RegisterGpuContainer(const PoolId &pool_id, void *gpu_container_ptr,
-                             const std::string &chimod_name);
+  void RegisterGpuContainer(const PoolId &pool_id, void *gpu_container_ptr);
+
+  /**
+   * Allocate a GPU container by module name.
+   * Launches a kernel in the orchestrator's CUDA module context so vtables
+   * are valid for the persistent orchestrator kernel.
+   *
+   * @param pool_id Pool identifier
+   * @param container_id Container ID (typically node_id)
+   * @param chimod_name Name of the ChiMod (e.g., "chimaera_admin")
+   * @return Device pointer to allocated gpu::Container, or nullptr
+   */
+  void *AllocGpuContainer(const PoolId &pool_id, u32 container_id,
+                            const std::string &chimod_name);
 };
 
+/**
+ * Initialize an ArenaAllocator + TaskQueue on device memory via a GPU kernel.
+ * Called from CPU; launches a one-shot kernel to construct the allocator and
+ * queue in-place on the device buffer, then returns the queue FullPtr.
+ *
+ * @param device_data  Pointer to device memory (from GpuMalloc)
+ * @param capacity     Size of device_data in bytes
+ * @param queue_depth  Depth of the TaskQueue ring buffer
+ * @return FullPtr<TaskQueue> with shm_ offset valid for this allocator
+ */
+hipc::FullPtr<TaskQueue> InitQueueOnDevice(char *device_data, size_t capacity,
+                                            u32 queue_depth);
+
+}  // namespace gpu
 }  // namespace chi
 
 #endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_MEGAKERNEL_H_
+#endif  // CHIMAERA_INCLUDE_CHIMAERA_GPU_WORK_ORCHESTRATOR_H_

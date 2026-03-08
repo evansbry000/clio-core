@@ -1,0 +1,273 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/**
+ * GPU Runtime Latency Benchmark — CPU driver
+ *
+ * Initializes the Chimaera runtime in server mode, creates a MOD_NAME pool,
+ * then delegates to the GPU benchmark wrapper (run_gpu_bench_latency) to
+ * launch a GPU client kernel against the GPU work orchestrator.
+ *
+ * Benchmark parameters:
+ *   --test-case <case>        Only "latency" is accepted (default: latency)
+ *   --rt-blocks <N>           GPU runtime (orchestrator) blocks (default: 1)
+ *   --rt-threads <N>          GPU runtime threads per block (default: 32)
+ *   --client-blocks <N>       GPU client kernel blocks (default: 1)
+ *   --client-threads <N>      GPU client kernel threads per block (default: 32)
+ *   --batch-size <N>          Tasks per batch per GPU thread (default: 1)
+ *   --total-tasks <N>         Total tasks per GPU thread (default: 100)
+ */
+
+#include <chimaera/chimaera.h>
+#include <chimaera/ipc_manager.h>
+#include <chimaera/MOD_NAME/MOD_NAME_client.h>
+#include <hermes_shm/util/logging.h>
+
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <thread>
+
+using namespace std::chrono_literals;
+
+// Forward declaration of GPU benchmark wrapper (defined in bench_gpu_runtime_gpu.cc)
+// BENCH_GPU_KERNELS_COMPILED is set by CMake when building with CUDA/ROCm support.
+// The CPU source is compiled with HSHM_ENABLE_CUDA=0 to suppress __device__ annotations,
+// so we use this separate flag to detect whether GPU kernels are actually linked in.
+#if BENCH_GPU_KERNELS_COMPILED
+extern "C" int run_gpu_bench_latency(chi::PoolId pool_id,
+                                      chi::u32 method_id,
+                                      chi::u32 rt_blocks,
+                                      chi::u32 rt_threads,
+                                      chi::u32 client_blocks,
+                                      chi::u32 client_threads,
+                                      chi::u32 batch_size,
+                                      chi::u32 total_tasks,
+                                      float *out_elapsed_ms);
+#else
+extern "C" __attribute__((weak)) int run_gpu_bench_latency(
+    chi::PoolId, chi::u32, chi::u32, chi::u32, chi::u32, chi::u32,
+    chi::u32, chi::u32, float *) {
+  return -200;  // No GPU support compiled
+}
+#endif
+
+/** Supported benchmark test cases */
+enum class TestCase { kLatency };
+
+/**
+ * Configuration for the GPU runtime benchmark.
+ * All fields have defaults matching the spec (latency, 1 rt block, 32 threads).
+ */
+struct BenchmarkConfig {
+  TestCase test_case = TestCase::kLatency;  /**< Benchmark mode */
+  chi::u32 rt_blocks = 1;       /**< GPU work orchestrator block count */
+  chi::u32 rt_threads = 32;     /**< GPU work orchestrator threads per block */
+  chi::u32 client_blocks = 1;   /**< GPU client kernel block count */
+  chi::u32 client_threads = 32; /**< GPU client kernel threads per block */
+  chi::u32 batch_size = 1;      /**< Tasks per batch per GPU thread */
+  chi::u32 total_tasks = 100;   /**< Total tasks per GPU thread */
+};
+
+/**
+ * Print usage information and exit.
+ *
+ * @param prog Program name (argv[0])
+ */
+static void PrintHelp(const char *prog) {
+  HIPRINT("Usage: {} [options]", prog);
+  HIPRINT("Options:");
+  HIPRINT("  --test-case <case>     Test case (only 'latency' accepted; default: latency)");
+  HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
+  HIPRINT("  --rt-threads <N>       GPU runtime orchestrator threads/block (default: 32)");
+  HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
+  HIPRINT("  --client-threads <N>   GPU client kernel threads/block (default: 32)");
+  HIPRINT("  --batch-size <N>       Tasks per batch per GPU thread (default: 1)");
+  HIPRINT("  --total-tasks <N>      Total tasks per GPU thread (default: 100)");
+  HIPRINT("  --help, -h             Show this help");
+}
+
+/**
+ * Parse command-line arguments into BenchmarkConfig.
+ *
+ * @param argc Argument count
+ * @param argv Argument vector
+ * @param cfg  Output config
+ * @return true on success, false on error or --help
+ */
+static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if ((arg == "--help" || arg == "-h")) {
+      PrintHelp(argv[0]);
+      return false;
+    } else if (arg == "--test-case" && i + 1 < argc) {
+      std::string tc = argv[++i];
+      if (tc != "latency") {
+        HLOG(kError, "Only 'latency' test case is supported; got '{}'", tc);
+        return false;
+      }
+    } else if (arg == "--rt-blocks" && i + 1 < argc) {
+      cfg.rt_blocks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--rt-threads" && i + 1 < argc) {
+      cfg.rt_threads = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--client-blocks" && i + 1 < argc) {
+      cfg.client_blocks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--client-threads" && i + 1 < argc) {
+      cfg.client_threads = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--batch-size" && i + 1 < argc) {
+      cfg.batch_size = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--total-tasks" && i + 1 < argc) {
+      cfg.total_tasks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else {
+      HLOG(kError, "Unknown argument: {}", arg);
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Create the MOD_NAME pool used by the benchmark.
+ *
+ * @param pool_id  Desired pool ID
+ * @return true on success
+ */
+static bool CreateBenchPool(const chi::PoolId &pool_id) {
+  chimaera::MOD_NAME::Client client(pool_id);
+  auto task = client.AsyncCreate(chi::PoolQuery::Dynamic(),
+                                  "gpu_bench_pool", pool_id);
+  task.Wait();
+  if (task->return_code_ != 0) {
+    HLOG(kError, "Failed to create MOD_NAME pool (rc={})", task->return_code_);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Print benchmark results including throughput and per-task latency.
+ *
+ * @param cfg         Benchmark configuration
+ * @param elapsed_ms  Total elapsed time in ms
+ */
+static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
+  // The kernel launches 1 thread per block (only thread 0 does work).
+  // client_threads is unused by the actual kernel launch.
+  chi::u64 num_threads = static_cast<chi::u64>(cfg.client_blocks);  // 1 active thread/block
+  chi::u64 total_ops = num_threads * static_cast<chi::u64>(cfg.total_tasks);
+  double throughput = (total_ops * 1000.0) / elapsed_ms;   // tasks/sec
+  double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task per thread
+
+  HIPRINT("\n=== GPU Runtime Benchmark Results ===");
+  HIPRINT("Test case:           latency");
+  HIPRINT("RT blocks:           {}", cfg.rt_blocks);
+  HIPRINT("RT threads/block:    {}", cfg.rt_threads);
+  HIPRINT("Client blocks:       {}", cfg.client_blocks);
+  HIPRINT("Client threads/block:{}", cfg.client_threads);
+  HIPRINT("Batch size:          {}", cfg.batch_size);
+  HIPRINT("Total tasks/thread:  {}", cfg.total_tasks);
+  HIPRINT("GPU client threads:  {}", num_threads);
+  HIPRINT("Total task ops:      {}", total_ops);
+  printf("Elapsed time:        %.3f ms\n", elapsed_ms);
+  printf("Throughput:          %.0f tasks/sec\n", throughput);
+  printf("Avg latency:         %.3f us/task/thread\n", latency_us);
+}
+
+/**
+ * Run the GPU runtime latency benchmark end-to-end.
+ *
+ * Initializes Chimaera, creates a MOD_NAME pool, then calls into
+ * the GPU kernel wrapper to time the full GPU client→runtime round-trip.
+ *
+ * @param cfg  Benchmark configuration
+ * @return 0 on success, non-zero on failure
+ */
+static int RunBenchmark(const BenchmarkConfig &cfg) {
+#if !BENCH_GPU_KERNELS_COMPILED
+  HLOG(kError, "GPU support not compiled. Rebuild with HSHM_ENABLE_CUDA=1.");
+  return 1;
+#endif
+
+  // Initialize Chimaera in server mode (starts GPU work orchestrator)
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer)) {
+    HLOG(kError, "Failed to initialize Chimaera server");
+    return 1;
+  }
+  // Allow runtime to stabilize before issuing tasks
+  std::this_thread::sleep_for(500ms);
+
+  const chi::PoolId pool_id(9000, 0);
+  if (!CreateBenchPool(pool_id)) {
+    chi::CHIMAERA_FINALIZE();
+    return 1;
+  }
+  // Wait for pool registration to propagate to the GPU orchestrator
+  std::this_thread::sleep_for(200ms);
+
+  const chi::u32 method_id = chimaera::MOD_NAME::Method::kGpuSubmit;
+  float elapsed_ms = 0.0f;
+  int rc = run_gpu_bench_latency(pool_id, method_id,
+                                  cfg.rt_blocks, cfg.rt_threads,
+                                  cfg.client_blocks, cfg.client_threads,
+                                  cfg.batch_size, cfg.total_tasks,
+                                  &elapsed_ms);
+  chi::CHIMAERA_FINALIZE();
+
+  if (rc != 0) {
+    HLOG(kError, "GPU benchmark failed with code {}", rc);
+    return 1;
+  }
+
+  PrintResults(cfg, elapsed_ms);
+  return 0;
+}
+
+/**
+ * Benchmark entry point.
+ *
+ * Parses arguments and dispatches to RunBenchmark.
+ */
+int main(int argc, char **argv) {
+  BenchmarkConfig cfg;
+  if (!ParseArgs(argc, argv, cfg)) {
+    return 1;
+  }
+
+  HIPRINT("=== Chimaera GPU Runtime Benchmark ===");
+  HIPRINT("RT blocks={}, RT threads={}, client blocks={} (1 thread/block)",
+          cfg.rt_blocks, cfg.rt_threads, cfg.client_blocks);
+  HIPRINT("Total tasks/block={}", cfg.total_tasks);
+
+  return RunBenchmark(cfg);
+}

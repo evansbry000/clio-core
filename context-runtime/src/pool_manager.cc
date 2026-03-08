@@ -580,44 +580,23 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       co_return;
     }
 
-    // Create GPU container if ChiMod has a GPU companion library
-    ChiModInfo *chimod_info = module_manager->GetChiMod(chimod_name);
-    HLOG(kInfo, "CreatePool: Checking GPU companion for {} (has_gpu={})",
-         chimod_name, chimod_info && chimod_info->new_func_gpu ? 1 : 0);
-    if (chimod_info && chimod_info->new_func_gpu) {
-      HLOG(kInfo, "CreatePool: Calling new_func_gpu for pool {}", target_pool_id);
-      // Pause megakernel to free SMs for GPU container allocation kernels
+    // Create GPU container via the work orchestrator
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-      ipc_manager2->PauseMegakernel();
-#endif
-      void *gpu_container_ptr =
-          chimod_info->new_func_gpu(&target_pool_id, node_id);
-      HLOG(kInfo, "CreatePool: new_func_gpu returned {}", gpu_container_ptr);
+    {
+      ipc_manager2->PauseGpuOrchestrator();
+      void *gpu_container_ptr = ipc_manager2->AllocGpuContainer(
+          target_pool_id, node_id, chimod_name);
       if (gpu_container_ptr) {
-        HLOG(kInfo,
-             "PoolManager: Created GPU container for pool {} (device_ptr={})",
-             target_pool_id, gpu_container_ptr);
-        // Store the GPU container pointer in pool metadata
         auto it = pool_metadata_.find(target_pool_id);
         if (it != pool_metadata_.end()) {
           it->second.gpu_container_ptr_ = gpu_container_ptr;
         }
-        // Register with the megakernel's gpu::PoolManager
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-        ipc_manager2->RegisterMegakernelContainer(target_pool_id,
-                                                   gpu_container_ptr,
-                                                   chimod_name);
-#endif
-      } else {
-        HLOG(kWarning,
-             "PoolManager: Failed to create GPU container for ChiMod: {}",
-             chimod_name);
+        ipc_manager2->RegisterGpuOrchestratorContainer(target_pool_id,
+                                                        gpu_container_ptr);
       }
-      // Resume megakernel after GPU container allocation is done
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-      ipc_manager2->ResumeMegakernel();
-#endif
+      ipc_manager2->ResumeGpuOrchestrator();
     }
+#endif
 
   } catch (const std::exception& e) {
     HLOG(kError, "PoolManager: Exception during pool creation: {}", e.what());

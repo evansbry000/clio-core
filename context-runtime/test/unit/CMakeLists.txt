@@ -441,6 +441,23 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
   add_test(NAME ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} COMMAND ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET})
 
+  # BuddyAllocator benchmark-mimic GPU test
+  add_cuda_executable(test_buddy_benchmark_gpu TRUE test_buddy_benchmark_gpu.cc)
+  target_include_directories(test_buddy_benchmark_gpu PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+  )
+  target_link_libraries(test_buddy_benchmark_gpu
+    chimaera_cxx
+    hshm::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_buddy_benchmark_gpu PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME test_buddy_benchmark_gpu COMMAND test_buddy_benchmark_gpu)
+
   # GPU Runtime test executable (pure host code, compiled by g++)
   set(GPU_RUNTIME_TEST_TARGET test_chimaera_gpu_runtime)
   set(GPU_RUNTIME_TEST_SOURCES test_gpu_runtime.cc)

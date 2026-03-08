@@ -37,6 +37,14 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
   add_test(NAME test_local_transfer_gpu COMMAND test_local_transfer_gpu)
 
+  # BuddyAllocator GPU test
+  add_cuda_executable(test_buddy_alloc_gpu TRUE test_buddy_alloc_gpu.cc)
+  target_link_libraries(test_buddy_alloc_gpu
+    hshm::cuda_cxx
+    Catch2::Catch2WithMain
+  )
+  add_test(NAME test_buddy_alloc_gpu COMMAND test_buddy_alloc_gpu)
+
   add_subdirectory(runtime)
 
 else()

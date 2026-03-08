@@ -38,9 +38,10 @@
 #include <chimaera/config_manager.h>
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
 #include <yaml-cpp/yaml.h>
-#include <cereal/types/unordered_map.hpp>
-#include <cereal/types/string.hpp>
 
+#include <cereal/types/string.hpp>
+#include <cereal/types/unordered_map.hpp>
+#include <cstring>
 #include <unordered_map>
 
 #include "autogen/admin_methods.h"
@@ -117,11 +118,11 @@ struct BaseCreateTask : public chi::Task {
   /** SHM default constructor */
   BaseCreateTask()
       : chi::Task(),
-        chimod_name_(HSHM_MALLOC),
-        pool_name_(HSHM_MALLOC),
-        chimod_params_(HSHM_MALLOC),
+        chimod_name_(CHI_PRIV_ALLOC),
+        pool_name_(CHI_PRIV_ALLOC),
+        chimod_params_(CHI_PRIV_ALLOC),
         new_pool_id_(chi::PoolId::GetNull()),
-        error_message_(HSHM_MALLOC),
+        error_message_(CHI_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
         client_(nullptr) {
@@ -139,11 +140,11 @@ struct BaseCreateTask : public chi::Task {
       const std::string &pool_name, const chi::PoolId &target_pool_id,
       chi::ContainerClient *client, CreateParamsArgs &&...create_params_args)
       : chi::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(HSHM_MALLOC, chimod_name),
-        pool_name_(HSHM_MALLOC, pool_name),
-        chimod_params_(HSHM_MALLOC),
+        chimod_name_(CHI_PRIV_ALLOC, chimod_name),
+        pool_name_(CHI_PRIV_ALLOC, pool_name),
+        chimod_params_(CHI_PRIV_ALLOC),
         new_pool_id_(target_pool_id),
-        error_message_(HSHM_MALLOC),
+        error_message_(CHI_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
         client_(client) {
@@ -159,7 +160,7 @@ struct BaseCreateTask : public chi::Task {
       // Create and serialize the CreateParams with provided arguments
       CreateParamsT params(
           std::forward<CreateParamsArgs>(create_params_args)...);
-      chi::Task::Serialize(HSHM_MALLOC, chimod_params_, params);
+      chi::Task::Serialize(CHI_PRIV_ALLOC, chimod_params_, params);
     }
   }
 
@@ -169,11 +170,11 @@ struct BaseCreateTask : public chi::Task {
                           const chi::PoolQuery &pool_query,
                           const chi::PoolConfig &pool_config)
       : chi::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(HSHM_MALLOC, pool_config.mod_name_),
-        pool_name_(HSHM_MALLOC, pool_config.pool_name_),
-        chimod_params_(HSHM_MALLOC),
+        chimod_name_(CHI_PRIV_ALLOC, pool_config.mod_name_),
+        pool_name_(CHI_PRIV_ALLOC, pool_config.pool_name_),
+        chimod_params_(CHI_PRIV_ALLOC),
         new_pool_id_(pool_config.pool_id_),
-        error_message_(HSHM_MALLOC),
+        error_message_(CHI_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
         client_(nullptr) {
@@ -188,7 +189,7 @@ struct BaseCreateTask : public chi::Task {
     pool_query_ = pool_query;
 
     // Serialize PoolConfig directly into chimod_params_
-    chi::Task::Serialize(HSHM_MALLOC, chimod_params_, pool_config);
+    chi::Task::Serialize(CHI_PRIV_ALLOC, chimod_params_, pool_config);
   }
 
   /**
@@ -201,7 +202,7 @@ struct BaseCreateTask : public chi::Task {
       return;  // Skip SetParams in compose mode
     }
     CreateParamsT params(std::forward<Args>(args)...);
-    chi::Task::Serialize(HSHM_MALLOC, chimod_params_, params);
+    chi::Task::Serialize(CHI_PRIV_ALLOC, chimod_params_, params);
   }
 
   /**
@@ -337,7 +338,7 @@ struct DestroyPoolTask : public chi::Task {
       : chi::Task(),
         target_pool_id_(),
         destruction_flags_(0),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit DestroyPoolTask(const chi::TaskId &task_node,
@@ -348,7 +349,7 @@ struct DestroyPoolTask : public chi::Task {
       : chi::Task(task_node, pool_id, pool_query, 10),
         target_pool_id_(target_pool_id),
         destruction_flags_(destruction_flags),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -415,7 +416,7 @@ struct StopRuntimeTask : public chi::Task {
       : chi::Task(),
         shutdown_flags_(0),
         grace_period_ms_(5000),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit StopRuntimeTask(const chi::TaskId &task_node,
@@ -426,7 +427,7 @@ struct StopRuntimeTask : public chi::Task {
       : chi::Task(task_node, pool_id, pool_query, 10),
         shutdown_flags_(shutdown_flags),
         grace_period_ms_(grace_period_ms),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -558,7 +559,7 @@ struct SendTask : public chi::Task {
       error_message_;  ///< Error description if transfer failed
 
   /** SHM default constructor */
-  SendTask() : chi::Task(), transfer_flags_(0), error_message_(HSHM_MALLOC) {}
+  SendTask() : chi::Task(), transfer_flags_(0), error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit SendTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
@@ -566,7 +567,7 @@ struct SendTask : public chi::Task {
                     chi::u32 transfer_flags = 0)
       : chi::Task(task_node, pool_id, pool_query, Method::kSend),
         transfer_flags_(transfer_flags),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -627,7 +628,7 @@ struct RecvTask : public chi::Task {
       error_message_;  ///< Error description if transfer failed
 
   /** SHM default constructor */
-  RecvTask() : chi::Task(), transfer_flags_(0), error_message_(HSHM_MALLOC) {}
+  RecvTask() : chi::Task(), transfer_flags_(0), error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit RecvTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
@@ -635,7 +636,7 @@ struct RecvTask : public chi::Task {
                     chi::u32 transfer_flags = 0)
       : chi::Task(task_node, pool_id, pool_query, Method::kRecv),
         transfer_flags_(transfer_flags),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -682,18 +683,51 @@ struct RecvTask : public chi::Task {
   }
 };
 
+/** Maximum number of GPUs supported for queue info in ClientConnectTask */
+static constexpr int kMaxGpuDevices = 8;
+
 /**
  * ClientConnectTask - Client connection handshake
  * Received via lightbeam transport and responds with success
  * Returns 0 on success to indicate runtime is healthy
+ *
+ * Extended with GPU queue information so clients can attach to
+ * the server's GPU queues for SendToGpu() and kernel submission.
  */
 struct ClientConnectTask : public chi::Task {
   // Connect response
-  OUT int32_t response_;  ///< 0 = success, non-zero = error
-  OUT chi::u64 server_generation_;  ///< Server's generation counter for restart detection
+  OUT int32_t response_;            ///< 0 = success, non-zero = error
+  OUT chi::u64 server_generation_;  ///< Server's generation counter for restart
+                                    ///< detection
+
+  // Worker task queue SHM offset (for SHM-mode client attach)
+  OUT chi::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within main allocator
+
+  // GPU queue info (populated by server if GPUs are present)
+  OUT chi::u32 num_gpus_;  ///< Number of GPU devices
+  OUT chi::u64 cpu2gpu_queue_off_[kMaxGpuDevices];  ///< ShmPtr offsets for CPU→GPU queues
+  OUT chi::u64 gpu2cpu_queue_off_[kMaxGpuDevices];  ///< ShmPtr offsets for GPU→CPU queues
+  OUT chi::u64 gpu2gpu_queue_off_[kMaxGpuDevices];  ///< ShmPtr offsets for GPU→GPU queues
+  OUT chi::u64 cpu2gpu_backend_size_[kMaxGpuDevices];  ///< CPU→GPU queue backend sizes
+  OUT chi::u64 gpu2cpu_backend_size_[kMaxGpuDevices];  ///< GPU→CPU queue backend sizes
+  OUT chi::u32 gpu_queue_depth_;                       ///< Queue depth configuration
+  OUT char gpu2gpu_ipc_handle_bytes_[kMaxGpuDevices][64];  ///< GpuMalloc IPC handles for gpu2gpu
 
   /** SHM default constructor */
-  ClientConnectTask() : chi::Task(), response_(-1), server_generation_(0) {}
+  ClientConnectTask()
+      : chi::Task(),
+        response_(-1),
+        server_generation_(0),
+        worker_queues_off_(0),
+        num_gpus_(0),
+        gpu_queue_depth_(0) {
+    memset(cpu2gpu_queue_off_, 0, sizeof(cpu2gpu_queue_off_));
+    memset(gpu2cpu_queue_off_, 0, sizeof(gpu2cpu_queue_off_));
+    memset(gpu2gpu_queue_off_, 0, sizeof(gpu2gpu_queue_off_));
+    memset(cpu2gpu_backend_size_, 0, sizeof(cpu2gpu_backend_size_));
+    memset(gpu2cpu_backend_size_, 0, sizeof(gpu2cpu_backend_size_));
+    memset(gpu2gpu_ipc_handle_bytes_, 0, sizeof(gpu2gpu_ipc_handle_bytes_));
+  }
 
   /** Emplace constructor */
   explicit ClientConnectTask(const chi::TaskId &task_node,
@@ -701,12 +735,21 @@ struct ClientConnectTask : public chi::Task {
                              const chi::PoolQuery &pool_query)
       : chi::Task(task_node, pool_id, pool_query, Method::kClientConnect),
         response_(-1),
-        server_generation_(0) {
+        server_generation_(0),
+        worker_queues_off_(0),
+        num_gpus_(0),
+        gpu_queue_depth_(0) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kClientConnect;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    memset(cpu2gpu_queue_off_, 0, sizeof(cpu2gpu_queue_off_));
+    memset(gpu2cpu_queue_off_, 0, sizeof(gpu2cpu_queue_off_));
+    memset(gpu2gpu_queue_off_, 0, sizeof(gpu2gpu_queue_off_));
+    memset(cpu2gpu_backend_size_, 0, sizeof(cpu2gpu_backend_size_));
+    memset(gpu2cpu_backend_size_, 0, sizeof(gpu2cpu_backend_size_));
+    memset(gpu2gpu_ipc_handle_bytes_, 0, sizeof(gpu2gpu_ipc_handle_bytes_));
   }
 
   template <typename Archive>
@@ -717,13 +760,39 @@ struct ClientConnectTask : public chi::Task {
   template <typename Archive>
   void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(response_, server_generation_);
+    ar(response_, server_generation_, worker_queues_off_, num_gpus_, gpu_queue_depth_);
+    for (chi::u32 i = 0; i < kMaxGpuDevices; ++i) {
+      ar(cpu2gpu_queue_off_[i], gpu2cpu_queue_off_[i], gpu2gpu_queue_off_[i],
+         cpu2gpu_backend_size_[i], gpu2cpu_backend_size_[i]);
+    }
+    if constexpr (Archive::is_saving::value) {
+      ar.write_binary(reinterpret_cast<const char *>(gpu2gpu_ipc_handle_bytes_),
+                      sizeof(gpu2gpu_ipc_handle_bytes_));
+    } else {
+      ar.read_binary(reinterpret_cast<char *>(gpu2gpu_ipc_handle_bytes_),
+                     sizeof(gpu2gpu_ipc_handle_bytes_));
+    }
   }
 
   void Copy(const hipc::FullPtr<ClientConnectTask> &other) {
     Task::Copy(other.template Cast<Task>());
     response_ = other->response_;
     server_generation_ = other->server_generation_;
+    worker_queues_off_ = other->worker_queues_off_;
+    num_gpus_ = other->num_gpus_;
+    gpu_queue_depth_ = other->gpu_queue_depth_;
+    memcpy(cpu2gpu_queue_off_, other->cpu2gpu_queue_off_,
+           sizeof(cpu2gpu_queue_off_));
+    memcpy(gpu2cpu_queue_off_, other->gpu2cpu_queue_off_,
+           sizeof(gpu2cpu_queue_off_));
+    memcpy(gpu2gpu_queue_off_, other->gpu2gpu_queue_off_,
+           sizeof(gpu2gpu_queue_off_));
+    memcpy(cpu2gpu_backend_size_, other->cpu2gpu_backend_size_,
+           sizeof(cpu2gpu_backend_size_));
+    memcpy(gpu2cpu_backend_size_, other->gpu2cpu_backend_size_,
+           sizeof(gpu2cpu_backend_size_));
+    memcpy(gpu2gpu_ipc_handle_bytes_, other->gpu2gpu_ipc_handle_bytes_,
+           sizeof(gpu2gpu_ipc_handle_bytes_));
   }
 
   void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
@@ -900,8 +969,7 @@ struct MonitorTask : public chi::Task {
 
   MonitorTask() : chi::Task() {}
 
-  explicit MonitorTask(const chi::TaskId &task_id,
-                       const chi::PoolId &pool_id,
+  explicit MonitorTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
                        const chi::PoolQuery &pool_query,
                        const std::string &query)
       : chi::Task(task_id, pool_id, pool_query, Method::kMonitor),
@@ -1037,7 +1105,7 @@ struct SubmitBatchTask : public chi::Task {
         task_infos_(),
         serialized_data_(),
         tasks_completed_(0),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /**
    * Emplace constructor
@@ -1049,7 +1117,7 @@ struct SubmitBatchTask : public chi::Task {
         task_infos_(),
         serialized_data_(),
         tasks_completed_(0),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -1069,7 +1137,7 @@ struct SubmitBatchTask : public chi::Task {
         task_infos_(batch.GetTaskInfos()),
         serialized_data_(batch.GetSerializedData()),
         tasks_completed_(0),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -1122,90 +1190,15 @@ struct SubmitBatchTask : public chi::Task {
 };
 
 /**
- * RegisterAcceleratorMemoryTask - Register GPU accelerator memory with runtime
- *
- * This task is called from GPU kernels to register a GPU memory backend
- * with the Chimaera runtime. The runtime can then use this memory for
- * allocations within GPU kernels.
+ * Memory type for RegisterMemoryTask
+ * Distinguishes between CPU shared memory, pinned host memory, and GPU device
+ * memory
  */
-// TODO: RegisterAcceleratorMemoryTask - incomplete, needs Method::kRegisterAcceleratorMemory defined
-// struct RegisterAcceleratorMemoryTask : public chi::Task {
-//   // Backend information for GPU memory
-//   IN chi::u64 backend_id_;           ///< Backend ID
-//   IN chi::u64 data_capacity_;        ///< GPU memory capacity in bytes
-//   IN chi::u32 gpu_id_;               ///< GPU device ID
-//
-//   // Results
-//   OUT chi::priv::string error_message_;  ///< Error description if registration failed
-//
-//   /** SHM default constructor */
-//   RegisterAcceleratorMemoryTask()
-//       : chi::Task(),
-//         backend_id_(0),
-//         data_capacity_(0),
-//         gpu_id_(0),
-//         error_message_(HSHM_MALLOC) {}
-//
-//   /** Emplace constructor */
-//   explicit RegisterAcceleratorMemoryTask(const chi::TaskId &task_node,
-//                                          const chi::PoolId &pool_id,
-//                                          const chi::PoolQuery &pool_query,
-//                                          chi::u64 backend_id,
-//                                          chi::u64 data_capacity,
-//                                          chi::u32 gpu_id)
-//       : chi::Task(task_node, pool_id, pool_query, Method::kRegisterAcceleratorMemory),
-//         backend_id_(backend_id),
-//         data_capacity_(data_capacity),
-//         gpu_id_(gpu_id),
-//         error_message_(HSHM_MALLOC) {
-//     // Initialize task
-//     task_id_ = task_node;
-//     pool_id_ = pool_id;
-//     method_ = Method::kRegisterAcceleratorMemory;
-//     task_flags_.Clear();
-//     pool_query_ = pool_query;
-//   }
-//
-//   /**
-//    * Serialize IN and INOUT parameters for network transfer
-//    * This includes: backend_id_, data_capacity_, gpu_id_
-//    */
-//   template <typename Archive>
-//   void SerializeIn(Archive &ar) {
-//     Task::SerializeIn(ar);
-//     ar(backend_id_, data_capacity_, gpu_id_);
-//   }
-//
-//   /**
-//    * Serialize OUT and INOUT parameters for network transfer
-//    * This includes: error_message_
-//    */
-//   template <typename Archive>
-//   void SerializeOut(Archive &ar) {
-//     Task::SerializeOut(ar);
-//     ar(error_message_);
-//   }
-//
-//   /**
-//    * Copy from another RegisterAcceleratorMemoryTask
-//    * @param other Pointer to the source task to copy from
-//    */
-//   void Copy(const hipc::FullPtr<RegisterAcceleratorMemoryTask> &other) {
-//     // Copy base Task fields
-//     Task::Copy(other.template Cast<Task>());
-//     // Copy RegisterAcceleratorMemoryTask-specific fields
-//     backend_id_ = other->backend_id_;
-//     data_capacity_ = other->data_capacity_;
-//     gpu_id_ = other->gpu_id_;
-//     error_message_ = other->error_message_;
-//   }
-//
-//   /** Aggregate replica results into this task */
-//   void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
-//     Task::Aggregate(other_base);
-//     Copy(other_base.template Cast<RegisterAcceleratorMemoryTask>());
-//   }
-// };
+enum class MemoryType : chi::u32 {
+  kCpuMemory = 0,         ///< Regular POSIX shared memory (current default)
+  kPinnedHostMemory = 1,  ///< cudaHostRegister'd pinned memory (GpuShmMmap)
+  kGpuDeviceMemory = 2,   ///< cudaMalloc'd + IPC handle (GpuMalloc)
+};
 
 /**
  * RegisterMemoryTask - Register client shared memory with runtime
@@ -1213,17 +1206,35 @@ struct SubmitBatchTask : public chi::Task {
  * When a SHM-mode client creates a new shared memory segment via
  * IncreaseMemory(), it sends this task over TCP to tell the runtime
  * server to attach to the new segment.
+ *
+ * Extended to support GPU memory backends via MemoryType:
+ * - kCpuMemory: Existing POSIX shared memory path
+ * - kPinnedHostMemory: GpuShmMmap pinned host memory
+ * - kGpuDeviceMemory: GpuMalloc IPC handle-based GPU memory
  */
 struct RegisterMemoryTask : public chi::Task {
-  IN chi::u32 alloc_major_;  ///< AllocatorId major (pid)
-  IN chi::u32 alloc_minor_;  ///< AllocatorId minor (index)
+  IN chi::u32 alloc_major_;       ///< AllocatorId/BackendId major (pid)
+  IN chi::u32 alloc_minor_;       ///< AllocatorId/BackendId minor (index)
+  IN chi::u32 memory_type_;       ///< MemoryType enum value
+  IN chi::u32 gpu_id_;            ///< GPU device ID (for kGpuDeviceMemory)
+  IN chi::u64 data_capacity_;     ///< Memory capacity (for kGpuDeviceMemory)
+  IN char ipc_handle_bytes_[64];  ///< cudaIpcMemHandle_t raw bytes (for
+                                  ///< kGpuDeviceMemory)
   OUT bool success_;
 
   /** SHM default constructor */
   RegisterMemoryTask()
-      : chi::Task(), alloc_major_(0), alloc_minor_(0), success_(false) {}
+      : chi::Task(),
+        alloc_major_(0),
+        alloc_minor_(0),
+        memory_type_(0),
+        gpu_id_(0),
+        data_capacity_(0),
+        success_(false) {
+    memset(ipc_handle_bytes_, 0, sizeof(ipc_handle_bytes_));
+  }
 
-  /** Emplace constructor */
+  /** Emplace constructor (backward compatible - CPU memory) */
   explicit RegisterMemoryTask(const chi::TaskId &task_node,
                               const chi::PoolId &pool_id,
                               const chi::PoolQuery &pool_query,
@@ -1231,18 +1242,54 @@ struct RegisterMemoryTask : public chi::Task {
       : chi::Task(task_node, pool_id, pool_query, Method::kRegisterMemory),
         alloc_major_(alloc_id.major_),
         alloc_minor_(alloc_id.minor_),
+        memory_type_(static_cast<chi::u32>(MemoryType::kCpuMemory)),
+        gpu_id_(0),
+        data_capacity_(0),
         success_(false) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kRegisterMemory;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    memset(ipc_handle_bytes_, 0, sizeof(ipc_handle_bytes_));
+  }
+
+  /** Emplace constructor for GPU device memory */
+  explicit RegisterMemoryTask(const chi::TaskId &task_node,
+                              const chi::PoolId &pool_id,
+                              const chi::PoolQuery &pool_query,
+                              const hipc::MemoryBackendId &backend_id,
+                              MemoryType mem_type, chi::u32 gpu_id,
+                              chi::u64 data_capacity,
+                              const void *ipc_handle_data)
+      : chi::Task(task_node, pool_id, pool_query, Method::kRegisterMemory),
+        alloc_major_(backend_id.major_),
+        alloc_minor_(backend_id.minor_),
+        memory_type_(static_cast<chi::u32>(mem_type)),
+        gpu_id_(gpu_id),
+        data_capacity_(data_capacity),
+        success_(false) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kRegisterMemory;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+    if (ipc_handle_data) {
+      memcpy(ipc_handle_bytes_, ipc_handle_data, 64);
+    } else {
+      memset(ipc_handle_bytes_, 0, sizeof(ipc_handle_bytes_));
+    }
   }
 
   template <typename Archive>
   void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(alloc_major_, alloc_minor_);
+    ar(alloc_major_, alloc_minor_, memory_type_, gpu_id_, data_capacity_);
+    if constexpr (Archive::is_saving::value) {
+      ar.write_binary(ipc_handle_bytes_, 64);
+    } else {
+      ar.read_binary(ipc_handle_bytes_, 64);
+    }
   }
 
   template <typename Archive>
@@ -1255,6 +1302,10 @@ struct RegisterMemoryTask : public chi::Task {
     Task::Copy(other.template Cast<Task>());
     alloc_major_ = other->alloc_major_;
     alloc_minor_ = other->alloc_minor_;
+    memory_type_ = other->memory_type_;
+    gpu_id_ = other->gpu_id_;
+    data_capacity_ = other->data_capacity_;
+    memcpy(ipc_handle_bytes_, other->ipc_handle_bytes_, 64);
     success_ = other->success_;
   }
 
@@ -1274,9 +1325,7 @@ struct RestartContainersTask : public chi::Task {
 
   /** SHM default constructor */
   RestartContainersTask()
-      : chi::Task(),
-        containers_restarted_(0),
-        error_message_(HSHM_MALLOC) {}
+      : chi::Task(), containers_restarted_(0), error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit RestartContainersTask(const chi::TaskId &task_node,
@@ -1284,7 +1333,7 @@ struct RestartContainersTask : public chi::Task {
                                  const chi::PoolQuery &pool_query)
       : chi::Task(task_node, pool_id, pool_query, Method::kRestartContainers),
         containers_restarted_(0),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kRestartContainers;
@@ -1328,22 +1377,20 @@ struct AddNodeTask : public chi::Task {
   /** SHM default constructor */
   AddNodeTask()
       : chi::Task(),
-        new_node_ip_(HSHM_MALLOC),
+        new_node_ip_(CHI_PRIV_ALLOC),
         new_node_port_(0),
         new_node_id_(0),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
-  explicit AddNodeTask(const chi::TaskId &task_node,
-                       const chi::PoolId &pool_id,
+  explicit AddNodeTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                        const chi::PoolQuery &pool_query,
-                       const std::string &new_node_ip,
-                       chi::u32 new_node_port)
+                       const std::string &new_node_ip, chi::u32 new_node_port)
       : chi::Task(task_node, pool_id, pool_query, Method::kAddNode),
-        new_node_ip_(HSHM_MALLOC, new_node_ip),
+        new_node_ip_(CHI_PRIV_ALLOC, new_node_ip),
         new_node_port_(new_node_port),
         new_node_id_(0),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kAddNode;
@@ -1393,20 +1440,20 @@ struct ChangeAddressTableTask : public chi::Task {
         target_pool_id_(),
         container_id_(0),
         new_node_id_(0),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit ChangeAddressTableTask(const chi::TaskId &task_node,
-                                   const chi::PoolId &pool_id,
-                                   const chi::PoolQuery &pool_query,
-                                   const chi::PoolId &target_pool_id,
-                                   chi::ContainerId container_id,
-                                   chi::u32 new_node_id)
+                                  const chi::PoolId &pool_id,
+                                  const chi::PoolQuery &pool_query,
+                                  const chi::PoolId &target_pool_id,
+                                  chi::ContainerId container_id,
+                                  chi::u32 new_node_id)
       : chi::Task(task_node, pool_id, pool_query, Method::kChangeAddressTable),
         target_pool_id_(target_pool_id),
         container_id_(container_id),
         new_node_id_(new_node_id),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kChangeAddressTable;
@@ -1452,19 +1499,19 @@ struct MigrateContainersTask : public chi::Task {
   /** SHM default constructor */
   MigrateContainersTask()
       : chi::Task(),
-        migrations_json_(HSHM_MALLOC),
+        migrations_json_(CHI_PRIV_ALLOC),
         num_migrated_(0),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit MigrateContainersTask(const chi::TaskId &task_node,
-                                  const chi::PoolId &pool_id,
-                                  const chi::PoolQuery &pool_query,
-                                  const std::string &migrations_json)
+                                 const chi::PoolId &pool_id,
+                                 const chi::PoolQuery &pool_query,
+                                 const std::string &migrations_json)
       : chi::Task(task_node, pool_id, pool_query, Method::kMigrateContainers),
-        migrations_json_(HSHM_MALLOC, migrations_json),
+        migrations_json_(CHI_PRIV_ALLOC, migrations_json),
         num_migrated_(0),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kMigrateContainers;
@@ -1582,8 +1629,8 @@ struct HeartbeatProbeTask : public chi::Task {
  * Remote task: asks a helper node to probe a target on our behalf
  */
 struct ProbeRequestTask : public chi::Task {
-  IN chi::u64 target_node_id_;   // node to probe on behalf of requester
-  OUT int32_t probe_result_;     // 0 = alive, -1 = unreachable
+  IN chi::u64 target_node_id_;  // node to probe on behalf of requester
+  OUT int32_t probe_result_;    // 0 = alive, -1 = unreachable
 
   /** SHM default constructor */
   ProbeRequestTask() : chi::Task(), target_node_id_(0), probe_result_(-1) {}
@@ -1632,7 +1679,8 @@ struct ProbeRequestTask : public chi::Task {
  * Each node updates address_map_, only dest node creates the container
  */
 struct RecoverContainersTask : public chi::Task {
-  IN chi::priv::string assignments_data_;  // Serialized vector<RecoveryAssignment>
+  IN chi::priv::string
+      assignments_data_;  // Serialized vector<RecoveryAssignment>
   IN chi::u64 dead_node_id_;
   OUT chi::u32 num_recovered_;
   OUT chi::priv::string error_message_;
@@ -1640,22 +1688,22 @@ struct RecoverContainersTask : public chi::Task {
   /** SHM default constructor */
   RecoverContainersTask()
       : chi::Task(),
-        assignments_data_(HSHM_MALLOC),
+        assignments_data_(CHI_PRIV_ALLOC),
         dead_node_id_(0),
         num_recovered_(0),
-        error_message_(HSHM_MALLOC) {}
+        error_message_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
   explicit RecoverContainersTask(const chi::TaskId &task_node,
-                                  const chi::PoolId &pool_id,
-                                  const chi::PoolQuery &pool_query,
-                                  const std::string &assignments_data,
-                                  chi::u64 dead_node_id)
+                                 const chi::PoolId &pool_id,
+                                 const chi::PoolQuery &pool_query,
+                                 const std::string &assignments_data,
+                                 chi::u64 dead_node_id)
       : chi::Task(task_node, pool_id, pool_query, Method::kRecoverContainers),
-        assignments_data_(HSHM_MALLOC, assignments_data),
+        assignments_data_(CHI_PRIV_ALLOC, assignments_data),
         dead_node_id_(dead_node_id),
         num_recovered_(0),
-        error_message_(HSHM_MALLOC) {
+        error_message_(CHI_PRIV_ALLOC) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kRecoverContainers;
@@ -1769,17 +1817,14 @@ struct AnnounceShutdownTask : public chi::Task {
   IN chi::u64 shutting_down_node_id_;  ///< Node ID that is shutting down
 
   /** SHM default constructor */
-  AnnounceShutdownTask()
-      : chi::Task(),
-        shutting_down_node_id_(0) {}
+  AnnounceShutdownTask() : chi::Task(), shutting_down_node_id_(0) {}
 
   /** Emplace constructor */
   explicit AnnounceShutdownTask(const chi::TaskId &task_node,
                                 const chi::PoolId &pool_id,
                                 const chi::PoolQuery &pool_query,
                                 chi::u64 shutting_down_node_id)
-      : chi::Task(task_node, pool_id, pool_query,
-                   Method::kAnnounceShutdown),
+      : chi::Task(task_node, pool_id, pool_query, Method::kAnnounceShutdown),
         shutting_down_node_id_(shutting_down_node_id) {
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -1812,33 +1857,32 @@ struct AnnounceShutdownTask : public chi::Task {
 };
 
 /**
- * RegisterGpuContainerTask - Register a GPU container with the megakernel's
- * gpu::PoolManager. Called during pool creation when a ChiMod has a GPU
- * companion library. The device_ptr is obtained from new_chimod_gpu().
+ * RegisterGpuContainerTask - Register a GPU container with the GPU
+ * orchestrator's gpu::PoolManager. Called during pool creation when a ChiMod
+ * has a GPU companion library. The device_ptr is obtained from
+ * new_chimod_gpu().
  *
  * On GPU: updates gpu::PoolManager::RegisterContainer(pool_id, device_ptr).
- * On CPU: this is a no-op (megakernel handles it).
+ * On CPU: this is a no-op (GPU orchestrator handles it).
  */
 struct RegisterGpuContainerTask : public chi::Task {
   IN chi::PoolId target_pool_id_;
   IN chi::u32 container_id_;
   IN void *gpu_container_ptr_;  // Device pointer to gpu::Container
 
-  RegisterGpuContainerTask()
-      : chi::Task(), gpu_container_ptr_(nullptr) {}
+  RegisterGpuContainerTask() : chi::Task(), gpu_container_ptr_(nullptr) {}
 
   explicit RegisterGpuContainerTask(const chi::TaskId &task_node,
-                                     const chi::PoolId &pool_id,
-                                     const chi::PoolQuery &pool_query,
-                                     const chi::PoolId &target_pool_id,
-                                     chi::u32 container_id,
-                                     void *gpu_container_ptr)
+                                    const chi::PoolId &pool_id,
+                                    const chi::PoolQuery &pool_query,
+                                    const chi::PoolId &target_pool_id,
+                                    chi::u32 container_id,
+                                    void *gpu_container_ptr)
       : chi::Task(task_node, pool_id, pool_query,
-                   Method::kRegisterGpuContainer),
+                  Method::kRegisterGpuContainer),
         target_pool_id_(target_pool_id),
         container_id_(container_id),
-        gpu_container_ptr_(gpu_container_ptr) {
-  }
+        gpu_container_ptr_(gpu_container_ptr) {}
 
   // Serialization support
   template <class Archive>

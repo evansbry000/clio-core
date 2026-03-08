@@ -56,6 +56,17 @@ enum class RoutingMode {
 };
 
 /**
+ * Result of routing a task via RouteTask / RouteLocal / RouteGlobal
+ */
+enum class RouteResult {
+  ExecHere,  /**< Execute on this worker directly (caller runs ExecTask) */
+  Local,     /**< Enqueued to a different local worker */
+  Network,   /**< Enqueued to net_queue_ for remote dispatch */
+  Retry,     /**< Container is plugged — caller should add to retry queue */
+  Dne        /**< Container doesn't exist (pool not found) */
+};
+
+/**
  * Pool query class for determining task execution location and routing
  *
  * Provides methods to query different container addresses and routing modes

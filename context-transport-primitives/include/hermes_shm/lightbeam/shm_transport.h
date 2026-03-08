@@ -43,7 +43,6 @@
 #endif
 #endif
 #include <csignal>
-
 #include "hermes_shm/data_structures/serialization/local_serialize.h"
 #include "hermes_shm/thread/thread_model_manager.h"
 #include "lightbeam.h"
@@ -55,14 +54,15 @@ namespace hshm::lbm {
 // The copy space is treated as a ring buffer indexed by total_written_ and
 // total_read_ modulo copy_space_size_.
 struct ShmTransferInfo {
-  hipc::atomic<size_t> total_written_;  // Total bytes written by producer
-  hipc::atomic<size_t> total_read_;     // Total bytes read by consumer
-  size_t copy_space_size_;              // Ring buffer capacity
+  hipc::atomic<size_t> total_written_;   // Total bytes written by producer
+  hipc::atomic<size_t> total_read_;      // Total bytes read by consumer
+  hipc::atomic<size_t> copy_space_size_; // Ring buffer capacity (atomic so
+                                         // GPU can bypass L2 cache on read)
 
   HSHM_CROSS_FUN ShmTransferInfo() {
     total_written_.store(0);
     total_read_.store(0);
-    copy_space_size_ = 0;
+    copy_space_size_.store(0);
   }
 };
 
@@ -126,7 +126,7 @@ class ShmTransport
 
     // 1. Serialize metadata using LocalSerialize with allocator-backed buffer
     CharVec meta_buf(meta.alloc_);
-    meta_buf.reserve(ctx.shm_info_->copy_space_size_);
+    meta_buf.reserve(ctx.shm_info_->copy_space_size_.load());
     hshm::ipc::LocalSerialize<CharVec> ar(meta_buf);
     ar(meta);
 
@@ -202,7 +202,7 @@ class ShmTransport
     return info;
   }
 
- private:
+ public:
   /**
    * GPU-compatible static bulk data receiver.
    * Allocates receive buffers using the meta's allocator for private memory.
@@ -276,8 +276,13 @@ class ShmTransport
 #endif
 #endif
 #else
+    // Use volatile reads to bypass GPU L2 cache.
+    // On CUDA sm_70+ (Volta/Turing/Ampere/Ada), volatile global loads generate
+    // ld.global.cv which does NOT cache at any level of the GPU memory system.
+    // This ensures GPU reads CPU-written pinned host memory without stale L2 data.
+    const volatile char* vsrc = src;
     for (size_t i = 0; i < n; ++i) {
-      dst[i] = src[i];
+      dst[i] = vsrc[i];
     }
 #endif
   }
@@ -286,19 +291,21 @@ class ShmTransport
   HSHM_CROSS_FUN
   static void WriteTransfer(const char* data, size_t size, const LbmContext& ctx) {
     size_t offset = 0;
+    // Read all ShmTransferInfo fields via system-scope to bypass GPU L2 cache.
+    // This ensures GPU sees CPU-written values in pinned host memory.
+    size_t ring_size = ctx.shm_info_->copy_space_size_.load_system();
     size_t total_written = ctx.shm_info_->total_written_.load_system();
     while (offset < size) {
       size_t total_read = ctx.shm_info_->total_read_.load_system();
-      size_t space =
-          ctx.shm_info_->copy_space_size_ - (total_written - total_read);
+      size_t space = ring_size - (total_written - total_read);
       if (space == 0) {
 #if HSHM_IS_HOST
         HSHM_THREAD_MODEL->Yield();
 #endif
         continue;
       }
-      size_t write_pos = total_written % ctx.shm_info_->copy_space_size_;
-      size_t contig = ctx.shm_info_->copy_space_size_ - write_pos;
+      size_t write_pos = total_written % ring_size;
+      size_t contig = ring_size - write_pos;
       size_t chunk = Min3(size - offset, space, contig);
       MemCopy(ctx.copy_space + write_pos, data + offset, chunk);
       offset += chunk;
@@ -311,6 +318,9 @@ class ShmTransport
   HSHM_CROSS_FUN
   static void ReadTransfer(char* buf, size_t size, const LbmContext& ctx) {
     size_t offset = 0;
+    // Read all ShmTransferInfo fields via system-scope to bypass GPU L2 cache.
+    // This ensures GPU sees CPU-written values in pinned host memory.
+    size_t ring_size = ctx.shm_info_->copy_space_size_.load_system();
     size_t total_read = ctx.shm_info_->total_read_.load_system();
     while (offset < size) {
       size_t total_written = ctx.shm_info_->total_written_.load_system();
@@ -321,8 +331,8 @@ class ShmTransport
 #endif
         continue;
       }
-      size_t read_pos = total_read % ctx.shm_info_->copy_space_size_;
-      size_t contig = ctx.shm_info_->copy_space_size_ - read_pos;
+      size_t read_pos = total_read % ring_size;
+      size_t contig = ring_size - read_pos;
       size_t chunk = Min3(size - offset, avail, contig);
       MemCopy(buf + offset, ctx.copy_space + read_pos, chunk);
       offset += chunk;

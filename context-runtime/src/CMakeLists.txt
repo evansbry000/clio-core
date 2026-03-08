@@ -24,7 +24,7 @@ endforeach()
 set(CHIMAERA_LIB_NAME "${CHIMAERA_NAMESPACE}_cxx")
 add_library(${CHIMAERA_LIB_NAME} SHARED ${CHIMAERA_CPU_SOURCES})
 
-# Build GPU megakernel library if CUDA/ROCm enabled and GPU sources exist
+# Build GPU work orchestrator library if CUDA/ROCm enabled and GPU sources exist
 if(CHIMAERA_GPU_SOURCES)
   if(WRP_CORE_ENABLE_CUDA)
     add_cuda_library(${CHIMAERA_LIB_NAME}_gpu SHARED TRUE ${CHIMAERA_GPU_SOURCES})
@@ -33,6 +33,7 @@ if(CHIMAERA_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
     target_link_libraries(${CHIMAERA_LIB_NAME}_gpu PUBLIC hshm::cuda_cxx)
     # PRIVATE link: prevents HSHM_ENABLE_CUDA from propagating to g++ compilations

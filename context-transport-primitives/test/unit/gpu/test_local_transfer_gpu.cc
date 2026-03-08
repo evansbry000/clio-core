@@ -35,22 +35,22 @@
  * GPU unit test for ShmTransport with GpuShmMmap backend
  *
  * This test verifies that data transfer works correctly with GPU-accessible
- * pinned memory using ShmTransferInfo and ShmTransport::WriteTransfer/ReadTransfer:
+ * pinned memory using ShmTransferInfo and ShmTransport::Send/Recv:
  * 1. Allocates pinned host memory using GpuShmMmap backend for copy space
  * 2. Uses ShmTransferInfo for SPSC ring buffer metadata
- * 3. GPU kernel writes data via ShmTransport::WriteTransfer
- * 4. CPU reads data via ShmTransport::ReadTransfer
+ * 3. GPU kernel sends data via ShmTransport::Send
+ * 4. CPU receives data via ShmTransport::Recv
  * 5. CPU verifies the transferred data
  */
 
 #include <catch2/catch_all.hpp>
 
 #include "hermes_shm/lightbeam/shm_transport.h"
-#include "hermes_shm/memory/allocator/arena_allocator.h"
+#include "hermes_shm/memory/allocator/buddy_allocator.h"
 #include "hermes_shm/memory/backend/gpu_shm_mmap.h"
 #include "hermes_shm/util/gpu_api.h"
 
-using hshm::ipc::ArenaAllocator;
+using hshm::ipc::BuddyAllocator;
 using hshm::ipc::GpuShmMmap;
 using hshm::ipc::MemoryBackendId;
 using hshm::lbm::Bulk;
@@ -59,7 +59,7 @@ using hshm::lbm::LbmMeta;
 using hshm::lbm::ShmTransferInfo;
 using hshm::lbm::ShmTransport;
 
-using GpuAllocT = hipc::ArenaAllocator<false>;
+using GpuAllocT = hshm::ipc::BuddyAllocator;
 using GpuMeta = LbmMeta<GpuAllocT>;
 
 /**
@@ -75,17 +75,27 @@ __global__ void FillBufferKernel(char *buffer, size_t size, char pattern) {
 }
 
 /**
- * GPU kernel that writes data to copy_space via ShmTransport::WriteTransfer
- * Uses the GPU-compatible SPSC ring buffer to transfer data.
+ * GPU kernel that sends data via ShmTransport::Send API.
+ * Constructs LbmMeta on device and sends via the SPSC ring buffer.
  * Only thread 0 performs the transfer (single-producer).
  */
-__global__ void GpuWriteTransferKernel(const char *src_buffer, size_t data_size,
-                                        char *copy_space, ShmTransferInfo *shm_info) {
+__global__ void GpuSendSimpleKernel(GpuAllocT *alloc, const char *src_buffer,
+                                     size_t data_size, char *copy_space,
+                                     ShmTransferInfo *shm_info) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
+    GpuMeta meta(alloc);
+    Bulk bulk;
+    bulk.data.ptr_ = const_cast<char *>(src_buffer);
+    bulk.data.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
+    bulk.data.shm_.off_ = 0;
+    bulk.size = data_size;
+    bulk.flags = hshm::bitfield32_t(BULK_XFER);
+    meta.send.push_back(bulk);
+    meta.send_bulks = 1;
     LbmContext ctx;
     ctx.copy_space = copy_space;
     ctx.shm_info_ = shm_info;
-    ShmTransport::WriteTransfer(src_buffer, data_size, ctx);
+    ShmTransport::Send(meta, ctx);
   }
 }
 
@@ -116,8 +126,8 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
         backend.shm_init(backend_id, kBackendSize, kUrl, kGpuId);
     REQUIRE(init_success);
 
-    // Step 2: Create an ArenaAllocator on that backend
-    using AllocT = hipc::ArenaAllocator<false>;
+    // Step 2: Create an BuddyAllocator on that backend
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
     REQUIRE(alloc_ptr != nullptr);
 
@@ -145,27 +155,29 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     cudaError_t err = cudaDeviceSynchronize();
     REQUIRE(err == cudaSuccess);
 
-    // Step 6: GPU writes data via ShmTransport::WriteTransfer (SPSC ring buffer)
-    // Launch with single thread since WriteTransfer is single-producer
-    GpuWriteTransferKernel<<<1, 1>>>(gpu_buffer, kDataSize, copy_space, shm_info);
+    // Step 6: GPU sends data via ShmTransport::Send (SPSC ring buffer)
+    GpuSendSimpleKernel<<<1, 1>>>(alloc_ptr, gpu_buffer, kDataSize, copy_space,
+                                   shm_info);
 
-    // Step 7: CPU reads data via ShmTransport::ReadTransfer
-    std::vector<char> received_data(kDataSize);
+    // Step 7: CPU receives data via ShmTransport::Recv
+    LbmMeta<> recv_meta;
     LbmContext ctx;
     ctx.copy_space = copy_space;
     ctx.shm_info_ = shm_info;
-    ShmTransport::ReadTransfer(received_data.data(), kDataSize, ctx);
+    ShmTransport::Recv(recv_meta, ctx);
 
     // Wait for GPU kernel to complete
     err = cudaDeviceSynchronize();
     REQUIRE(err == cudaSuccess);
 
     // Step 8: Verify all data was transferred
-    REQUIRE(received_data.size() == kDataSize);
+    REQUIRE(recv_meta.recv.size() == 1);
+    REQUIRE(recv_meta.recv[0].size == kDataSize);
+    REQUIRE(recv_meta.recv[0].data.ptr_ != nullptr);
 
     bool all_ones = true;
     for (size_t i = 0; i < kDataSize; ++i) {
-      if (received_data[i] != kPattern) {
+      if (recv_meta.recv[0].data.ptr_[i] != kPattern) {
         all_ones = false;
         break;
       }
@@ -173,6 +185,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     REQUIRE(all_ones);
 
     // Cleanup
+    std::free(recv_meta.recv[0].data.ptr_);
     cudaFreeHost(gpu_buffer);
   }
 
@@ -184,7 +197,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
         backend.shm_init(backend_id, kBackendSize, kUrl + "_pattern", kGpuId);
     REQUIRE(init_success);
 
-    using AllocT = hipc::ArenaAllocator<false>;
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
     REQUIRE(alloc_ptr != nullptr);
 
@@ -208,30 +221,34 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
       gpu_buffer[i] = static_cast<char>(i % 256);
     }
 
-    // GPU writes via SPSC ring buffer
-    GpuWriteTransferKernel<<<1, 1>>>(gpu_buffer, kDataSize, copy_space, shm_info);
+    // GPU sends via SPSC ring buffer
+    GpuSendSimpleKernel<<<1, 1>>>(alloc_ptr, gpu_buffer, kDataSize, copy_space,
+                                   shm_info);
 
-    // CPU reads via SPSC ring buffer
-    std::vector<char> received_data(kDataSize);
+    // CPU receives via SPSC ring buffer
+    LbmMeta<> recv_meta;
     LbmContext ctx;
     ctx.copy_space = copy_space;
     ctx.shm_info_ = shm_info;
-    ShmTransport::ReadTransfer(received_data.data(), kDataSize, ctx);
+    ShmTransport::Recv(recv_meta, ctx);
 
     cudaError_t err = cudaDeviceSynchronize();
     REQUIRE(err == cudaSuccess);
 
     // Verify data integrity
-    REQUIRE(received_data.size() == kDataSize);
+    REQUIRE(recv_meta.recv.size() == 1);
+    REQUIRE(recv_meta.recv[0].size == kDataSize);
+    REQUIRE(recv_meta.recv[0].data.ptr_ != nullptr);
     bool pattern_correct = true;
     for (size_t i = 0; i < kDataSize; ++i) {
-      if (received_data[i] != static_cast<char>(i % 256)) {
+      if (recv_meta.recv[0].data.ptr_[i] != static_cast<char>(i % 256)) {
         pattern_correct = false;
         break;
       }
     }
     REQUIRE(pattern_correct);
 
+    std::free(recv_meta.recv[0].data.ptr_);
     cudaFreeHost(gpu_buffer);
   }
 
@@ -243,7 +260,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
         backend.shm_init(backend_id, kBackendSize, kUrl + "_direct", kGpuId);
     REQUIRE(init_success);
 
-    using AllocT = hipc::ArenaAllocator<false>;
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
     REQUIRE(alloc_ptr != nullptr);
 
@@ -286,7 +303,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
         backend.shm_init(backend_id, kBackendSize, kUrl + "_large", kGpuId);
     REQUIRE(init_success);
 
-    using AllocT = hipc::ArenaAllocator<false>;
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
     REQUIRE(alloc_ptr != nullptr);
 
@@ -314,31 +331,35 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
     cudaError_t err = cudaDeviceSynchronize();
     REQUIRE(err == cudaSuccess);
 
-    // GPU writes via SPSC ring buffer
-    GpuWriteTransferKernel<<<1, 1>>>(gpu_buffer, kLargeDataSize, copy_space, shm_info);
+    // GPU sends via SPSC ring buffer
+    GpuSendSimpleKernel<<<1, 1>>>(alloc_ptr, gpu_buffer, kLargeDataSize,
+                                   copy_space, shm_info);
 
-    // CPU reads via SPSC ring buffer
-    std::vector<char> received_data(kLargeDataSize);
+    // CPU receives via SPSC ring buffer
+    LbmMeta<> recv_meta;
     LbmContext ctx;
     ctx.copy_space = copy_space;
     ctx.shm_info_ = shm_info;
-    ShmTransport::ReadTransfer(received_data.data(), kLargeDataSize, ctx);
+    ShmTransport::Recv(recv_meta, ctx);
 
     err = cudaDeviceSynchronize();
     REQUIRE(err == cudaSuccess);
 
     // Verify
-    REQUIRE(received_data.size() == kLargeDataSize);
+    REQUIRE(recv_meta.recv.size() == 1);
+    REQUIRE(recv_meta.recv[0].size == kLargeDataSize);
+    REQUIRE(recv_meta.recv[0].data.ptr_ != nullptr);
 
     bool pattern_correct = true;
     for (size_t i = 0; i < kLargeDataSize; ++i) {
-      if (received_data[i] != kPattern) {
+      if (recv_meta.recv[0].data.ptr_[i] != kPattern) {
         pattern_correct = false;
         break;
       }
     }
     REQUIRE(pattern_correct);
 
+    std::free(recv_meta.recv[0].data.ptr_);
     cudaFreeHost(gpu_buffer);
   }
 }
@@ -348,7 +369,7 @@ TEST_CASE("ShmTransfer GPU", "[gpu][transfer]") {
  * Constructs LbmMeta on device, attaches bulk data, and sends via the
  * SPSC ring buffer with metadata serialization.
  *
- * @param alloc ArenaAllocator in pinned memory (GPU-accessible)
+ * @param alloc BuddyAllocator in pinned memory (GPU-accessible)
  * @param data_buf Data buffer in pinned memory to send as bulk
  * @param data_size Size of the data buffer
  * @param copy_space Ring buffer copy space in pinned memory
@@ -388,7 +409,7 @@ __global__ void GpuSendKernel(GpuAllocT *alloc, char *data_buf,
  * Receives metadata + bulk data through the SPSC ring buffer and copies
  * the first bulk's data into output_buf.
  *
- * @param alloc ArenaAllocator in pinned memory (GPU-accessible)
+ * @param alloc BuddyAllocator in pinned memory (GPU-accessible)
  * @param output_buf Buffer to copy received data into
  * @param max_size Maximum size of output_buf
  * @param copy_space Ring buffer copy space in pinned memory
@@ -411,7 +432,9 @@ __global__ void GpuRecvKernel(GpuAllocT *alloc, char *output_buf,
       *recv_size = meta.recv[0].size;
       size_t copy_size = meta.recv[0].size;
       if (copy_size > max_size) copy_size = max_size;
-      ShmTransport::MemCopy(output_buf, meta.recv[0].data.ptr_, copy_size);
+      for (size_t k = 0; k < copy_size; ++k) {
+        output_buf[k] = meta.recv[0].data.ptr_[k];
+      }
     }
   }
 }
@@ -436,8 +459,8 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
         backend.shm_init(backend_id, kBackendSize, kUrl, kGpuId);
     REQUIRE(init_success);
 
-    // Step 2: Create ArenaAllocator on that backend (GPU-accessible)
-    using AllocT = hipc::ArenaAllocator<false>;
+    // Step 2: Create BuddyAllocator on that backend (GPU-accessible)
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
     REQUIRE(alloc_ptr != nullptr);
 
@@ -515,7 +538,7 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
         backend.shm_init(backend_id, kBackendSize, kUrl + "_large", kGpuId);
     REQUIRE(init_success);
 
-    using AllocT = hipc::ArenaAllocator<false>;
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
     REQUIRE(alloc_ptr != nullptr);
 
@@ -593,7 +616,7 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
                                      kUrl + "_gpu2gpu_shared", kGpuId));
 
     // Step 2: Create allocators
-    using AllocT = hipc::ArenaAllocator<false>;
+    using AllocT = hshm::ipc::BuddyAllocator;
     AllocT *send_alloc = send_backend.MakeAlloc<AllocT>();
     AllocT *recv_alloc = recv_backend.MakeAlloc<AllocT>();
     AllocT *shared_alloc = shared_backend.MakeAlloc<AllocT>();

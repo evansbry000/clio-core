@@ -82,7 +82,7 @@ __global__ void test_gpu_backend_write_kernel(const hipc::MemoryBackend backend,
 }
 
 /**
- * Test placement new on ArenaAllocator without shm_init
+ * Test placement new on BuddyAllocator without shm_init
  */
 __global__ void test_gpu_placement_new_kernel(const hipc::MemoryBackend backend,
                                               int *results) {
@@ -90,9 +90,9 @@ __global__ void test_gpu_placement_new_kernel(const hipc::MemoryBackend backend,
 
   if (thread_id == 0 && backend.data_ != nullptr) {
     // Try placement new without calling shm_init
-    hipc::ArenaAllocator<false> *alloc =
-        reinterpret_cast<hipc::ArenaAllocator<false> *>(backend.data_);
-    new (alloc) hipc::ArenaAllocator<false>();
+    hipc::BuddyAllocator *alloc =
+        reinterpret_cast<hipc::BuddyAllocator *>(backend.data_);
+    new (alloc) hipc::BuddyAllocator();
     results[0] = 0;  // Success if we got here
   } else {
     results[thread_id] = 0;
@@ -107,9 +107,9 @@ __global__ void test_gpu_shm_init_kernel(const hipc::MemoryBackend backend,
   int thread_id = threadIdx.x;
 
   if (thread_id == 0 && backend.data_ != nullptr) {
-    hipc::ArenaAllocator<false> *alloc =
-        reinterpret_cast<hipc::ArenaAllocator<false> *>(backend.data_);
-    new (alloc) hipc::ArenaAllocator<false>();
+    hipc::BuddyAllocator *alloc =
+        reinterpret_cast<hipc::BuddyAllocator *>(backend.data_);
+    new (alloc) hipc::BuddyAllocator();
     results[0] = 1;  // Mark that we got past placement new
     alloc->shm_init(backend, backend.data_capacity_);
     results[0] = 0;  // Success if we got past shm_init
@@ -123,13 +123,13 @@ __global__ void test_gpu_shm_init_kernel(const hipc::MemoryBackend backend,
  */
 __global__ void test_gpu_alloc_no_ipc_kernel(const hipc::MemoryBackend backend,
                                              int *results) {
-  __shared__ hipc::ArenaAllocator<false> *g_arena_alloc;
+  __shared__ hipc::BuddyAllocator *g_arena_alloc;
   int thread_id = threadIdx.x;
 
   if (thread_id == 0) {
     g_arena_alloc =
-        reinterpret_cast<hipc::ArenaAllocator<false> *>(backend.data_);
-    new (g_arena_alloc) hipc::ArenaAllocator<false>();
+        reinterpret_cast<hipc::BuddyAllocator *>(backend.data_);
+    new (g_arena_alloc) hipc::BuddyAllocator();
     g_arena_alloc->shm_init(backend, backend.data_capacity_);
   }
   __syncthreads();
@@ -845,7 +845,7 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     std::vector<int> h_results(block_size, -1);
     hshm::GpuApi::Memcpy(d_results, h_results.data(), sizeof(int) * block_size);
 
-    cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+    cudaDeviceSetLimit(cudaLimitStackSize, 4096);
     test_gpu_ipc_manager_gpu_alloc_kernel<<<1, block_size>>>(gpu_info, d_results);
 
     cudaError_t err = cudaDeviceSynchronize();
@@ -873,9 +873,9 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     REQUIRE(queue_backend.shm_init(queue_backend_id, queue_memory_size,
                                    "/gpu_queue_test2", 0));
 
-    auto *queue_allocator = reinterpret_cast<hipc::ArenaAllocator<false> *>(
+    auto *queue_allocator = reinterpret_cast<hipc::BuddyAllocator *>(
         queue_backend.data_);
-    new (queue_allocator) hipc::ArenaAllocator<false>();
+    new (queue_allocator) hipc::BuddyAllocator();
     queue_allocator->shm_init(queue_backend, queue_backend.data_capacity_);
 
     auto gpu_queue = queue_allocator->template NewObj<chi::TaskQueue>(
@@ -888,7 +888,7 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     int h_result_init = -999;
     hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
 
-    cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+    cudaDeviceSetLimit(cudaLimitStackSize, 4096);
 
     // Launch kernel async — GPU writes to ring buffer + enqueues + waits
     test_gpu_send_serialization_kernel<<<1, 1>>>(gpu_info, d_result);
@@ -952,9 +952,9 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     REQUIRE(queue_backend.shm_init(queue_backend_id, queue_memory_size,
                                    "/gpu_queue_test4", 0));
 
-    auto *queue_allocator = reinterpret_cast<hipc::ArenaAllocator<false> *>(
+    auto *queue_allocator = reinterpret_cast<hipc::BuddyAllocator *>(
         queue_backend.data_);
-    new (queue_allocator) hipc::ArenaAllocator<false>();
+    new (queue_allocator) hipc::BuddyAllocator();
     queue_allocator->shm_init(queue_backend, queue_backend.data_capacity_);
 
     auto gpu_queue = queue_allocator->template NewObj<chi::TaskQueue>(
@@ -967,7 +967,7 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     int h_result_init = -999;
     hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
 
-    cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+    cudaDeviceSetLimit(cudaLimitStackSize, 4096);
 
     // Launch kernel async — GPU writes input to ring buffer, then blocks in RecvGpu
     test_gpu_send_recv_roundtrip_kernel<<<1, 1>>>(gpu_info, d_result);

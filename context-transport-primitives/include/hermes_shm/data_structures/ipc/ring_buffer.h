@@ -104,6 +104,15 @@ struct RingBufferEntry {
   HSHM_INLINE_CROSS_FUN
   bool IsReady() const { return flags_.Any(1); }
 
+  /**
+   * System-scope check if entry is ready: bypasses GPU L2 so GPU can
+   * observe CPU-written ready flags in pinned host memory.
+   *
+   * @return True if entry is ready
+   */
+  HSHM_INLINE_CROSS_FUN
+  bool IsReadySystem() const { return flags_.AnySystem(1); }
+
 
   /**
    * Mark entry as ready (release semantics)
@@ -464,23 +473,35 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   HSHM_CROSS_FUN
   bool Pop(T& val) {
-    // Don't pop if there's no entries
-    u64 head = head_.load();
-    u64 tail = tail_.load();
+    // Use system-scope loads to bypass GPU L2 cache so that GPU consumers
+    // observe CPU-written tail/entry updates in pinned host memory.
+    u64 head = head_.load_system();
+    u64 tail = tail_.load_system();
     if (head >= tail) {
       return false;
     }
 
-    // Pop the element, but only if it's marked valid
+    // Pop the element, but only if it's marked valid.
+    // Use system-scope CAS so that:
+    //   1. GPU sees CPU-written flags bypassing GPU L2 (acquire for data_).
+    //   2. Multiple GPU blocks racing to claim the same entry are correctly
+    //      serialized: exactly one wins, others return false.
     size_t idx = head % queue_.size();
     entry_type& entry = queue_[idx];
-    if (entry.IsReady()) {  // Acquire semantics ensure data visibility
-      val = entry.data_;
-      entry.ClearReady();
-      head_.fetch_add(1);
-      return true;
+    if (!entry.IsReadySystem()) {
+      return false;
     }
-    return false;
+    u32 expected = 1u;
+    if (!entry.flags_.bits_.compare_exchange_strong_system(expected, 0u)) {
+      // Another consumer atomically claimed this entry first.
+      return false;
+    }
+    val = entry.data_;
+    // Use store_system so the updated head is globally visible (bypasses GPU L2).
+    // Without this, head_.load_system() in the next Pop call would read the
+    // stale value from DRAM, causing the GPU to repeatedly try the same slot.
+    head_.store_system(head + 1);
+    return true;
   }
 
   /**

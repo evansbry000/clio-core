@@ -151,28 +151,54 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
   }
 
   /**
-   * Attach to existing GPU memory backend
+   * Attach to existing GPU memory backend via IPC handle
    *
-   * @param url Identifier for the backend (must match the IPC handle lookup mechanism)
+   * Opens a CUDA/HIP IPC memory handle from another process and
+   * reads the backend header to recover metadata.
+   *
+   * @param ipc_handle IPC handle obtained from the owning process
    * @return true on success, false on failure
-   *
-   * NOTE: This requires an external IPC handle registry mechanism to share handles between processes.
-   * For now, this is a placeholder that will need implementation.
+   */
+  bool shm_attach_ipc(const GpuIpcMemHandle &ipc_handle) {
+    flags_.Clear();
+
+    // Open IPC handle to get mapped pointer in this process
+    GpuApi::OpenIpcMemHandle(const_cast<GpuIpcMemHandle &>(ipc_handle),
+                             &region_);
+    if (!region_) {
+      HLOG(kError, "GpuMalloc::shm_attach_ipc: Failed to open IPC handle");
+      return false;
+    }
+
+    // Read header from GPU memory to get metadata
+    MemoryBackendHeader header_local;
+    GpuApi::Memcpy(&header_local, reinterpret_cast<MemoryBackendHeader *>(region_),
+                   sizeof(MemoryBackendHeader));
+
+    // Set up local pointers
+    header_ = reinterpret_cast<MemoryBackendHeader *>(region_);
+    data_ = region_ + 2 * kBackendHeaderSize;
+
+    // Copy metadata to local fields
+    id_ = header_local.id_;
+    backend_size_ = header_local.backend_size_;
+    data_capacity_ = header_local.data_capacity_;
+    data_id_ = header_local.data_id_;
+    priv_header_off_ = header_local.priv_header_off_;
+
+    UnsetOwner();
+    flags_.SetBits(MEMORY_BACKEND_INITIALIZED);
+    return true;
+  }
+
+  /**
+   * Attach to existing GPU memory backend (URL-based, not implemented)
    */
   bool shm_attach(const std::string &url) {
     flags_.Clear();
     url_ = url;
-
-    // TODO: Implement IPC handle registry lookup by URL
-    // For now, we can't attach without a shared mechanism to exchange IPC handles
-    HLOG(kError, "GpuMalloc::shm_attach requires IPC handle registry (not yet implemented)");
+    HLOG(kError, "GpuMalloc::shm_attach requires IPC handle (use shm_attach_ipc instead)");
     return false;
-
-    // Future implementation would:
-    // 1. Lookup IPC handle from registry using url
-    // 2. GpuApi::OpenIpcMemHandle(ipc_handle, &region_)
-    // 3. Copy header from GPU to host to read metadata
-    // 4. Set up local pointers and flags
   }
 
   /** Detach the mapped memory */
@@ -182,13 +208,17 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
   void shm_destroy() { _Destroy(); }
 
  protected:
-  /** Detach from memory */
+  /** Detach from memory (closes IPC handle for non-owner) */
   void _Detach() {
     if (!flags_.Any(MEMORY_BACKEND_INITIALIZED)) {
       return;
     }
 
-    // Clear GPU memory pointers (don't free, we're not the owner)
+    // Close IPC handle if we mapped via shm_attach_ipc
+    if (region_) {
+      GpuApi::CloseIpcMemHandle(region_);
+    }
+
     region_ = nullptr;
     header_ = nullptr;
     data_ = nullptr;

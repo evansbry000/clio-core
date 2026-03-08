@@ -32,13 +32,13 @@
  */
 
 /**
- * Unit tests for GPU megakernel runtime support
+ * Unit tests for GPU orchestrator runtime support
  *
  * Tests:
  * - Runtime initialization with GPU support
  * - Admin pool exists after init
  * - GPU queues are initialized
- * - Megakernel is launched
+ * - GPU orchestrator is launched
  * - Clean finalize
  */
 
@@ -48,7 +48,7 @@
 
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
-#include <chimaera/megakernel.h>
+#include <chimaera/gpu_work_orchestrator.h>
 #include <chimaera/pool_manager.h>
 #include <chimaera/config_manager.h>
 #include <chimaera/singletons.h>
@@ -148,15 +148,15 @@ TEST_CASE("GpuRuntime - GPU Config Parameters", "[gpu]") {
 }
 
 /**
- * Test: Megakernel launcher is active
+ * Test: GPU Orchestrator is active
  */
-TEST_CASE("GpuRuntime - Megakernel Active", "[gpu]") {
+TEST_CASE("GpuRuntime - GPU Orchestrator Active", "[gpu]") {
   GpuRuntimeFixture fixture;
   REQUIRE(g_initialized);
 
   auto *ipc = CHI_IPC;
-  // Check that the megakernel launcher was created
-  REQUIRE(ipc->megakernel_launcher_ != nullptr);
+  // Check that the GPU orchestrator was created
+  REQUIRE(ipc->gpu_orchestrator_ != nullptr);
 }
 
 /**
@@ -194,18 +194,18 @@ TEST_CASE("GpuRuntime - GpuToGpu Queues Initialized", "[gpu]") {
 }
 
 /**
- * Test: Megakernel running_flag is set after launch
+ * Test: GPU Orchestrator running_flag is set after launch
  */
-TEST_CASE("GpuRuntime - Megakernel Running Flag", "[gpu]") {
+TEST_CASE("GpuRuntime - GPU Orchestrator Running Flag", "[gpu]") {
   GpuRuntimeFixture fixture;
   REQUIRE(g_initialized);
 
   auto *ipc = CHI_IPC;
-  REQUIRE(ipc->megakernel_launcher_ != nullptr);
+  REQUIRE(ipc->gpu_orchestrator_ != nullptr);
 
-  // Cast to MegakernelLauncher and check running_flag
+  // Cast to gpu::WorkOrchestrator and check running_flag
   auto *launcher =
-      static_cast<chi::MegakernelLauncher *>(ipc->megakernel_launcher_);
+      static_cast<chi::gpu::WorkOrchestrator *>(ipc->gpu_orchestrator_);
   REQUIRE(launcher->control_ != nullptr);
 
   // Give the kernel time to set running_flag (it's async)

@@ -80,7 +80,8 @@ class Pthread : public ThreadModel {
   HSHM_CROSS_FUN
   void Yield() {
 #if HSHM_IS_HOST
-    sched_yield();
+    struct timespec ts = {0, 100};
+    nanosleep(&ts, nullptr);
 #endif
   }
 

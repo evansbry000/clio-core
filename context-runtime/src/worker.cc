@@ -110,7 +110,7 @@ bool Worker::Init() {
   event_queue_ =
       HSHM_MALLOC
           ->template NewObj<hshm::ipc::mpsc_ring_buffer<
-              Future<Task, CHI_MAIN_ALLOC_T>, hshm::ipc::MallocAllocator>>(
+              Future<Task, CHI_QUEUE_ALLOC_T>, hshm::ipc::MallocAllocator>>(
               HSHM_MALLOC, EVENT_QUEUE_DEPTH)
           .ptr_;
 
@@ -403,16 +403,14 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   }
 
   // Route task using consolidated routing function
-  if (CHI_IPC->RouteTask(future)) {
-    // Routing successful, execute the task
+  // RouteTask handles Retry/Dne internally via AddToRetryQueue
+  if (CHI_IPC->RouteTask(future) == RouteResult::ExecHere) {
 #if HSHM_IS_HOST
     RunContext *run_ctx = task_full_ptr->run_ctx_.get();
     bool is_started = task_full_ptr->task_flags_.Any(TASK_STARTED);
     ExecTask(task_full_ptr, run_ctx, is_started);
 #endif
   }
-  // Note: RouteTask returning false doesn't always indicate an error
-  // Real errors are handled within RouteTask itself
 
   return true;
 }
@@ -830,6 +828,10 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // transfer)
   RunContext *parent_task = run_ctx->future_.GetParentTask();
 
+  HLOG(kInfo, "EndTask: pool_id={} method={} was_copied={} parent_task={} event_queue={}",
+       task_ptr->pool_id_, task_ptr->method_, was_copied,
+       (void*)parent_task, parent_task ? (void*)parent_task->event_queue_ : nullptr);
+
   // Handle client transfer based on origin transport mode
   if (was_copied) {
     u32 origin = future_shm->origin_;
@@ -856,7 +858,7 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     // where the parent sees FUTURE_COMPLETE early, completes, frees memory, and
     // a stale event resumes a different task that reused the same address.
     auto *parent_event_queue =
-        reinterpret_cast<hipc::mpsc_ring_buffer<Future<Task, CHI_MAIN_ALLOC_T>,
+        reinterpret_cast<hipc::mpsc_ring_buffer<Future<Task, CHI_QUEUE_ALLOC_T>,
                                                 hshm::ipc::MallocAllocator> *>(
             parent_task->event_queue_);
     bool was_empty = parent_event_queue->Empty();
@@ -867,7 +869,11 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   } else {
     // Runtime task without parent (top-level client task) - set FUTURE_COMPLETE
     // directly so the client's Wait() can see it
+    HLOG(kInfo, "EndTask: setting FUTURE_COMPLETE for pool_id={} method={}",
+         task_ptr->pool_id_, task_ptr->method_);
     future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+    HLOG(kInfo, "EndTask: FUTURE_COMPLETE set, flags={}",
+         (u32)future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE));
   }
 }
 
@@ -971,8 +977,8 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
       run_ctx->block_start_ = batch_timestamp;
 
       // Route task again - this will handle both local and distributed routing
-      if (CHI_IPC->RouteTask(run_ctx->future_)) {
-        // Routing successful, execute the task
+      // RouteTask handles Retry/Dne internally via AddToRetryQueue
+      if (CHI_IPC->RouteTask(run_ctx->future_) == RouteResult::ExecHere) {
         ExecTask(run_ctx->task_, run_ctx, is_started);
 
         // If task re-yielded with a polling interval, ExecTask already
@@ -991,7 +997,7 @@ void Worker::ProcessEventQueue() {
   // FUTURE_COMPLETE on it here (on the parent worker's thread), then resume
   // the parent coroutine. This avoids stale RunContext* pointers since
   // FUTURE_COMPLETE is never set before the event is consumed.
-  Future<Task, CHI_MAIN_ALLOC_T> future;
+  Future<Task, CHI_QUEUE_ALLOC_T> future;
   while (event_queue_->Pop(future)) {
     // Mark the subtask's future as complete
     future.Complete();
@@ -1169,34 +1175,14 @@ void Worker::ProcessRetryQueue() {
       continue;  // Skip invalid entries
     }
 
-    // Re-resolve the pool query for this task
-    std::vector<PoolQuery> pool_queries = CHI_IPC->ResolvePoolQuery(
-        task_ptr->pool_query_, task_ptr->pool_id_, task_ptr);
-
-    bool is_local = CHI_IPC->IsTaskLocal(task_ptr, pool_queries);
-    if (is_local) {
-      // Container is back / available locally — check plug state
-      auto *pool_manager = CHI_POOL_MANAGER;
-      bool is_plugged = false;
-      ContainerId container_id = task_ptr->pool_query_.GetContainerId();
-      Container *exec_container = pool_manager->GetContainer(
-          task_ptr->pool_id_, container_id, is_plugged);
-
-      if (is_plugged) {
-        // Still plugged, put back in retry queue
-        retry_queue_.push(run_ctx);
-      } else if (exec_container) {
-        // Container available — execute locally
-        run_ctx->container_ = exec_container;
-        task_ptr->SetCompleter(exec_container->container_id_);
-        ExecTask(task_ptr, run_ctx, false);
-      } else {
-        // Container gone but resolved as local — shouldn't happen, retry
-        retry_queue_.push(run_ctx);
-      }
-    } else {
-      // Container migrated away — route globally
-      CHI_IPC->RouteGlobal(run_ctx->future_, pool_queries);
+    // Clear TASK_ROUTED so RouteTask re-evaluates.
+    // RouteTask handles Retry/Dne internally via AddToRetryQueue.
+    task_ptr->ClearFlags(TASK_ROUTED);
+    RouteResult result =
+        CHI_IPC->RouteTask(run_ctx->future_, /*force_enqueue=*/true);
+    if (result == RouteResult::ExecHere) {
+      // force_enqueue=true means this shouldn't happen, but handle it
+      ExecTask(task_ptr, run_ctx, false);
     }
   }
 }

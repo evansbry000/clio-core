@@ -139,6 +139,15 @@ class GpuApi {
 #endif
   }
 
+  static void CloseIpcMemHandle(void *data) {
+#if HSHM_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipIpcCloseMemHandle(data));
+#endif
+#if HSHM_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaIpcCloseMemHandle(data));
+#endif
+  }
+
   template <typename T>
   static T *Malloc(size_t size) {
 #if HSHM_ENABLE_ROCM
@@ -172,11 +181,11 @@ class GpuApi {
   static void RegisterHostMemory(T *ptr, size_t size) {
 #if HSHM_ENABLE_ROCM
     HIP_ERROR_CHECK(
-        hipHostRegister((void *)ptr, size, hipHostRegisterPortable));
+        hipHostRegister((void *)ptr, size, hipHostRegisterPortable | hipHostRegisterMapped));
 #endif
 #if HSHM_ENABLE_CUDA
     CUDA_ERROR_CHECK(
-        cudaHostRegister((void *)ptr, size, cudaHostRegisterPortable));
+        cudaHostRegister((void *)ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped));
 #endif
   }
 

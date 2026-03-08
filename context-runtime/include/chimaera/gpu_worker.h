@@ -46,8 +46,8 @@ namespace gpu {
 /**
  * GPU-side worker that mirrors the CPU Worker API.
  *
- * Runs on block 0, thread 0 of the megakernel. Polls both the
- * CPU→GPU queue (to_gpu_queue) and the GPU→GPU queue (gpu_to_gpu_queue)
+ * Runs on block 0, thread 0 of the GPU work orchestrator. Polls both the
+ * CPU→GPU queue (cpu2gpu_queue) and the GPU→GPU queue (gpu2gpu_queue)
  * for incoming tasks, deserializes inputs, dispatches to GPU containers,
  * serializes outputs, and signals completion.
  *
@@ -57,8 +57,8 @@ class Worker {
  public:
   u32 worker_id_;                    /**< Worker identity */
   volatile bool is_running_;         /**< Running flag for the poll loop */
-  TaskQueue *to_gpu_queue_;          /**< CPU → GPU queue (megakernel polls) */
-  TaskQueue *gpu_to_gpu_queue_;      /**< GPU → GPU queue (megakernel polls) */
+  TaskQueue *cpu2gpu_queue_;         /**< CPU → GPU queue (GPU work orchestrator polls) */
+  TaskQueue *gpu2gpu_queue_;         /**< GPU → GPU queue (GPU work orchestrator polls) */
   PoolManager *pool_mgr_;            /**< GPU-side container lookup table */
   char *queue_backend_base_;         /**< Base of queue backend for ShmPtr resolution */
   GpuRunContext rctx_;               /**< Reused run context per task */
@@ -67,19 +67,19 @@ class Worker {
    * Initialize the worker with queue and pool manager pointers.
    *
    * @param worker_id Logical worker ID
-   * @param to_gpu_queue CPU→GPU queue pointer (pinned host memory)
-   * @param gpu_to_gpu_queue GPU→GPU queue pointer (pinned host memory)
+   * @param cpu2gpu_queue CPU→GPU queue pointer (pinned host memory)
+   * @param gpu2gpu_queue GPU→GPU queue pointer (device memory)
    * @param pool_mgr GPU-side pool manager for container lookup
    * @param queue_backend_base Base pointer of queue backend for ShmPtr offsets
    */
   HSHM_GPU_FUN void Init(u32 worker_id,
-                          TaskQueue *to_gpu_queue,
-                          TaskQueue *gpu_to_gpu_queue,
+                          TaskQueue *cpu2gpu_queue,
+                          TaskQueue *gpu2gpu_queue,
                           PoolManager *pool_mgr,
                           char *queue_backend_base) {
     worker_id_ = worker_id;
-    to_gpu_queue_ = to_gpu_queue;
-    gpu_to_gpu_queue_ = gpu_to_gpu_queue;
+    cpu2gpu_queue_ = cpu2gpu_queue;
+    gpu2gpu_queue_ = gpu2gpu_queue;
     pool_mgr_ = pool_mgr;
     queue_backend_base_ = queue_backend_base;
     is_running_ = true;
@@ -100,8 +100,8 @@ class Worker {
    */
   HSHM_GPU_FUN bool PollOnce() {
     bool did_work = false;
-    did_work |= ProcessNewTask(to_gpu_queue_);
-    did_work |= ProcessNewTask(gpu_to_gpu_queue_);
+    did_work |= ProcessNewTask(cpu2gpu_queue_);
+    did_work |= ProcessNewTask(gpu2gpu_queue_);
     return did_work;
   }
 
@@ -144,8 +144,18 @@ class Worker {
       return false;
     }
 
-    // Resolve FutureShm from the queue backend
-    FutureShm *fshm = ResolveFutureShm(future);
+    // Resolve FutureShm: queue-dependent resolution
+    hipc::ShmPtr<FutureShm> sptr = future.GetFutureShmPtr();
+    if (sptr.IsNull()) return true;
+    size_t off = sptr.off_.load();
+    FutureShm *fshm;
+    if (queue == cpu2gpu_queue_) {
+      // CPU→GPU (SendToGpu): relative offset from queue backend (pinned host)
+      fshm = reinterpret_cast<FutureShm *>(queue_backend_base_ + off);
+    } else {
+      // GPU→GPU: absolute UVA pointer (device memory or pinned host via UVA)
+      fshm = reinterpret_cast<FutureShm *>(off);
+    }
     if (!fshm) {
       return true;  // Consumed slot but bad pointer
     }
@@ -155,30 +165,58 @@ class Worker {
     u32 method_id = fshm->method_id_;
     Container *container = pool_mgr_->GetContainer(pool_id);
     if (!container) {
-      // No container registered — mark complete with no output
-      fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+      // No container registered — mark complete with no output (system-scope for CPU visibility)
+      fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
       return true;
     }
 
-    // Deserialize input, dispatch, serialize output
-    DispatchTask(fshm, container, method_id);
+    if (fshm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT)) {
+      // Copy path (SendGpuLocal / SendToGpu): deserialize, run, serialize
+      DispatchTask(fshm, container, method_id);
+    } else {
+      // Forward path (SendGpuForward): run task in-place, no (de)serialization
+      DispatchTaskDirect(fshm, container, method_id);
+    }
     return true;
   }
 
   /**
-   * Resolve a FutureShm pointer from a Future's ShmPtr.
+   * Run a task directly from its pointer without (de)serialization.
    *
-   * The FutureShm is allocated in the queue backend (pinned host memory).
-   * We resolve it by adding the ShmPtr offset to queue_backend_base_.
+   * Used by the SendGpuForward path where the task object is already in
+   * GPU-accessible memory. Results are written in-place to the task object;
+   * the caller reads them after FUTURE_COMPLETE is observed.
    *
-   * @param future The future whose FutureShm to resolve
-   * @return Pointer to the FutureShm, or nullptr on failure
+   * @param fshm FutureShm with client_task_vaddr_ set to absolute Task*
+   * @param container Target GPU container
+   * @param method_id Method to dispatch
    */
-  HSHM_GPU_FUN FutureShm *ResolveFutureShm(Future<Task> &future) {
-    hipc::ShmPtr<FutureShm> sptr = future.GetFutureShmPtr();
-    if (sptr.IsNull()) return nullptr;
-    size_t off = sptr.off_.load();
-    return reinterpret_cast<FutureShm *>(queue_backend_base_ + off);
+  HSHM_GPU_FUN void DispatchTaskDirect(FutureShm *fshm, Container *container,
+                                        u32 method_id) {
+    auto *ipc = CHI_IPC;
+    auto *alloc = ipc->gpu_alloc_table_[ipc->GetGpuThreadId()];
+
+    // Set allocator on container for cross-library calls
+    container->gpu_alloc_ = alloc;
+
+    // Reconstruct FullPtr from absolute UVA pointer stored in client_task_vaddr_
+    hipc::FullPtr<Task> task_ptr;
+    task_ptr.ptr_ = reinterpret_cast<Task *>(fshm->client_task_vaddr_);
+    task_ptr.shm_.off_ = fshm->client_task_vaddr_;
+    task_ptr.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
+
+    // Execute the task — results are written into task_ptr in-place
+    container->Run(method_id, task_ptr, rctx_);
+
+    // System-scope OR: fence + atomicOr_system ensures all results written
+    // above are globally visible to CPU before FUTURE_COMPLETE is observed.
+    fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+
+    // Reset the orchestrator's arena. For the forward (in-place) path, the
+    // task lives in the client's memory (task_ptr is a UVA pointer, not in
+    // this arena), so there is no arena-allocated task to worry about.
+    // NOTE: safe only when one task is processed per thread at a time.
+    alloc->Reset();
   }
 
   /**
@@ -196,20 +234,24 @@ class Worker {
     in_ctx.shm_info_ = &fshm->input_;
 
     auto *ipc = CHI_IPC;
-    auto *alloc = ipc->gpu_alloc_table_[ipc->GetGpuThreadId()];
+    int thread_id = ipc->GetGpuThreadId();
+    auto *alloc = ipc->gpu_alloc_table_[thread_id];
 
     // Set allocator on container for cross-library calls
     container->gpu_alloc_ = alloc;
 
-    LocalLoadTaskArchive load_ar(alloc);
+    LocalLoadTaskArchive load_ar(CHI_GPU_HEAP);
     hshm::lbm::ShmTransport::Recv(load_ar, in_ctx);
     load_ar.SetMsgType(LocalMsgType::kSerializeIn);
 
     // Step 2: Allocate and load the task via container
     hipc::FullPtr<Task> task_ptr =
         container->LocalAllocLoadTask(method_id, load_ar);
+
     if (task_ptr.IsNull()) {
-      fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+      fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+      // Reset arena: no task was allocated, safe to reclaim all scratch memory.
+      alloc->Reset();
       return;
     }
 
@@ -221,16 +263,24 @@ class Worker {
     out_ctx.copy_space = fshm->copy_space;
     out_ctx.shm_info_ = &fshm->output_;
 
-    hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> buf(alloc);
-    LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeOut, buf, alloc);
+    auto *heap = CHI_GPU_HEAP;
+    hshm::priv::vector<char, CHI_GPU_HEAP_T> buf(heap);
+    LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeOut, buf, heap);
     container->LocalSaveTask(method_id, save_ar, task_ptr);
     hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
 
-    // Step 5: System-scope memory fence + mark complete
-    hipc::threadfence_system();
-    fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+    // Step 5: task_ptr destructor (output already written to fshm->copy_space).
+    task_ptr.ptr_->~Task();
 
-    // Step 6: Reset this thread's allocator (bulk free scratch)
+    // Step 6: System-scope OR: fence + atomicOr_system ensures output bytes
+    // written to copy_space are globally visible before FUTURE_COMPLETE.
+    fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+
+    // Step 7: Reset the orchestrator's arena allocator.
+    // ArenaAllocator is a bump-pointer allocator with no individual-free support.
+    // All task scratch (deserialized task, buf vector) is dead after FUTURE_COMPLETE.
+    // This reclaims the arena so subsequent tasks don't exhaust memory.
+    // NOTE: safe only when one task is processed per thread at a time.
     alloc->Reset();
   }
 };

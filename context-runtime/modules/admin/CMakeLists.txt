@@ -8,13 +8,10 @@ add_chimod_client(
 )
 
 # Create runtime library
-# Note: src/admin_runtime_gpu.cc is automatically detected by add_chimod_runtime
-# and compiled as a GPU companion library when CUDA/ROCm is enabled
 add_chimod_runtime(
   SOURCES
     src/admin_runtime.cc
     src/autogen/admin_lib_exec.cc
-    src/admin_runtime_gpu.cc
 )
 
 # Add unit tests subdirectory
