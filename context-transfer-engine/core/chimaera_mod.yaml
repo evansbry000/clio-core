@@ -38,6 +38,27 @@ kGetTargetInfo: 32     # Get target information (score, capacity, perf metrics)
 kFlushMetadata: 33     # Periodic task to flush tag/blob metadata to durable storage
 kFlushData: 34         # Periodic task to flush data from volatile to non-volatile targets
 
-# GPU support (no GPU methods yet; all are no-ops on GPU)
+# GPU support — all custom methods dispatched on GPU (empty stubs for now)
 has_gpu: true
-gpu_methods: []
+gpu_methods:
+  - kRegisterTarget
+  - kUnregisterTarget
+  - kListTargets
+  - kStatTargets
+  - kGetOrCreateTag
+  - kGetTagSize
+  - kDelTag
+  - kGetContainedBlobs
+  - kPutBlob
+  - kGetBlob
+  - kReorganizeBlob
+  - kDelBlob
+  - kGetBlobScore
+  - kGetBlobSize
+  - kGetBlobInfo
+  - kPollTelemetryLog
+  - kTagQuery
+  - kBlobQuery
+  - kGetTargetInfo
+  - kFlushMetadata
+  - kFlushData
