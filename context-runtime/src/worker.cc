@@ -59,6 +59,7 @@
 #include "chimaera/singletons.h"
 #include "chimaera/task.h"
 #include "chimaera/task_archives.h"
+#include "chimaera/local_task_archives.h"
 #include "chimaera/work_orchestrator.h"
 
 namespace chi {
@@ -301,13 +302,26 @@ hipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
     ctx.copy_space = future_shm->copy_space;
     ctx.shm_info_ = &future_shm->input_;
 
-    // Receive via SHM transport (blocking - spins until client sends)
-    LoadTaskArchive archive;
-    auto info = shm_recv_transport_->Recv(archive, ctx);
-    (void)info;
+    // Detect GPU→CPU tasks: SendGpu sets client_task_vaddr_=0 and uses
+    // LocalSaveTaskArchive (LocalSerialize format). SendShm (CPU→CPU) sets
+    // client_task_vaddr_ to the task pointer and uses SaveTaskArchive (cereal).
+    bool is_gpu_task = (future_shm->client_task_vaddr_ == 0);
 
-    // Allocate and deserialize task
-    task_full_ptr = container->AllocLoadTask(method_id, archive);
+    if (is_gpu_task) {
+      // GPU→CPU path: task was serialized with LocalSaveTaskArchive.
+      // Use LocalLoadTaskArchive (LocalDeserialize) to match the wire format.
+      LocalLoadTaskArchive local_archive;
+      auto info = shm_recv_transport_->Recv(local_archive, ctx);
+      (void)info;
+      task_full_ptr = container->LocalAllocLoadTask(method_id, local_archive);
+    } else {
+      // CPU→CPU SHM path: task was serialized with SaveTaskArchive (cereal).
+      // Use LoadTaskArchive (cereal BinaryInputArchive) to match.
+      LoadTaskArchive archive;
+      auto info = shm_recv_transport_->Recv(archive, ctx);
+      (void)info;
+      task_full_ptr = container->AllocLoadTask(method_id, archive);
+    }
 
     // Update the Future's task pointer
     future.GetTaskPtr() = task_full_ptr;
@@ -345,6 +359,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   if (!lane->Pop(future)) {
     return false;
   }
+
 
   SetCurrentRunContext(nullptr);
 
@@ -827,10 +842,6 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Copy parent task pointer before transfer begins (may be modified during
   // transfer)
   RunContext *parent_task = run_ctx->future_.GetParentTask();
-
-  HLOG(kInfo, "EndTask: pool_id={} method={} was_copied={} parent_task={} event_queue={}",
-       task_ptr->pool_id_, task_ptr->method_, was_copied,
-       (void*)parent_task, parent_task ? (void*)parent_task->event_queue_ : nullptr);
 
   // Handle client transfer based on origin transport mode
   if (was_copied) {

@@ -40,6 +40,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <pthread.h>
 
 #include "chimaera/container.h"
 #include "chimaera/pool_manager.h"
@@ -177,26 +178,53 @@ void WorkOrchestrator::StopWorkers() {
     }
   }
 
-  // Wait for worker threads to finish using HSHM thread model with timeout
-  auto thread_model = HSHM_THREAD_MODEL;
-  auto start_time = std::chrono::steady_clock::now();
-  const auto timeout_duration = std::chrono::seconds(5); // 5 second timeout
+  // Wait for worker threads with a hard 5-second deadline.
+  // We use pthread_timedjoin_np instead of a plain Join() so the timeout
+  // check can actually fire — Join() blocks indefinitely and the elapsed
+  // check at the top of the loop would never be reached.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
   size_t joined_count = 0;
   for (auto &thread : worker_threads_) {
-    auto elapsed = std::chrono::steady_clock::now() - start_time;
-    if (elapsed > timeout_duration) {
-      HLOG(kError, "Warning: Worker thread join timeout reached. Some threads "
-                    "may not have stopped gracefully.");
-      break;
+    if (!thread.std_thread_.joinable()) {
+      ++joined_count;
+      continue;
     }
 
-    thread_model->Join(thread);
-    joined_count++;
+    // Compute absolute deadline for this join attempt.
+    auto remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0) {
+      HLOG(kError, "StopWorkers: deadline exceeded, detaching remaining "
+                   "worker threads");
+      thread.std_thread_.detach();
+      continue;
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += remaining / 1000000000LL;
+    ts.tv_nsec += remaining % 1000000000LL;
+    if (ts.tv_nsec >= 1000000000LL) {
+      ts.tv_sec++;
+      ts.tv_nsec -= 1000000000LL;
+    }
+
+    int r = pthread_timedjoin_np(thread.std_thread_.native_handle(),
+                                  nullptr, &ts);
+    if (r == 0) {
+      ++joined_count;
+    } else {
+      // ETIMEDOUT or other error — detach so the destructor doesn't block.
+      HLOG(kError, "StopWorkers: thread join timed out (err={}), detaching",
+           r);
+      thread.std_thread_.detach();
+    }
   }
 
   HLOG(kDebug, "Joined {} of {} worker threads", joined_count,
-        worker_threads_.size());
+       worker_threads_.size());
   workers_running_ = false;
 }
 

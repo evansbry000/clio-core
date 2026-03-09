@@ -653,10 +653,18 @@ class IpcManager {
     ctx.copy_space = fshm->copy_space;
     ctx.shm_info_ = &fshm->input_;
 
-    // Enqueue BEFORE sending so worker can start deserializing concurrently
+    // Enqueue BEFORE sending so worker can start deserializing concurrently.
+    // GPU→CPU path: use PushSystem so device-scope writes (tail, SetReady)
+    // are visible to the CPU worker via system-scope atomics. Without this,
+    // the CPU's load_system() on tail/entry flags would see stale values on
+    // platforms where cudaDevAttrHostNativeAtomicSupported == 0 (PCIe GPUs).
     auto &lane = queue->GetLane(0, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
-    lane.Push(task_future);
+    if (to_cpu) {
+      lane.PushSystem(task_future);  // GPU→CPU: system-scope for CPU visibility
+    } else {
+      lane.Push(task_future);  // GPU→GPU: device-scope is sufficient
+    }
 
     // Serialize task input into the ring buffer using the heap BuddyAllocator
     // so the scratch buffer is individually freed when buf goes out of scope.
@@ -949,6 +957,7 @@ class IpcManager {
     future_shm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
     future_shm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(task_ptr.ptr_);
     future_shm->input_.copy_space_size_ = copy_space_size;
+    future_shm->output_.copy_space_size_ = copy_space_size;
     future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
     // Create Future
@@ -2635,8 +2644,14 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec) {
       }
     } else {
       // CLIENT PATH
+      // Detect GPU-style futures: FUTURE_COPY_FROM_CLIENT set AND
+      // client_task_vaddr_==0 (SendGpu/SendToGpu set it to 0; SendShm sets it
+      // to the task pointer which is always non-zero).
+      // SHM client futures (SendShm) also set FUTURE_COPY_FROM_CLIENT but use
+      // cereal serialization — they must go through CHI_IPC->Recv() instead.
       bool is_gpu_future =
-          future_full->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT);
+          future_full->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) &&
+          (future_full->client_task_vaddr_ == 0);
       if (is_gpu_future) {
         // GPU FUTURE IN CLIENT MODE: poll FUTURE_COMPLETE (set by GPU with
         // system-scope atomics after writing output), then deserialize.

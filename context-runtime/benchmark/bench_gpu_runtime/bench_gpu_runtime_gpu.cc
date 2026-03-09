@@ -223,7 +223,15 @@ extern "C" int run_gpu_bench_latency(
                           .count();
   *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
 
-  // Pause orchestrator before cleanup
+  // Synchronize client kernel stream before pausing the orchestrator.
+  // Block 0 signals d_done=1 but blocks 1-(client_blocks-1) may still be
+  // processing their last GPU task.  The orchestrator must remain active so
+  // it can deliver those final responses.  Without this synchronize those
+  // blocks spin forever in future.Wait() and CUDA context cleanup at process
+  // exit hangs waiting for the GPU kernel to terminate.
+  hshm::GpuApi::Synchronize(stream);
+
+  // All client blocks have now finished — safe to stop the orchestrator.
   CHI_IPC->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
