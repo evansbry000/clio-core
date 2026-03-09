@@ -250,6 +250,10 @@ set_tests_properties(cae_error_handling PROPERTIES LABELS "core;validation;msan_
 # - Runtime paths: empty tag, binary success/roundtrip, binary bad path,
 #   HDF5 success (if enabled) or HDF5-not-compiled, HDF5 bad path
 # - Autogen core_lib_exec.cc kExportData cases exercised via AsyncExportData
+#
+# NOTE: All ExportData tests are consolidated into two CTest targets (task and
+# runtime) to avoid starting the Chimaera runtime multiple times on the same
+# port (which causes TIME_WAIT failures for subsequent processes).
 #------------------------------------------------------------------------------
 add_executable(test_export_data
   ${CMAKE_CURRENT_SOURCE_DIR}/test_export_data.cc
@@ -265,9 +269,8 @@ target_link_libraries(test_export_data
   PRIVATE
     wrp_cae_core_client
     wrp_cte_core_client
-    chimaera::admin_runtime
-    chimaera::bdev_runtime
-    hshm::cxx
+    chimaera::cxx
+    hshm::configure
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
@@ -279,41 +282,19 @@ endif()
 
 install(TARGETS test_export_data DESTINATION bin)
 
-# Register individual test cases with CTest
-add_test(NAME CAE_ExportData_TaskDefaultCtor
+# Register as two CTest targets: task struct tests and runtime integration tests.
+# Each target runs all its test cases in a single process (one runtime startup),
+# avoiding port 9413 TIME_WAIT conflicts that arise from repeated restarts.
+add_test(NAME CAE_ExportData_Task
   COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_TaskEmplaceCtor
-  COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_TaskCopy
-  COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_TaskAggregate
-  COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_TaskSerializeIn
-  COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_TaskSerializeOut
-  COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_EmptyTag
+add_test(NAME CAE_ExportData_Runtime
   COMMAND test_export_data "[cae][export][runtime]")
-add_test(NAME CAE_ExportData_BinaryRoundtrip
-  COMMAND test_export_data "[cae][export][runtime][binary]")
-add_test(NAME CAE_ExportData_BinaryBadPath
-  COMMAND test_export_data "[cae][export][runtime][binary]")
-add_test(NAME CAE_ExportData_HDF5Path
-  COMMAND test_export_data "[cae][export][runtime][hdf5]")
 
 set_tests_properties(
-  CAE_ExportData_TaskDefaultCtor
-  CAE_ExportData_TaskEmplaceCtor
-  CAE_ExportData_TaskCopy
-  CAE_ExportData_TaskAggregate
-  CAE_ExportData_TaskSerializeIn
-  CAE_ExportData_TaskSerializeOut
-  CAE_ExportData_EmptyTag
-  CAE_ExportData_BinaryRoundtrip
-  CAE_ExportData_BinaryBadPath
-  CAE_ExportData_HDF5Path
+  CAE_ExportData_Task
+  CAE_ExportData_Runtime
   PROPERTIES
-    TIMEOUT 120
+    TIMEOUT 300
     LABELS "coverage;export;msan_skip"
     ENVIRONMENT "CHI_WITH_RUNTIME=1;CHI_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/wrp_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
