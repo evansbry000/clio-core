@@ -63,6 +63,42 @@ using GpuAllocT = hshm::ipc::BuddyAllocator;
 using GpuMeta = LbmMeta<GpuAllocT>;
 
 /**
+ * Diagnostic struct to capture ContainsPtr results from GPU
+ */
+struct ContainsPtrDiag {
+  size_t data_capacity;        // Value of backend_.data_capacity_ as seen on GPU
+  size_t test_offset;          // The offset we tested
+  bool contains_result;        // Result of alloc->ContainsPtr(OffsetPtr)
+  bool fullptr_offset_null;    // True if FullPtr(alloc, OffsetPtr<T>(off)) is null
+  bool fullptr_size_null;      // True if FullPtr(alloc, size_t) is null
+};
+
+/**
+ * Diagnostic kernel: isolate exactly which ContainsPtr code path fails on GPU.
+ * This does NOT go through FinalizeAllocation or AllocateSmall.
+ */
+__global__ void DiagnoseContainsPtrKernel(GpuAllocT *alloc, size_t test_offset,
+                                           ContainsPtrDiag *diag) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    // Read data_capacity_ via the public accessor
+    diag->data_capacity = alloc->GetBackendDataCapacity();
+    diag->test_offset   = test_offset;
+
+    // Test 1: ContainsPtr(OffsetPtrBase) directly
+    hipc::OffsetPtr<void> ptr(test_offset);
+    diag->contains_result = alloc->ContainsPtr(ptr);
+
+    // Test 2: FullPtr via OffsetPtr overload (the original broken path)
+    hipc::FullPtr<void> fp_offset(alloc, hipc::OffsetPtr<void>(test_offset));
+    diag->fullptr_offset_null = fp_offset.IsNull();
+
+    // Test 3: FullPtr via size_t overload (the fixed path)
+    hipc::FullPtr<void> fp_size(alloc, test_offset);
+    diag->fullptr_size_null = fp_size.IsNull();
+  }
+}
+
+/**
  * GPU kernel to fill a buffer with a pattern
  */
 __global__ void FillBufferKernel(char *buffer, size_t size, char pattern) {
@@ -707,4 +743,65 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
     cudaFreeHost(data_buf);
     cudaFreeHost(output_buf);
   }
+}
+
+/**
+ * Diagnostic test: why did ContainsPtr fail on GPU?
+ *
+ * This test isolates ContainsPtr behavior by calling it directly from a kernel,
+ * NOT through FinalizeAllocation or any allocator path.  It compares:
+ *   1. data_capacity_ as read on GPU
+ *   2. ContainsPtr(OffsetPtr<void>) result
+ *   3. FullPtr via OffsetPtr overload (original broken path)
+ *   4. FullPtr via size_t overload (fixed path)
+ *
+ * Expected: all four should be correct.  If ContainsPtr is broken, test 2
+ * fails; if the FullPtr-OffsetPtr path is broken, test 3 fails.
+ */
+TEST_CASE("ContainsPtr GPU Diagnostic", "[gpu][contains_ptr]") {
+  constexpr size_t kBackendSize = 16 * 1024 * 1024;
+  constexpr int kGpuId = 0;
+
+  GpuShmMmap backend;
+  MemoryBackendId backend_id(9, 9);
+  REQUIRE(backend.shm_init(backend_id, kBackendSize, "/diag_contains_ptr", kGpuId));
+
+  GpuAllocT *alloc_ptr = backend.MakeAlloc<GpuAllocT>();
+  REQUIRE(alloc_ptr != nullptr);
+
+  // Allocate the diag struct from managed memory so GPU can write to it
+  ContainsPtrDiag *diag = nullptr;
+  REQUIRE(cudaMallocManaged(&diag, sizeof(ContainsPtrDiag)) == cudaSuccess);
+  memset(diag, 0, sizeof(ContainsPtrDiag));
+
+  // Use a known-valid offset: sizeof(_BuddyAllocator) is the first allocation
+  // offset (allocator object itself starts at 0, data starts after it).
+  // Allocate something so we have a known valid offset to test with.
+  auto dummy_ptr = alloc_ptr->AllocateObjs<char>(64);
+  REQUIRE(dummy_ptr.ptr_ != nullptr);
+  size_t valid_offset = dummy_ptr.shm_.off_.load();
+  INFO("valid_offset from CPU allocation = " << valid_offset);
+  INFO("data_capacity from CPU = " << alloc_ptr->GetBackendDataCapacity());
+
+  DiagnoseContainsPtrKernel<<<1, 1>>>(alloc_ptr, valid_offset, diag);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  INFO("GPU data_capacity = " << diag->data_capacity);
+  INFO("GPU test_offset   = " << diag->test_offset);
+  INFO("GPU contains_result       = " << diag->contains_result);
+  INFO("GPU fullptr_offset_null   = " << diag->fullptr_offset_null);
+  INFO("GPU fullptr_size_null     = " << diag->fullptr_size_null);
+
+  // data_capacity_ must be readable and non-zero from GPU
+  REQUIRE(diag->data_capacity > 0);
+  REQUIRE(diag->data_capacity == alloc_ptr->GetBackendDataCapacity());
+
+  // ContainsPtr should return true for a valid offset
+  REQUIRE(diag->contains_result == true);
+
+  // Both FullPtr overloads should produce non-null results
+  REQUIRE(diag->fullptr_offset_null == false);
+  REQUIRE(diag->fullptr_size_null   == false);
+
+  cudaFree(diag);
 }

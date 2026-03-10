@@ -488,10 +488,6 @@ class _BuddyAllocator : public Allocator {
     // Step 3: Try allocating from small_arena_
     size_t total_size = size + sizeof(BuddyPage);
     size_t arena_offset = small_arena_.Allocate(total_size);
-#if HSHM_IS_GPU
-    printf("GPU[AS]: step3 arena_off=%lu total=%lu\n",
-           (unsigned long)arena_offset, (unsigned long)total_size);
-#endif
     if (arena_offset != 0) {
       return FinalizeAllocation(arena_offset, size);
     }
