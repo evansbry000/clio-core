@@ -369,8 +369,8 @@ __global__ void test_gpu_serialize_deserialize_kernel(
     }
 
     // Serialize task using LocalSaveTaskArchive with priv::vector
-    auto *alloc = CHI_IPC->gpu_alloc_table_[CHI_IPC->GetGpuThreadId()];
-    hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> buf(alloc);
+    auto *alloc = CHI_IPC->GetGpuHeap();
+    hshm::priv::vector<char, CHI_GPU_HEAP_T> buf(alloc);
     chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buf, alloc);
     original_task->SerializeIn(save_ar);
     size_t serialized_size = save_ar.GetSize();
@@ -431,8 +431,8 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
     }
 
     // Serialize task using LocalSaveTaskArchive with priv::vector
-    auto *alloc = CHI_IPC->gpu_alloc_table_[CHI_IPC->GetGpuThreadId()];
-    hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> buf(alloc);
+    auto *alloc = CHI_IPC->GetGpuHeap();
+    hshm::priv::vector<char, CHI_GPU_HEAP_T> buf(alloc);
     chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buf, alloc);
     task->SerializeIn(save_ar);
 
@@ -766,7 +766,29 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
 
   SECTION("GPU kernel serialize/deserialize") {
     INFO("Testing GPU task serialization and deserialization");
-    REQUIRE(run_gpu_kernel_test("serialize_deserialize", gpu_backend, 1));
+    // This kernel uses LocalSaveTaskArchive which requires GetGpuHeap().
+    // run_gpu_kernel_test creates IpcManagerGpu without a heap backend, so
+    // we must set up a GpuMalloc heap backend and call the kernel directly.
+    hipc::MemoryBackendId heap_backend_id(23, 0);
+    hipc::GpuMalloc gpu_heap_backend;
+    REQUIRE(gpu_heap_backend.shm_init(heap_backend_id, 4 * 1024 * 1024,
+                                      "/gpu_test_heap_sd", 0));
+    chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
+    gpu_info.gpu_heap_backend =
+        static_cast<hipc::MemoryBackend &>(gpu_heap_backend);
+
+    int *d_results = hshm::GpuApi::Malloc<int>(sizeof(int));
+    int h_init = -1;
+    hshm::GpuApi::Memcpy(d_results, &h_init, sizeof(int));
+
+    test_gpu_serialize_deserialize_kernel<<<1, 1>>>(gpu_info, d_results);
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    REQUIRE(sync_err == cudaSuccess);
+
+    int h_result = -1;
+    hshm::GpuApi::Memcpy(&h_result, d_results, sizeof(int));
+    hshm::GpuApi::Free(d_results);
+    REQUIRE(h_result == 0);
   }
 
   SECTION("GPU serialize -> CPU deserialize") {
@@ -774,7 +796,13 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
         "Testing GPU task serialization -> ShmTransport -> CPU "
         "deserialization");
 
+    hipc::MemoryBackendId heap_backend_id2(24, 0);
+    hipc::GpuMalloc gpu_heap_backend2;
+    REQUIRE(gpu_heap_backend2.shm_init(heap_backend_id2, 4 * 1024 * 1024,
+                                       "/gpu_test_heap_sc", 0));
     chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
+    gpu_info.gpu_heap_backend =
+        static_cast<hipc::MemoryBackend &>(gpu_heap_backend2);
 
     // Allocate pinned host buffer for transfer
     size_t buffer_size = 1024;
@@ -882,7 +910,15 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
         queue_allocator, 1, 1, 256);
     REQUIRE(!gpu_queue.IsNull());
 
+    // SendGpu uses GetGpuHeap() for LocalSaveTaskArchive — needs a heap backend
+    hipc::MemoryBackendId heap_id2(30, 0);
+    hipc::GpuMalloc heap_backend2;
+    REQUIRE(heap_backend2.shm_init(heap_id2, 4 * 1024 * 1024,
+                                   "/gpu_heap_test2", 0));
+
     chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue.ptr_);
+    gpu_info.gpu_heap_backend =
+        static_cast<hipc::MemoryBackend &>(heap_backend2);
 
     int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
     int h_result_init = -999;
@@ -901,13 +937,13 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     }
     INFO("Popped future from queue");
 
-    // Resolve FutureShm pointer using data backend base address
+    // Resolve FutureShm: SendGpu stores an absolute UVA pointer in off_.
+    // (See ipc_manager.h SendGpu: fshmptr.off_ = reinterpret_cast<size_t>(buffer.ptr_))
     hipc::ShmPtr<chi::FutureShm> future_shm_ptr =
         popped_future.GetFutureShmPtr();
     REQUIRE(!future_shm_ptr.IsNull());
-    chi::FutureShm *future_shm = reinterpret_cast<chi::FutureShm *>(
-        reinterpret_cast<char *>(gpu_backend.data_) +
-        future_shm_ptr.off_.load());
+    chi::FutureShm *future_shm =
+        reinterpret_cast<chi::FutureShm *>(future_shm_ptr.off_.load());
 
     // Verify FUTURE_COPY_FROM_CLIENT flag
     REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
@@ -961,7 +997,15 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
         queue_allocator, 1, 1, 256);
     REQUIRE(!gpu_queue.IsNull());
 
+    // SendGpu uses GetGpuHeap() for LocalSaveTaskArchive — needs a heap backend
+    hipc::MemoryBackendId heap_id3(31, 0);
+    hipc::GpuMalloc heap_backend3;
+    REQUIRE(heap_backend3.shm_init(heap_id3, 4 * 1024 * 1024,
+                                   "/gpu_heap_test3", 0));
+
     chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue.ptr_);
+    gpu_info.gpu_heap_backend =
+        static_cast<hipc::MemoryBackend &>(heap_backend3);
 
     int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
     int h_result_init = -999;
@@ -980,9 +1024,9 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
     hipc::ShmPtr<chi::FutureShm> future_shm_ptr =
         popped_future.GetFutureShmPtr();
     REQUIRE(!future_shm_ptr.IsNull());
-    chi::FutureShm *future_shm = reinterpret_cast<chi::FutureShm *>(
-        reinterpret_cast<char *>(gpu_backend.data_) +
-        future_shm_ptr.off_.load());
+    // SendGpu stores absolute UVA pointer in off_ — cast directly
+    chi::FutureShm *future_shm =
+        reinterpret_cast<chi::FutureShm *>(future_shm_ptr.off_.load());
 
     // CPU reads input from ring buffer
     hshm::lbm::LbmContext recv_ctx;

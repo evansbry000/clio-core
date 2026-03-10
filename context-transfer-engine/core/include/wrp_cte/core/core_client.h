@@ -75,6 +75,28 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * GPU-callable AsyncCreate: takes const char* names for GPU kernel use.
+   * Routes to CPU admin worker via PoolQuery::ToLocalCpu().
+   * @param pool_query Pool query for task routing
+   * @param pool_name Name of the pool (const char*, GPU-safe)
+   * @param custom_pool_id Explicit pool ID
+   */
+  HSHM_CROSS_FUN chi::Future<CreateTask> AsyncCreate(
+      const chi::PoolQuery &pool_query, const char *pool_name,
+      const chi::PoolId &custom_pool_id) {
+    auto *ipc_manager = CHI_IPC;
+    auto task = ipc_manager->NewTask<CreateTask>(
+        chi::CreateTaskId(),
+        chi::kAdminPoolId,
+        pool_query,
+        CreateParams::chimod_lib_name,
+        pool_name,
+        custom_pool_id,
+        static_cast<chi::ContainerClient *>(nullptr));
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Monitor container state - asynchronous
    */
   chi::Future<MonitorTask> AsyncMonitor(const chi::PoolQuery &pool_query,

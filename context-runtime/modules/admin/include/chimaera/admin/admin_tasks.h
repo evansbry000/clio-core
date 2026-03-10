@@ -37,12 +37,13 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/config_manager.h>
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
+#if HSHM_IS_HOST
 #include <yaml-cpp/yaml.h>
-
 #include <cereal/types/string.hpp>
 #include <cereal/types/unordered_map.hpp>
-#include <cstring>
 #include <unordered_map>
+#endif
+#include <cstring>
 
 #include "autogen/admin_methods.h"
 
@@ -126,13 +127,15 @@ struct BaseCreateTask : public chi::Task {
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
         client_(nullptr) {
+#if HSHM_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask default constructor: IS_ADMIN={}, DO_COMPOSE={}, "
          "do_compose_={}",
          IS_ADMIN, DO_COMPOSE, do_compose_);
+#endif
   }
 
-  /** Emplace constructor with CreateParams arguments */
+  /** Emplace constructor with CreateParams arguments (HOST only) */
   template <typename... CreateParamsArgs>
   explicit BaseCreateTask(
       const chi::TaskId &task_node, const chi::PoolId &task_pool_id,
@@ -154,6 +157,12 @@ struct BaseCreateTask : public chi::Task {
     task_flags_.Clear();
     pool_query_ = pool_query;
 
+#if HSHM_IS_HOST
+    HLOG(kDebug,
+         "BaseCreateTask emplace constructor: chimod_name={}, pool_name={}",
+         chimod_name, pool_name);
+#endif
+
     // In compose mode, skip CreateParams construction - PoolConfig will be set
     // via SetParams
     if (!do_compose_) {
@@ -162,6 +171,65 @@ struct BaseCreateTask : public chi::Task {
           std::forward<CreateParamsArgs>(create_params_args)...);
       chi::Task::Serialize(CHI_PRIV_ALLOC, chimod_params_, params);
     }
+  }
+
+  /** Overload: const char* for chimod_name and std::string for pool_name */
+  explicit BaseCreateTask(
+      const chi::TaskId &task_node, const chi::PoolId &task_pool_id,
+      const chi::PoolQuery &pool_query, const char *chimod_name,
+      const std::string &pool_name, const chi::PoolId &target_pool_id,
+      chi::ContainerClient *client)
+      : chi::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CHI_PRIV_ALLOC, chimod_name),
+        pool_name_(CHI_PRIV_ALLOC, pool_name),
+        chimod_params_(CHI_PRIV_ALLOC),
+        new_pool_id_(target_pool_id),
+        error_message_(CHI_PRIV_ALLOC),
+        is_admin_(IS_ADMIN),
+        do_compose_(DO_COMPOSE),
+        client_(client) {
+    // Initialize base task
+    task_id_ = task_node;
+    method_ = MethodId;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+
+#if HSHM_IS_HOST
+    HLOG(kDebug,
+         "BaseCreateTask emplace constructor (const char* chimod): chimod_name={}, pool_name={}",
+         chimod_name, pool_name);
+#endif
+
+    // In compose mode, skip CreateParams construction - PoolConfig will be set
+    // via SetParams
+    if (!do_compose_) {
+      // Create and serialize the CreateParams with provided arguments
+      // Note: No variadic args here - for zero-arg CreateParams
+      CreateParamsT params;
+      chi::Task::Serialize(CHI_PRIV_ALLOC, chimod_params_, params);
+    }
+  }
+
+  /** Emplace constructor for GPU: takes const char* names, leaves chimod_params_ empty */
+  HSHM_CROSS_FUN explicit BaseCreateTask(
+      const chi::TaskId &task_node, const chi::PoolId &task_pool_id,
+      const chi::PoolQuery &pool_query, const char *chimod_name,
+      const char *pool_name, const chi::PoolId &target_pool_id,
+      chi::ContainerClient *client)
+      : chi::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CHI_PRIV_ALLOC, chimod_name),
+        pool_name_(CHI_PRIV_ALLOC, pool_name),
+        chimod_params_(CHI_PRIV_ALLOC),
+        new_pool_id_(target_pool_id),
+        error_message_(CHI_PRIV_ALLOC),
+        is_admin_(IS_ADMIN),
+        do_compose_(false),
+        client_(client) {
+    task_id_ = task_node;
+    method_ = MethodId;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+    // chimod_params_ stays empty — CreateParams::serialize() serializes nothing
   }
 
   /** Compose constructor - takes PoolConfig directly */
@@ -178,10 +246,12 @@ struct BaseCreateTask : public chi::Task {
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
         client_(nullptr) {
+#if HSHM_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask COMPOSE constructor: IS_ADMIN={}, DO_COMPOSE={}, "
          "do_compose_={}, pool_name={}",
          IS_ADMIN, DO_COMPOSE, do_compose_, pool_config.pool_name_);
+#endif
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -192,6 +262,7 @@ struct BaseCreateTask : public chi::Task {
     chi::Task::Serialize(CHI_PRIV_ALLOC, chimod_params_, pool_config);
   }
 
+#if HSHM_IS_HOST
   /**
    * Set parameters by serializing them to chimod_params_
    * Does nothing if do_compose_ is true (compose mode)
@@ -223,6 +294,11 @@ struct BaseCreateTask : public chi::Task {
       return chi::Task::Deserialize<CreateParamsT>(chimod_params_);
     }
   }
+#else
+  HSHM_GPU_FUN CreateParamsT GetParams() const {
+    return CreateParamsT{};
+  }
+#endif
 
   /**
    * Serialize IN and INOUT parameters for network transfer
@@ -230,16 +306,20 @@ struct BaseCreateTask : public chi::Task {
    * is_admin_, do_compose_
    */
   template <typename Archive>
-  void SerializeIn(Archive &ar) {
+  HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
+#if HSHM_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask::SerializeIn BEFORE: do_compose_={}, is_admin_={}",
          do_compose_, is_admin_);
+#endif
     Task::SerializeIn(ar);
     ar(chimod_name_, pool_name_, chimod_params_, new_pool_id_, is_admin_,
        do_compose_);
+#if HSHM_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask::SerializeIn AFTER: do_compose_={}, is_admin_={}",
          do_compose_, is_admin_);
+#endif
   }
 
   /**
@@ -248,7 +328,7 @@ struct BaseCreateTask : public chi::Task {
    * is_admin_, do_compose_
    */
   template <typename Archive>
-  void SerializeOut(Archive &ar) {
+  HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(chimod_name_, chimod_params_, new_pool_id_, error_message_, is_admin_,
        do_compose_);
@@ -259,10 +339,12 @@ struct BaseCreateTask : public chi::Task {
    * @param other Pointer to the source task to copy from
    */
   void Copy(const hipc::FullPtr<BaseCreateTask> &other) {
+#if HSHM_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask::Copy() BEFORE: this->do_compose_={}, "
          "other->do_compose_={}",
          do_compose_, other->do_compose_);
+#endif
     // Copy base Task fields
     Task::Copy(other.template Cast<Task>());
     // Copy BaseCreateTask-specific fields
@@ -273,8 +355,10 @@ struct BaseCreateTask : public chi::Task {
     error_message_ = other->error_message_;
     is_admin_ = other->is_admin_;
     do_compose_ = other->do_compose_;
+#if HSHM_IS_HOST
     HLOG(kDebug, "BaseCreateTask::Copy() AFTER: this->do_compose_={}",
          do_compose_);
+#endif
   }
 
   /** Aggregate replica results into this task */
@@ -699,6 +783,7 @@ struct ClientConnectTask : public chi::Task {
   OUT int32_t response_;            ///< 0 = success, non-zero = error
   OUT chi::u64 server_generation_;  ///< Server's generation counter for restart
                                     ///< detection
+  OUT int32_t server_pid_;          ///< Server process PID (for AwakenWorker SIGUSR1)
 
   // Worker task queue SHM offset (for SHM-mode client attach)
   OUT chi::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within main allocator
@@ -718,6 +803,7 @@ struct ClientConnectTask : public chi::Task {
       : chi::Task(),
         response_(-1),
         server_generation_(0),
+        server_pid_(0),
         worker_queues_off_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
@@ -736,6 +822,7 @@ struct ClientConnectTask : public chi::Task {
       : chi::Task(task_node, pool_id, pool_query, Method::kClientConnect),
         response_(-1),
         server_generation_(0),
+        server_pid_(0),
         worker_queues_off_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
@@ -760,7 +847,7 @@ struct ClientConnectTask : public chi::Task {
   template <typename Archive>
   void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(response_, server_generation_, worker_queues_off_, num_gpus_, gpu_queue_depth_);
+    ar(response_, server_generation_, server_pid_, worker_queues_off_, num_gpus_, gpu_queue_depth_);
     for (chi::u32 i = 0; i < kMaxGpuDevices; ++i) {
       ar(cpu2gpu_queue_off_[i], gpu2cpu_queue_off_[i], gpu2gpu_queue_off_[i],
          cpu2gpu_backend_size_[i], gpu2cpu_backend_size_[i]);
@@ -778,6 +865,7 @@ struct ClientConnectTask : public chi::Task {
     Task::Copy(other.template Cast<Task>());
     response_ = other->response_;
     server_generation_ = other->server_generation_;
+    server_pid_ = other->server_pid_;
     worker_queues_off_ = other->worker_queues_off_;
     num_gpus_ = other->num_gpus_;
     gpu_queue_depth_ = other->gpu_queue_depth_;

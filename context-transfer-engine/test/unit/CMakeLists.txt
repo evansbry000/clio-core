@@ -63,6 +63,36 @@ add_executable(test_gpu_core
     test_gpu_core.cc
 )
 
+# Create test_gpu_create executable for GPU AsyncCreate tests
+# GPU kernel file compiled with HSHM_ENABLE_CUDA=1 so device APIs are available
+add_library(test_gpu_create_kernels OBJECT test_gpu_create_gpu.cu)
+target_include_directories(test_gpu_create_kernels PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+    ${CMAKE_SOURCE_DIR}/context-runtime/include
+    ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+    ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+    ${CMAKE_SOURCE_DIR}/build/context-transport-primitives/src/include
+)
+target_compile_definitions(test_gpu_create_kernels PRIVATE HSHM_ENABLE_CUDA=1)
+target_link_libraries(test_gpu_create_kernels PRIVATE hermes_shm_cuda)
+set_target_properties(test_gpu_create_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+)
+target_compile_options(test_gpu_create_kernels PUBLIC
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+
+add_executable(test_gpu_create
+    test_gpu_create_cpu.cc
+    $<TARGET_OBJECTS:test_gpu_create_kernels>
+)
+set_target_properties(test_gpu_create PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    LINKER_LANGUAGE CUDA
+    POSITION_INDEPENDENT_CODE ON
+)
+
 # Include directories for all tests - using unified simple_test.h framework
 target_include_directories(cte_core_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
@@ -101,6 +131,10 @@ target_include_directories(test_reorganize_blob PRIVATE
 )
 
 target_include_directories(test_gpu_core PRIVATE
+  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_gpu_create PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
 )
 
@@ -221,6 +255,19 @@ target_link_libraries(test_gpu_core
     chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
     chimaera::bdev_client        # Bdev client for BdevType enum
     hshm::cxx                    # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_gpu_create - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_gpu_create
+    wrp_cte_core_runtime         # CTE core runtime library
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    chimaera::bdev_client        # Bdev client for BdevType enum
+    hshm::cxx                    # HermesShm library (CPU)
+    hermes_shm_cuda              # HermesShm CUDA library (for GPU kernels)
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
 
@@ -669,6 +716,10 @@ add_test(NAME cte_reorganize_all
 add_test(NAME cte_gpu_core_all
     COMMAND test_gpu_core)
 
+# GPU create tests - AsyncCreate from GPU kernel
+add_test(NAME cte_gpu_create
+    COMMAND test_gpu_create)
+
 set_tests_properties(
     cte_reorganize_all
     PROPERTIES
@@ -682,6 +733,14 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 120
         LABELS "gpu;cte;core;msan_skip"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+)
+
+set_tests_properties(
+    cte_gpu_create
+    PROPERTIES
+        TIMEOUT 120
+        LABELS "gpu;cte;create;msan_skip"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
 
@@ -781,6 +840,7 @@ set_tests_properties(
     cte_tiered_storage_all
     cte_reorganize_all
     cte_gpu_core_all
+    cte_gpu_create
     PROPERTIES LABELS "msan_skip"
 )
 
@@ -806,7 +866,7 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob test_gpu_core
+install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob test_gpu_core test_gpu_create
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin

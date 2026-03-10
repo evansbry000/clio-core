@@ -138,9 +138,10 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   gpu::PoolManager host_pm;
   hshm::GpuApi::Memcpy(d_pm, &host_pm, sizeof(gpu::PoolManager));
 
-  // Increase GPU stack size for deep template call chains (128KB needed for
-  // complex template instantiations in GPU container dispatch)
-  cudaDeviceSetLimit(cudaLimitStackSize, 131072);
+  // Set GPU stack size. 8KB is sufficient for the orchestrator's polling loop
+  // and task dispatch. 128KB would exhaust VRAM (36SMs × 1536 threads × 128KB
+  // ≈ 6.75GB) and prevent concurrent kernel launches.
+  cudaDeviceSetLimit(cudaLimitStackSize, 8192);
 
   // Create dedicated stream
   stream_ = hshm::GpuApi::CreateStream();

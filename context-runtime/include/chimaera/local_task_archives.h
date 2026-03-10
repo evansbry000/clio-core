@@ -40,8 +40,8 @@
 #include <vector>
 
 // Include LocalSerialize for serialization
-#include <hermes_shm/data_structures/serialization/local_serialize.h>
 #include <hermes_shm/data_structures/priv/vector.h>
+#include <hermes_shm/data_structures/serialization/local_serialize.h>
 #include <hermes_shm/lightbeam/lightbeam.h>
 
 #include "chimaera/types.h"
@@ -56,8 +56,8 @@ class Task;
  * Defines the type of message being sent/received
  */
 enum class LocalMsgType : uint8_t {
-  kSerializeIn = 0,   /**< Serialize task inputs for execution */
-  kSerializeOut = 1,  /**< Serialize task outputs */
+  kSerializeIn = 0,  /**< Serialize task inputs for execution */
+  kSerializeOut = 1, /**< Serialize task outputs */
 };
 
 /**
@@ -76,9 +76,8 @@ struct LocalTaskInfo {
    */
   template <class Archive>
   HSHM_CROSS_FUN void serialize(Archive &ar) {
-    ar(task_id_.pid_, task_id_.tid_, task_id_.major_,
-       task_id_.replica_id_, task_id_.unique_, task_id_.node_id_,
-       task_id_.net_key_);
+    ar(task_id_.pid_, task_id_.tid_, task_id_.major_, task_id_.replica_id_,
+       task_id_.unique_, task_id_.node_id_, task_id_.net_key_);
     ar(pool_id_.major_, pool_id_.minor_);
     ar(method_id_);
   }
@@ -154,13 +153,14 @@ using LocalTaskInfoVec = hshm::priv::vector<LocalTaskInfo, CHI_GPU_HEAP_T>;
  */
 class LocalSaveTaskArchive : public LocalLbmBase {
   using Base = LocalLbmBase;
-public:
+
+ public:
   using is_saving = std::true_type;
   using is_loading = std::false_type;
   LocalTaskInfoVec task_infos_;
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
 
-private:
+ private:
 #if HSHM_IS_HOST
   std::vector<char> buffer_;
   hshm::ipc::LocalSerialize<std::vector<char>> serializer_;
@@ -170,10 +170,11 @@ private:
   hshm::ipc::LocalSerialize<GpuVec> serializer_;
 #endif
 
-public:
+ public:
   /**
    * Serialize for ShmTransport compatibility.
-   * Wire-compatible with SaveTaskArchive::serialize / LoadTaskArchive::serialize.
+   * Wire-compatible with SaveTaskArchive::serialize /
+   * LoadTaskArchive::serialize.
    */
   template <typename Ar>
   HSHM_CROSS_FUN void serialize(Ar &ar) {
@@ -191,7 +192,8 @@ public:
   explicit LocalSaveTaskArchive(LocalMsgType msg_type)
       : Base(), msg_type_(msg_type), serializer_(buffer_) {}
 #else
-  HSHM_GPU_FUN explicit LocalSaveTaskArchive(LocalMsgType msg_type);  // Not implemented for GPU
+  HSHM_GPU_FUN explicit LocalSaveTaskArchive(
+      LocalMsgType msg_type);  // Not implemented for GPU
 #endif
 
 #if HSHM_IS_GPU_COMPILER
@@ -203,34 +205,43 @@ public:
    * @param alloc Allocator for LbmMeta and task_infos_
    */
   HSHM_CROSS_FUN explicit LocalSaveTaskArchive(
-      LocalMsgType msg_type,
-      hshm::priv::vector<char, CHI_GPU_HEAP_T> &buffer,
+      LocalMsgType msg_type, hshm::priv::vector<char, CHI_GPU_HEAP_T> &buffer,
       CHI_GPU_HEAP_T *alloc)
       :
 #if HSHM_IS_GPU
-      Base(alloc), task_infos_(alloc),
+        Base(alloc),
+        task_infos_(alloc),
 #else
-      Base(),
+        Base(),
 #endif
-      msg_type_(msg_type)
+        msg_type_(msg_type)
 #if HSHM_IS_GPU
-      , buffer_(buffer), serializer_(buffer_)
+        ,
+        buffer_(buffer),
+        serializer_(buffer_)
 #else
-      , serializer_(buffer_)
+        ,
+        serializer_(buffer_)
 #endif
-  { (void)buffer; (void)alloc; }
+  {
+    (void)buffer;
+    (void)alloc;
+  }
 #endif
 
 #if HSHM_IS_HOST
   /** Move constructor (HOST only) */
   LocalSaveTaskArchive(LocalSaveTaskArchive &&other) noexcept
       : Base(std::move(other)),
-        task_infos_(std::move(other.task_infos_)), msg_type_(other.msg_type_),
+        task_infos_(std::move(other.task_infos_)),
+        msg_type_(other.msg_type_),
         buffer_(std::move(other.buffer_)),
-        serializer_(buffer_, true) {} // Use non-clearing constructor
+        serializer_(buffer_, true) {}  // Use non-clearing constructor
 
-  /** Move assignment operator - not supported due to reference member in serializer */
-  LocalSaveTaskArchive &operator=(LocalSaveTaskArchive &&other) noexcept = delete;
+  /** Move assignment operator - not supported due to reference member in
+   * serializer */
+  LocalSaveTaskArchive &operator=(LocalSaveTaskArchive &&other) noexcept =
+      delete;
 #else
   /** Move constructor disabled for GPU */
   LocalSaveTaskArchive(LocalSaveTaskArchive &&other) = delete;
@@ -293,7 +304,7 @@ public:
     (SerializeArg(args), ...);
   }
 
-private:
+ private:
   /** Helper to serialize individual arguments - handles Tasks specially */
   template <typename T>
   HSHM_CROSS_FUN void SerializeArg(T &arg) {
@@ -305,7 +316,7 @@ private:
     }
   }
 
-public:
+ public:
   /** Write raw binary data to the serializer */
   HSHM_CROSS_FUN void write_binary(const char *data, size_t size) {
     serializer_.write_binary(data, size);
@@ -346,12 +357,14 @@ public:
    * @param flags Transfer flags
    */
   template <typename T>
-  HSHM_CROSS_FUN void bulk(const hipc::FullPtr<T> &ptr, size_t size, uint32_t flags) {
+  HSHM_CROSS_FUN void bulk(const hipc::FullPtr<T> &ptr, size_t size,
+                           uint32_t flags) {
     if (!ptr.shm_.alloc_id_.IsNull()) {
       uint8_t mode = 0;
       serializer_ << mode;
       size_t off = ptr.shm_.off_.load();
-      serializer_ << off << ptr.shm_.alloc_id_.major_ << ptr.shm_.alloc_id_.minor_;
+      serializer_ << off << ptr.shm_.alloc_id_.major_
+                  << ptr.shm_.alloc_id_.minor_;
     } else if (flags & BULK_XFER) {
       uint8_t mode = 1;
       serializer_ << mode;
@@ -397,9 +410,7 @@ public:
    *
    * @return Size of serialized data
    */
-  HSHM_CROSS_FUN size_t GetSize() const {
-    return buffer_.size();
-  }
+  HSHM_CROSS_FUN size_t GetSize() const { return buffer_.size(); }
 
 #if HSHM_IS_HOST
   /**
@@ -433,13 +444,14 @@ public:
  */
 class LocalLoadTaskArchive : public LocalLbmBase {
   using Base = LocalLbmBase;
-public:
+
+ public:
   using is_saving = std::false_type;
   using is_loading = std::true_type;
   LocalTaskInfoVec task_infos_;
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
 
-private:
+ private:
 #if HSHM_IS_HOST
   std::vector<char> owned_data_;
   const std::vector<char> *data_;
@@ -451,11 +463,12 @@ private:
   hshm::ipc::LocalDeserialize<GpuVec> deserializer_;
 #endif
 
-public:
+ public:
   /**
    * Serialize for ShmTransport compatibility.
-   * Wire-compatible with SaveTaskArchive::serialize / LoadTaskArchive::serialize.
-   * Populates data_ from ring buffer metadata, then deserializer_ reads from it.
+   * Wire-compatible with SaveTaskArchive::serialize /
+   * LoadTaskArchive::serialize. Populates data_ from ring buffer metadata, then
+   * deserializer_ reads from it.
    */
   template <typename Ar>
   HSHM_CROSS_FUN void serialize(Ar &ar) {
@@ -464,7 +477,8 @@ public:
 #if HSHM_IS_HOST
     ar(owned_data_);
     data_ = &owned_data_;
-    new (&deserializer_) hshm::ipc::LocalDeserialize<std::vector<char>>(owned_data_);
+    new (&deserializer_)
+        hshm::ipc::LocalDeserialize<std::vector<char>>(owned_data_);
 #else
     ar(data_);
     new (&deserializer_) hshm::ipc::LocalDeserialize<GpuVec>(data_);
@@ -476,8 +490,11 @@ public:
    * Default constructor (HOST)
    */
   LocalLoadTaskArchive()
-      : Base(), msg_type_(LocalMsgType::kSerializeIn), data_(nullptr),
-        deserializer_(empty_buffer_), current_task_index_(0) {}
+      : Base(),
+        msg_type_(LocalMsgType::kSerializeIn),
+        data_(nullptr),
+        deserializer_(empty_buffer_),
+        current_task_index_(0) {}
 
   /**
    * Constructor from serialized data (HOST - uses std::vector)
@@ -485,11 +502,15 @@ public:
    * @param data Buffer containing serialized data
    */
   explicit LocalLoadTaskArchive(const std::vector<char> &data)
-      : Base(), msg_type_(LocalMsgType::kSerializeIn), data_(&data),
-        deserializer_(data), current_task_index_(0) {}
+      : Base(),
+        msg_type_(LocalMsgType::kSerializeIn),
+        data_(&data),
+        deserializer_(data),
+        current_task_index_(0) {}
 #else
   HSHM_GPU_FUN LocalLoadTaskArchive();  // Not implemented for GPU
-  HSHM_GPU_FUN explicit LocalLoadTaskArchive(const std::vector<char> &data);  // Not implemented for GPU
+  HSHM_GPU_FUN explicit LocalLoadTaskArchive(
+      const std::vector<char> &data);  // Not implemented for GPU
 #endif
 
 #if HSHM_IS_GPU_COMPILER
@@ -499,21 +520,28 @@ public:
    *
    * @param alloc Allocator for LbmMeta, task_infos_, and data_
    */
-  HSHM_CROSS_FUN explicit LocalLoadTaskArchive(
-      CHI_GPU_HEAP_T *alloc)
+  HSHM_CROSS_FUN explicit LocalLoadTaskArchive(CHI_GPU_HEAP_T *alloc)
       :
 #if HSHM_IS_GPU
-      Base(alloc), task_infos_(alloc),
+        Base(alloc),
+        task_infos_(alloc),
 #else
-      Base(),
+        Base(),
 #endif
-      msg_type_(LocalMsgType::kSerializeIn)
+        msg_type_(LocalMsgType::kSerializeIn)
 #if HSHM_IS_GPU
-      , data_(alloc), deserializer_(data_)
+        ,
+        data_(alloc),
+        deserializer_(data_)
 #else
-      , data_(nullptr), deserializer_(empty_buffer_), current_task_index_(0)
+        ,
+        data_(nullptr),
+        deserializer_(empty_buffer_),
+        current_task_index_(0)
 #endif
-  { (void)alloc; }
+  {
+    (void)alloc;
+  }
 
   /**
    * Constructor from pre-populated priv::vector (GPU)
@@ -527,15 +555,21 @@ public:
       CHI_GPU_HEAP_T *alloc)
       :
 #if HSHM_IS_GPU
-      Base(alloc), task_infos_(alloc),
+        Base(alloc),
+        task_infos_(alloc),
 #else
-      Base(),
+        Base(),
 #endif
-      msg_type_(LocalMsgType::kSerializeIn)
+        msg_type_(LocalMsgType::kSerializeIn)
 #if HSHM_IS_GPU
-      , data_(ext_data.size(), alloc), deserializer_(data_)
+        ,
+        data_(ext_data.size(), alloc),
+        deserializer_(data_)
 #else
-      , data_(nullptr), deserializer_(empty_buffer_), current_task_index_(0)
+        ,
+        data_(nullptr),
+        deserializer_(empty_buffer_),
+        current_task_index_(0)
 #endif
   {
 #if HSHM_IS_GPU
@@ -543,7 +577,8 @@ public:
       data_[i] = ext_data[i];
     }
 #endif
-    (void)ext_data; (void)alloc;
+    (void)ext_data;
+    (void)alloc;
   }
 #endif
 
@@ -551,14 +586,18 @@ public:
   /** Move constructor (HOST only) */
   LocalLoadTaskArchive(LocalLoadTaskArchive &&other) noexcept
       : Base(std::move(other)),
-        task_infos_(std::move(other.task_infos_)), msg_type_(other.msg_type_),
-        data_(other.data_), deserializer_(other.data_ ? *other.data_ : empty_buffer_),
+        task_infos_(std::move(other.task_infos_)),
+        msg_type_(other.msg_type_),
+        data_(other.data_),
+        deserializer_(other.data_ ? *other.data_ : empty_buffer_),
         current_task_index_(other.current_task_index_) {
     other.data_ = nullptr;
   }
 
-  /** Move assignment operator - not supported due to reference member in deserializer */
-  LocalLoadTaskArchive &operator=(LocalLoadTaskArchive &&other) noexcept = delete;
+  /** Move assignment operator - not supported due to reference member in
+   * deserializer */
+  LocalLoadTaskArchive &operator=(LocalLoadTaskArchive &&other) noexcept =
+      delete;
 #else
   /** Move constructor disabled for GPU */
   LocalLoadTaskArchive(LocalLoadTaskArchive &&other) = delete;
@@ -610,7 +649,8 @@ public:
    * @param value Pointer to deserialize into (must be pre-allocated)
    * @return Reference to this archive for chaining
    */
-  template <typename T> LocalLoadTaskArchive &operator>>(T *&value) {
+  template <typename T>
+  LocalLoadTaskArchive &operator>>(T *&value) {
     if constexpr (std::is_base_of_v<Task, T>) {
       if (msg_type_ == LocalMsgType::kSerializeIn) {
         value->SerializeIn(*this);
@@ -637,7 +677,7 @@ public:
     (DeserializeArg(args), ...);
   }
 
-private:
+ private:
   /** Helper to deserialize individual arguments - handles Tasks specially */
   template <typename T>
   HSHM_CROSS_FUN void DeserializeArg(T &arg) {
@@ -649,7 +689,7 @@ private:
     }
   }
 
-public:
+ public:
   /** Read raw binary data from the deserializer */
   HSHM_CROSS_FUN void read_binary(char *data, size_t size) {
     deserializer_.read_binary(data, size);
@@ -770,14 +810,16 @@ public:
    *
    * @param msg_type Message type
    */
-  HSHM_CROSS_FUN void SetMsgType(LocalMsgType msg_type) { msg_type_ = msg_type; }
+  HSHM_CROSS_FUN void SetMsgType(LocalMsgType msg_type) {
+    msg_type_ = msg_type;
+  }
 
-private:
+ private:
 #if HSHM_IS_HOST
   static inline std::vector<char> empty_buffer_;
 #endif
 };
 
-} // namespace chi
+}  // namespace chi
 
-#endif // CHIMAERA_INCLUDE_CHIMAERA_LOCAL_TASK_ARCHIVES_H_
+#endif  // CHIMAERA_INCLUDE_CHIMAERA_LOCAL_TASK_ARCHIVES_H_

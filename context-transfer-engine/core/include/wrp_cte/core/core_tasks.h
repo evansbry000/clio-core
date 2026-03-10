@@ -43,12 +43,12 @@
 #include <chimaera/bdev/bdev_tasks.h>
 // Include bdev client for TargetInfo
 #include <chimaera/bdev/bdev_client.h>
+#if HSHM_IS_HOST
 #include <yaml-cpp/yaml.h>
-
-#include <chrono>
-// Include cereal for serialization
 #include <cereal/archives/binary.hpp>
 #include <cereal/cereal.hpp>
+#endif
+#include <chrono>
 
 namespace wrp_cte::core {
 
@@ -89,6 +89,7 @@ struct CreateParams {
     (void)pool_id;  // Suppress unused parameter warning
   }
 
+#if HSHM_IS_HOST
   // Serialization support for cereal
   template <class Archive>
   void serialize(Archive &ar) {
@@ -127,6 +128,7 @@ struct CreateParams {
            "CTE CreateParams::LoadConfig() - Empty config string provided");
     }
   }
+#endif
 };
 
 /**

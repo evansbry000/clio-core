@@ -1025,6 +1025,7 @@ chi::TaskResume Runtime::ClientConnect(hipc::FullPtr<ClientConnectTask> task,
                                        chi::RunContext &rctx) {
   task->response_ = 0;
   task->server_generation_ = CHI_IPC->GetServerGeneration();
+  task->server_pid_ = static_cast<int32_t>(getpid());
   task->worker_queues_off_ = CHI_IPC->GetWorkerQueuesOffset();
 
   // Populate GPU queue info for client attachment

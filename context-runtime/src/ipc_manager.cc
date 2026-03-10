@@ -1071,8 +1071,11 @@ bool IpcManager::WaitForLocalServer() {
   if (task->response_ == 0) {
     client_generation_ = task->server_generation_;
     worker_queues_off_ = task->worker_queues_off_;
-    HLOG(kInfo, "Successfully connected to runtime (generation={})",
-         client_generation_);
+    if (task->server_pid_ > 0) {
+      runtime_pid_ = static_cast<pid_t>(task->server_pid_);
+    }
+    HLOG(kInfo, "Successfully connected to runtime (generation={}, server_pid={})",
+         client_generation_, runtime_pid_);
 
     // Initialize client GPU queues from server response
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
