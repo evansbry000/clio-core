@@ -44,6 +44,7 @@
 // Main HSHM include
 #include <hermes_shm/hermes_shm.h>
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
+#include <hermes_shm/memory/allocator/thread_allocator.h>
 
 /**
  * Core type definitions for Chimaera distributed task execution framework
@@ -460,27 +461,25 @@ constexpr PoolId kAdminPoolId =
 #define CHI_PRIV_ALLOC    HSHM_MALLOC
 #else
 #define CHI_TASK_ALLOC_T  hipc::BuddyAllocator
-// GPU: CHI_PRIV_ALLOC uses the heap BuddyAllocator (gpu_heap_allocs_), NOT
-// GetMainAllocator() which returns gpu_alloc_table_ (ArenaAllocator) cast as
-// BuddyAllocator — a type mismatch that causes UB in string constructors.
-#define CHI_PRIV_ALLOC_T  hipc::BuddyAllocator
+// GPU: CHI_PRIV_ALLOC uses the ThreadAllocator (gpu_heap_alloc_), which
+// provides per-block BuddyAllocator partitions to avoid cross-block contention.
+#define CHI_PRIV_ALLOC_T  hipc::ThreadAllocator
 /**
- * Get the GPU private allocator (BuddyAllocator from GPU heap).
+ * Get the GPU private allocator (ThreadAllocator from GPU heap).
  * Declared here; defined in ipc_manager.h after CHI_IPC is available.
  *
- * @return Pointer to the GPU heap BuddyAllocator
+ * @return Pointer to the GPU heap ThreadAllocator
  */
-HSHM_GPU_FUN hipc::BuddyAllocator *GetPrivAllocGpu();
+HSHM_GPU_FUN hipc::ThreadAllocator *GetPrivAllocGpu();
 #define CHI_PRIV_ALLOC    (::chi::GetPrivAllocGpu())
 #endif
 
 // CHI_GPU_HEAP_T: allocator for GPU serialization scratch buffers.
-// Options: hipc::BuddyAllocator (managed pool) or hipc::MallocAllocator
-//          (CUDA device heap malloc/free, no pre-allocated buffer needed).
-// Separate from HSHM_DEFAULT_ALLOC_GPU_T (ArenaAllocator) used for FutureShm.
-#define CHI_GPU_HEAP_T hipc::BuddyAllocator
+// Uses ThreadAllocator which internally manages per-block BuddyAllocator
+// partitions, eliminating cross-block allocator contention (CUDA Error 700).
+#define CHI_GPU_HEAP_T hipc::ThreadAllocator
 
-// CHI_GPU_HEAP: per-thread BuddyAllocator from the GpuMalloc heap table.
+// CHI_GPU_HEAP: single ThreadAllocator from the GpuMalloc heap.
 // Valid in GPU device code after CHIMAERA_GPU_ORCHESTRATOR_INIT.
 #define CHI_GPU_HEAP (CHI_IPC->GetGpuHeap())
 

@@ -813,10 +813,9 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     gpu_orchestrator_backends_.push_back(std::move(backend));
   }
 
-  // --- 7. GPU heap backend (GpuMalloc, device memory, for BuddyAllocator) ---
-  // Partitioned per-block by CHIMAERA_GPU_ORCHESTRATOR_INIT, then per-thread
-  // by InitHeapTable.  BuddyAllocator supports individual free so serialization
-  // scratch buffers are reclaimed without exhausting the primary ArenaAllocator.
+  // --- 7. GPU heap backend (GpuMalloc, device memory, for ThreadAllocator) ---
+  // A single ThreadAllocator manages per-block BuddyAllocator partitions
+  // internally via blockIdx.x, eliminating cross-block contention.
   {
     hipc::MemoryBackendId bid(9000 + gpu_id, 0);
     std::string url = "/chi_gpu_heap_" + sid;

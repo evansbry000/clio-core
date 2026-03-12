@@ -190,10 +190,10 @@ struct IpcManagerGpuInfo {
   hipc::MemoryBackend gpu2cpu_backend;
 
   /**
-   * GpuMalloc-backed heap backend for per-thread BuddyAllocator (CHI_GPU_HEAP_T).
+   * GpuMalloc-backed heap backend for ThreadAllocator (CHI_GPU_HEAP_T).
    * Used by LocalSaveTaskArchive / LocalLoadTaskArchive for serialization scratch.
-   * Separate from the primary ArenaAllocator so scratch buffers can be individually
-   * freed without exhausting the bump-pointer arena.
+   * A single ThreadAllocator manages per-block BuddyAllocator partitions internally,
+   * eliminating cross-block allocator contention (CUDA Error 700).
    */
   hipc::MemoryBackend gpu_heap_backend;
 
@@ -283,16 +283,15 @@ class IpcManager {
       InitAllocTable(gpu2cpu_backend_, num_threads, &gpu2cpu_alloc_table_);
     }
 
-    // Set up GPU heap table (GpuMalloc device memory, BuddyAllocator)
+    // Set up GPU heap (GpuMalloc device memory, single ThreadAllocator)
     if (gpu_info.gpu_heap_backend.data_ != nullptr) {
       gpu_heap_backend_ = gpu_info.gpu_heap_backend;
       if (gpu_info.skip_heap_init) {
-        // Resume path: heap allocators persist across pause/resume.
-        // Just rebuild the pointer table (already stored at base of backend).
-        gpu_heap_allocs_ =
-            reinterpret_cast<CHI_GPU_HEAP_T **>(gpu_heap_backend_.data_);
+        // Resume path: ThreadAllocator persists across pause/resume.
+        gpu_heap_alloc_ =
+            reinterpret_cast<CHI_GPU_HEAP_T *>(gpu_heap_backend_.data_);
       } else {
-        InitHeapTable(gpu_heap_backend_, num_threads, &gpu_heap_allocs_);
+        InitHeapAllocator(gpu_heap_backend_, num_threads, &gpu_heap_alloc_);
       }
     }
   }
@@ -336,52 +335,50 @@ class IpcManager {
   }
 
   /**
-   * Initialize a per-thread CHI_GPU_HEAP_T (BuddyAllocator) table from a
-   * GpuMalloc MemoryBackend.  Same layout as InitAllocTable but typed for
-   * CHI_GPU_HEAP_T so serialization archives get proper alloc/free semantics.
-   *
-   * Layout: [ptr_table (num_threads ptrs)] [BuddyAlloc_0] ... [BuddyAlloc_N-1]
-   * All allocators share the same base pointer so ShmPtr offsets are consistent.
+   * Initialize a single ThreadAllocator from a GpuMalloc MemoryBackend.
+   * The ThreadAllocator manages per-block BuddyAllocator partitions internally,
+   * eliminating the need for a separate pointer table.
    *
    * @param backend GpuMalloc backend (device memory)
-   * @param num_threads Number of per-thread allocators to create
-   * @param table_out Output: pointer to the per-thread heap allocator table
+   * @param num_threads Number of GPU blocks (used as max_threads for partitioning)
+   * @param alloc_out Output: pointer to the ThreadAllocator
    */
   HSHM_CROSS_FUN
-  void InitHeapTable(const hipc::MemoryBackend &backend, int num_threads,
-                     CHI_GPU_HEAP_T ***table_out) {
+  void InitHeapAllocator(const hipc::MemoryBackend &backend, int num_threads,
+                         CHI_GPU_HEAP_T **alloc_out) {
     char *base = backend.data_;
     size_t data_capacity = backend.data_capacity_;
-    size_t table_bytes = sizeof(CHI_GPU_HEAP_T *) * num_threads;
-    char *alloc_base = base + table_bytes;
-    size_t per_thread = (data_capacity - table_bytes) / num_threads;
 
-    *table_out = reinterpret_cast<CHI_GPU_HEAP_T **>(base);
+    auto *alloc = reinterpret_cast<CHI_GPU_HEAP_T *>(base);
+    new (alloc) CHI_GPU_HEAP_T();
 
+    hipc::MemoryBackend sub_backend;
+    sub_backend.data_ = base;
+    sub_backend.data_capacity_ = data_capacity;
+    sub_backend.id_ = backend.id_;
+
+    // Calculate per-thread partition size (leave room for allocator header + table)
+    size_t overhead = sizeof(CHI_GPU_HEAP_T) + 4096;  // header + table slack
+    size_t thread_unit = (data_capacity - overhead) / num_threads;
+    alloc->shm_init(sub_backend, 0, num_threads, thread_unit);
+
+    // Pre-initialize all thread partitions so GPU kernels don't need the mutex
     for (int i = 0; i < num_threads; ++i) {
-      char *region = alloc_base + i * per_thread;
-      auto *alloc = reinterpret_cast<CHI_GPU_HEAP_T *>(region);
-      new (alloc) CHI_GPU_HEAP_T();
-
-      hipc::MemoryBackend sub_backend;
-      sub_backend.data_ = base;
-      sub_backend.data_capacity_ = data_capacity;
-      sub_backend.id_ = backend.id_;
-      alloc->shm_init(sub_backend, per_thread);
-
-      (*table_out)[i] = alloc;
+      alloc->LazyInitThread(i);
     }
+
+    *alloc_out = alloc;
   }
 
   /**
-   * Return the per-GPU-thread heap allocator (CHI_GPU_HEAP_T) from the table.
+   * Return the GPU heap ThreadAllocator.
    * Used via the CHI_GPU_HEAP macro for serialization scratch in archives.
-   * Returns nullptr if the heap table was not initialized (no gpu_heap_backend).
+   * The ThreadAllocator auto-detects blockIdx.x for per-block partitioning.
+   * Returns nullptr if the heap was not initialized (no gpu_heap_backend).
    */
   HSHM_CROSS_FUN CHI_GPU_HEAP_T *GetGpuHeap() {
 #if HSHM_IS_GPU
-    if (!gpu_heap_allocs_) return nullptr;
-    return gpu_heap_allocs_[GetGpuThreadId()];
+    return gpu_heap_alloc_;
 #else
     return nullptr;
 #endif
@@ -654,8 +651,6 @@ class IpcManager {
     fshm->method_id_ = task_ptr->method_;
     fshm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
     fshm->client_task_vaddr_ = 0;
-    fshm->input_.copy_space_size_.store_system(copy_space_size);
-    fshm->output_.copy_space_size_.store_system(copy_space_size);
     fshm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
     // Store absolute UVA pointer in off_ with null alloc_id_ so that
@@ -675,17 +670,24 @@ class IpcManager {
     // so the worker sees complete data when it pops.
     LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeIn);
     task_ptr->SerializeIn(save_ar);
-    hshm::lbm::ShmTransport::Send(save_ar, ctx);
 
-    // Enqueue AFTER serialization is complete.
-    // Always use PushSystem (system-scope atomics) because the worker's Pop()
-    // uses system-scope loads (load_system, IsReadySystem). Mixing device-scope
-    // writes with system-scope reads can cause missed updates when system-scope
-    // reads bypass L2 cache and device-scope writes are only in L2.
     auto &lane = queue->GetLane(0, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
-    lane.PushSystem(task_future);
 
+    if (to_cpu) {
+      // GPU→CPU: system-scope atomics for cross-device visibility
+      fshm->input_.copy_space_size_.store_system(copy_space_size);
+      fshm->output_.copy_space_size_.store_system(copy_space_size);
+      hshm::lbm::ShmTransport::Send(save_ar, ctx);
+      lane.PushSystem(task_future);
+    } else {
+      // GPU→GPU: device-scope atomics (same device, ~10x faster)
+      fshm->flags_.SetBits(FutureShm::FUTURE_DEVICE_SCOPE);
+      fshm->input_.copy_space_size_.store(copy_space_size);
+      fshm->output_.copy_space_size_.store(copy_space_size);
+      hshm::lbm::ShmTransport::SendDevice(save_ar, ctx);
+      lane.Push(task_future);
+    }
     return future;
   }
 
@@ -704,23 +706,46 @@ class IpcManager {
     hipc::FullPtr<FutureShm> fshm_full = future.GetFutureShm();
     FutureShm *fshm = fshm_full.ptr_;
 
-    // Wait for the worker to signal completion
-    while (!fshm->flags_.AnySystem(FutureShm::FUTURE_COMPLETE)) {
-      HSHM_THREAD_MODEL->Yield();
-    }
-    hipc::threadfence();
+    // Use system-scope to read the scope flag (works on both host/device pass)
+    bool device_scope = fshm->flags_.AnySystem(FutureShm::FUTURE_DEVICE_SCOPE);
+#if !HSHM_IS_HOST
+    if (device_scope) {
+      // GPU→GPU: device-scope atomics
+      while (!fshm->flags_.Any(FutureShm::FUTURE_COMPLETE)) {
+        HSHM_THREAD_MODEL->Yield();
+      }
+      hipc::threadfence();
 
-    // Deserialize output if the worker wrote any data
-    if (fshm->output_.total_written_.load_system() > 0) {
-      hshm::lbm::LbmContext ctx;
-      ctx.copy_space = fshm->copy_space;
-      ctx.shm_info_ = &fshm->output_;
+      if (fshm->output_.total_written_.load() > 0) {
+        hshm::lbm::LbmContext ctx;
+        ctx.copy_space = fshm->copy_space;
+        ctx.shm_info_ = &fshm->output_;
 
-      // Use the generic heap allocator for the deserialization scratch buffer
-      LocalLoadTaskArchive load_ar;
-      hshm::lbm::ShmTransport::Recv(load_ar, ctx);
-      load_ar.SetMsgType(LocalMsgType::kSerializeOut);
-      task_ptr->SerializeOut(load_ar);
+        LocalLoadTaskArchive load_ar;
+        hshm::lbm::ShmTransport::RecvDevice(load_ar, ctx);
+        load_ar.SetMsgType(LocalMsgType::kSerializeOut);
+        task_ptr->SerializeOut(load_ar);
+      }
+    } else
+#endif
+    {
+      // GPU→CPU (or host fallback): system-scope atomics
+      (void)device_scope;
+      while (!fshm->flags_.AnySystem(FutureShm::FUTURE_COMPLETE)) {
+        HSHM_THREAD_MODEL->Yield();
+      }
+      hipc::threadfence();
+
+      if (fshm->output_.total_written_.load_system() > 0) {
+        hshm::lbm::LbmContext ctx;
+        ctx.copy_space = fshm->copy_space;
+        ctx.shm_info_ = &fshm->output_;
+
+        LocalLoadTaskArchive load_ar;
+        hshm::lbm::ShmTransport::Recv(load_ar, ctx);
+        load_ar.SetMsgType(LocalMsgType::kSerializeOut);
+        task_ptr->SerializeOut(load_ar);
+      }
     }
   }
 
@@ -2229,11 +2254,11 @@ class IpcManager {
   /** Per-thread allocator table for GPU→CPU FutureShm (pinned host) */
   HSHM_DEFAULT_ALLOC_GPU_T **gpu2cpu_alloc_table_ = nullptr;
 
-  // --- GPU heap: GpuMalloc-backed BuddyAllocator for serialization scratch ---
-  /** GpuMalloc device-memory backend for per-thread BuddyAllocator heap */
+  // --- GPU heap: GpuMalloc-backed ThreadAllocator for serialization scratch ---
+  /** GpuMalloc device-memory backend for ThreadAllocator heap */
   hipc::MemoryBackend gpu_heap_backend_;
-  /** Per-thread CHI_GPU_HEAP_T table (BuddyAllocator, supports individual free) */
-  CHI_GPU_HEAP_T **gpu_heap_allocs_ = nullptr;
+  /** Single ThreadAllocator managing per-block BuddyAllocator partitions */
+  CHI_GPU_HEAP_T *gpu_heap_alloc_ = nullptr;
 
   // --- Queue pointers (filled by ClientInitGpu from IpcManagerGpuInfo) ---
   /** GPU→GPU task queue (device memory, orchestrator polls) */
@@ -2428,7 +2453,7 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 // Define GetPrivAllocGpu now that CHI_IPC is available
 #if !HSHM_IS_HOST
 namespace chi {
-HSHM_GPU_FUN inline hipc::BuddyAllocator *GetPrivAllocGpu() {
+HSHM_GPU_FUN inline hipc::ThreadAllocator *GetPrivAllocGpu() {
   return CHI_IPC->GetGpuHeap();
 }
 }  // namespace chi
@@ -2501,12 +2526,8 @@ HSHM_GPU_FUN inline hipc::BuddyAllocator *GetPrivAllocGpu() {
       block_info.gpu2cpu_backend.data_ += blockIdx.x * per_block2;             \
       block_info.gpu2cpu_backend.data_capacity_ = per_block2;                  \
     }                                                                           \
-    if (block_info.gpu_heap_backend.data_ != nullptr) {                        \
-      size_t per_block_heap =                                                   \
-          block_info.gpu_heap_backend.data_capacity_ / (num_blocks);           \
-      block_info.gpu_heap_backend.data_ += blockIdx.x * per_block_heap;        \
-      block_info.gpu_heap_backend.data_capacity_ = per_block_heap;             \
-    }                                                                           \
+    /* gpu_heap_backend is NOT split per-block: ThreadAllocator handles */      \
+    /* per-block partitioning internally via blockIdx.x % max_threads_ */      \
     g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads);                 \
   }                                                                             \
   __syncthreads();                                                              \
