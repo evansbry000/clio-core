@@ -352,6 +352,7 @@ __global__ void test_gpu_serialize_deserialize_kernel(
 
   // Only thread 0 tests serialization
   if (thread_id == 0) {
+#if !HSHM_IS_HOST
     // Create a task using NewTask
     chi::TaskId task_id = chi::CreateTaskId();
     chi::PoolId pool_id(2000, 0);
@@ -368,10 +369,9 @@ __global__ void test_gpu_serialize_deserialize_kernel(
       return;
     }
 
-    // Serialize task using LocalSaveTaskArchive with priv::vector
+    // Serialize task using LocalSaveTaskArchive
     auto *alloc = CHI_IPC->GetGpuHeap();
-    hshm::priv::vector<char, CHI_GPU_HEAP_T> buf(alloc);
-    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buf, alloc);
+    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, alloc);
     original_task->SerializeIn(save_ar);
     size_t serialized_size = save_ar.GetSize();
 
@@ -385,8 +385,8 @@ __global__ void test_gpu_serialize_deserialize_kernel(
       return;
     }
 
-    // Deserialize using LocalLoadTaskArchive with priv::vector
-    chi::LocalLoadTaskArchive load_ar(buf, alloc);
+    // Deserialize using LocalLoadTaskArchive from save archive data
+    chi::LocalLoadTaskArchive load_ar(save_ar.GetData());
     loaded_task->SerializeIn(load_ar);
 
     // Verify deserialized task matches original
@@ -397,6 +397,7 @@ __global__ void test_gpu_serialize_deserialize_kernel(
     } else {
       results[0] = 3;  // Deserialization mismatch
     }
+#endif  // !HSHM_IS_HOST
   }
 
   __syncthreads();
@@ -413,6 +414,7 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
 
   // Only thread 0 serializes
   if (thread_id == 0) {
+#if !HSHM_IS_HOST
     // Create a task using NewTask
     chi::TaskId task_id = chi::CreateTaskId();
     chi::PoolId pool_id(3000, 0);
@@ -430,19 +432,19 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
       return;
     }
 
-    // Serialize task using LocalSaveTaskArchive with priv::vector
+    // Serialize task using LocalSaveTaskArchive
     auto *alloc = CHI_IPC->GetGpuHeap();
-    hshm::priv::vector<char, CHI_GPU_HEAP_T> buf(alloc);
-    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buf, alloc);
+    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, alloc);
     task->SerializeIn(save_ar);
 
     // Copy serialized data to output buffer
     size_t sz = save_ar.GetSize();
-    memcpy(output_buffer, buf.data(), sz);
+    memcpy(output_buffer, save_ar.GetData().data(), sz);
 
     // Store serialized size
     *output_size = sz;
     results[0] = 0;  // Success
+#endif  // !HSHM_IS_HOST
   }
 
   __syncthreads();

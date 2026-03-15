@@ -199,6 +199,9 @@ struct IpcManagerGpuInfo {
 
   u32 gpu_queue_depth = 16;
 
+  /** Number of lanes in the gpu2gpu TaskQueue (one per orchestrator thread) */
+  u32 gpu2gpu_num_lanes = 1;
+
   /** When true, skip heap re-initialization (heap allocators persist across
    *  pause/resume cycles — re-init would destroy existing allocations). */
   bool skip_heap_init = false;
@@ -267,6 +270,7 @@ class IpcManager {
     // Store queue pointers
     gpu2gpu_queue_ = gpu_info.gpu2gpu_queue;
     gpu2gpu_queue_base_ = gpu_info.gpu2gpu_queue_base;
+    gpu2gpu_num_lanes_ = gpu_info.gpu2gpu_num_lanes;
     cpu2gpu_queue_ = gpu_info.cpu2gpu_queue;
     cpu2gpu_queue_base_ = gpu_info.cpu2gpu_queue_base;
     gpu2cpu_queue_ = gpu_info.gpu2cpu_queue;
@@ -673,7 +677,15 @@ class IpcManager {
     LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeIn);
     task_ptr->SerializeIn(save_ar);
 
-    auto &lane = queue->GetLane(0, 0);
+    // Distribute across orchestrator lanes using client's global thread ID
+    u32 lane_id = 0;
+#if HSHM_IS_GPU
+    if (!to_cpu && gpu2gpu_num_lanes_ > 1) {
+      u32 global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+      lane_id = global_tid % gpu2gpu_num_lanes_;
+    }
+#endif
+    auto &lane = queue->GetLane(lane_id, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
 
     if (to_cpu) {
@@ -2267,6 +2279,8 @@ class IpcManager {
   TaskQueue *gpu2gpu_queue_ = nullptr;
   /** Base of gpu2gpu queue backend for device-side ShmPtr resolution */
   char *gpu2gpu_queue_base_ = nullptr;
+  /** Number of lanes in gpu2gpu queue */
+  u32 gpu2gpu_num_lanes_ = 1;
   /** CPU→GPU task queue (pinned host, orchestrator polls) */
   TaskQueue *cpu2gpu_queue_ = nullptr;
   /** Base of cpu2gpu copy-space backend for GPU-side ShmPtr→ptr conversion */

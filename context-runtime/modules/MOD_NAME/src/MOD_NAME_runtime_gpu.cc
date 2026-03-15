@@ -39,6 +39,7 @@
  */
 
 #include "chimaera/MOD_NAME/MOD_NAME_gpu_runtime.h"
+#include "chimaera/gpu_container.h"
 
 namespace chimaera::MOD_NAME {
 

@@ -80,14 +80,10 @@ __global__ void gpu_bench_client_kernel(
     chi::PoolId pool_id,
     chi::u32 num_blocks,
     chi::u32 total_tasks,
-    int *d_done) {
+    int *d_done,
+    chi::u32 total_threads) {
   // Partition backend per block; initialize block-local IpcManager
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
-
-  // Only thread 0 of each block does work (proven pattern from unit tests)
-  if (threadIdx.x != 0) {
-    return;
-  }
 
   chimaera::MOD_NAME::Client client(pool_id);
 
@@ -96,10 +92,12 @@ __global__ void gpu_bench_client_kernel(
     future.Wait();
   }
 
-  // Block 0 thread 0 signals completion to the CPU
-  if (blockIdx.x == 0) {
+  // All threads atomically count down; last thread signals the CPU
+  __threadfence();
+  int prev = atomicAdd(d_done, 1);
+  if (prev == static_cast<int>(total_threads) - 1) {
     __threadfence_system();
-    *d_done = 1;
+    // d_done is now == total_threads; host polls for d_done >= total_threads
   }
 }
 
@@ -108,13 +106,13 @@ __global__ void gpu_bench_client_kernel(
 /**
  * Poll the pinned done flag until set or timeout.
  */
-static bool PollDone(volatile int *d_done, int timeout_us) {
+static bool PollDone(volatile int *d_done, int total_threads, int timeout_us) {
   int elapsed_us = 0;
-  while (*d_done == 0 && elapsed_us < timeout_us) {
+  while (*d_done < total_threads && elapsed_us < timeout_us) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
     elapsed_us += 100;
   }
-  return *d_done == 1;
+  return *d_done >= total_threads;
 }
 
 /**
@@ -177,18 +175,16 @@ extern "C" int run_gpu_bench_latency(
     return -1;
   }
 
-  // Build IpcManagerGpuInfo: GPU→GPU path only (no CPU queues needed)
-  // Use non-inline GetGpuToGpuQueue to avoid ODR layout mismatch
-  chi::IpcManagerGpu gpu_info;
+  // Build IpcManagerGpuInfo from runtime's full GPU info, then override backends
+  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
   gpu_info.gpu_heap_backend = gpu_heap_backend;
-  gpu_info.gpu2cpu_queue = nullptr;
-  gpu_info.cpu2gpu_queue = nullptr;
-  gpu_info.gpu2gpu_queue = CHI_IPC->GetGpuToGpuQueue(0);
 
   int *d_done;
   cudaMallocHost(&d_done, sizeof(int));
   *d_done = 0;
+
+  chi::u32 total_threads = client_blocks * client_threads;
 
   void *stream = hshm::GpuApi::CreateStream();
 
@@ -197,9 +193,9 @@ extern "C" int run_gpu_bench_latency(
   cudaGetLastError();  // Clear any sticky CUDA errors
 
   chi_bench::gpu_bench_client_kernel<<<
-      client_blocks, 1, 0,   // 1 thread per block (proven pattern)
+      client_blocks, client_threads, 0,
       static_cast<cudaStream_t>(stream)>>>(
-      gpu_info, pool_id, client_blocks, total_tasks, d_done);
+      gpu_info, pool_id, client_blocks, total_tasks, d_done, total_threads);
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
@@ -213,9 +209,9 @@ extern "C" int run_gpu_bench_latency(
   CHI_IPC->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  // Poll for block 0 completion (60 s timeout)
+  // Poll for all threads to complete (60 s timeout)
   constexpr int kTimeoutUs = 60000000;
-  bool completed = PollDone(d_done, kTimeoutUs);
+  bool completed = PollDone(d_done, static_cast<int>(total_threads), kTimeoutUs);
 
   auto t_end = std::chrono::high_resolution_clock::now();
   double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

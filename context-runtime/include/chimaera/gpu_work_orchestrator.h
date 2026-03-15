@@ -121,6 +121,7 @@ class WorkOrchestrator {
    */
   void *AllocGpuContainer(const PoolId &pool_id, u32 container_id,
                             const std::string &chimod_name);
+
 };
 
 /**
@@ -134,7 +135,7 @@ class WorkOrchestrator {
  * @return FullPtr<TaskQueue> with shm_ offset valid for this allocator
  */
 hipc::FullPtr<TaskQueue> InitQueueOnDevice(char *device_data, size_t capacity,
-                                            u32 queue_depth);
+                                            u32 num_lanes, u32 queue_depth);
 
 }  // namespace gpu
 }  // namespace chi

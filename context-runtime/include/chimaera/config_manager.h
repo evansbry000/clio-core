@@ -314,7 +314,7 @@ class ConfigManager : public hshm::BaseConfig {
   float learning_rate_ = 0.2f;               // Default: 0.2 SGD learning rate
 
   // GPU orchestrator configuration
-  u32 gpu_blocks_ = 32;                      // Default: 32 blocks
+  u32 gpu_blocks_ = 1;                       // Default: 1 block
   u32 gpu_threads_per_block_ = 32;           // Default: 32 threads per block
   u32 gpu_queue_depth_ = 16;                 // Default: 16 tasks per queue
 

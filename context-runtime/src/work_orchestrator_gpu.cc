@@ -72,22 +72,18 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
   // num_blocks is used to partition the backend memory among blocks.
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
-  // Only thread 0 of each block runs the worker loop.
-  // Threads 1..N-1 exit immediately after INIT so that:
-  //   1. The per-block alloc_table_size remains proportional to threads_per_block
-  //      (keeps the ArenaAllocator memory layout correct).
-  //   2. No idle threads remain in each block's warp causing SIMT serialization
-  //      overhead for thread 0's poll loop.
-  // All blocks' thread 0 act as concurrent workers, each atomically popping
-  // tasks from the shared queues.
-  if (threadIdx.x != 0) {
-    return;
+  // Compute this thread's global lane ID
+  u32 lane_id = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Thread 0 of block 0 signals that the orchestrator is running
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    control->running_flag = 1;
   }
 
-  control->running_flag = 1;
-
+  // Each thread polls its own lane from the gpu2gpu queue
   gpu::Worker worker;
-  worker.Init(0,
+  worker.Init(lane_id,
+              lane_id,
               gpu_info.cpu2gpu_queue,
               gpu_info.gpu2gpu_queue,
               pool_mgr,
@@ -144,7 +140,6 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   hshm::GpuApi::Memcpy(d_pm, &host_pm, sizeof(gpu::PoolManager));
 
   // Set GPU stack size. 32KB per thread for deep dispatch + serialization.
-  // Only thread 0 per block runs the worker loop, so actual usage is modest.
   cudaDeviceSetLimit(cudaLimitStackSize, 32768);
   cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024);
 
@@ -157,16 +152,12 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
 
   // Zero the heap_ready_ flag in the shared GPU heap backend so that
   // non-zero blocks spin-wait until block 0 finishes initialization.
-  // heap_ready_ is the first field of _ThreadAllocator (after Allocator base).
   if (gpu_info.gpu_heap_backend.data_ != nullptr) {
     cudaMemset(gpu_info.gpu_heap_backend.data_, 0,
                sizeof(hipc::ThreadAllocator));
   }
 
   // Launch persistent GPU work orchestrator.
-  // All threads call CHIMAERA_GPU_ORCHESTRATOR_INIT for correct memory layout,
-  // then only block 0, thread 0 runs the worker loop; all others exit early.
-  // Block 0 initializes the shared GPU heap; others wait via WaitReady().
   HLOG(kInfo, "Launching GPU work orchestrator with {} blocks, {} threads/block",
        blocks, threads_per_block);
   chimaera_gpu_orchestrator<<<blocks, threads_per_block, 0,
@@ -217,7 +208,6 @@ void gpu::WorkOrchestrator::Pause() {
   control_->exit_flag = 1;
   HLOG(kInfo, "GPU work orchestrator: exit_flag set, waiting for kernel...");
 
-  // Check for pre-existing CUDA errors before sync (sticky errors)
   cudaError_t pre_err = cudaGetLastError();
   if (pre_err != cudaSuccess) {
     HLOG(kError, "GPU work orchestrator: pre-sync CUDA error: {}",
@@ -236,7 +226,6 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
     return;
   }
 
-  // Clear any sticky CUDA errors before launching
   cudaError_t pre_err = cudaGetLastError();
   if (pre_err != cudaSuccess) {
     HLOG(kError, "GPU work orchestrator Resume: clearing sticky CUDA error: {}",
@@ -247,7 +236,7 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
   control_->running_flag = 0;
 
   // On resume, skip heap re-initialization to preserve existing GPU-side
-  // container allocations (e.g., GpuMetadata in CTE GpuRuntime).
+  // container allocations.
   IpcManagerGpuInfo resume_info = gpu_info;
   resume_info.skip_heap_init = true;
 
@@ -256,7 +245,6 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
       static_cast<cudaStream_t>(stream_)>>>(
       d_pm, control_, resume_info, blocks_);
 
-  // Check launch error
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     HLOG(kError, "GPU work orchestrator Resume: kernel launch failed: {}",
@@ -272,8 +260,6 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
 
 /**
  * Register a GPU container with the device-side PoolManager.
- * Virtual dispatch is already correct since all containers are allocated
- * in this CUDA module's context.
  */
 void gpu::WorkOrchestrator::RegisterGpuContainer(const PoolId &pool_id,
                                                    void *gpu_container_ptr) {
@@ -281,7 +267,6 @@ void gpu::WorkOrchestrator::RegisterGpuContainer(const PoolId &pool_id,
     return;
   }
 
-  // Register container with PoolManager
   auto *d_pm = static_cast<gpu::PoolManager *>(d_pool_mgr_);
   gpu::PoolManager host_pm;
   hshm::GpuApi::Memcpy(&host_pm, d_pm, sizeof(gpu::PoolManager));
@@ -304,24 +289,14 @@ void *gpu::WorkOrchestrator::AllocGpuContainer(const PoolId &pool_id,
 }
 
 //==============================================================================
-// gpu::InitQueueOnDevice — initialize ArenaAllocator + TaskQueue on device mem
+// gpu_init_queue_kernel — device kernel for ArenaAllocator + TaskQueue init
 //==============================================================================
 
-/**
- * One-shot GPU kernel: constructs a BuddyAllocator and TaskQueue in-place
- * on device memory. Runs on a single thread (1 block, 1 thread).
- * MakeAlloc and NewObj are HSHM_CROSS_FUN so they work on GPU.
- *
- * @param device_data Base pointer of device memory (GpuMalloc data_)
- * @param capacity    Total bytes available
- * @param queue_depth Depth of the TaskQueue ring buffer
- * @param d_out_off   Device output: byte offset of the TaskQueue within data_
- */
 __global__ void gpu_init_queue_kernel(char *device_data, size_t capacity,
-                                       u32 queue_depth, size_t *d_out_off) {
+                                       u32 num_lanes, u32 queue_depth,
+                                       size_t *d_out_off) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
-  // Build a minimal MemoryBackend pointing at device_data so MakeAlloc works
   hipc::MemoryBackend proxy;
   proxy.data_ = device_data;
   proxy.data_capacity_ = capacity;
@@ -330,14 +305,14 @@ __global__ void gpu_init_queue_kernel(char *device_data, size_t capacity,
   if (!alloc) { *d_out_off = static_cast<size_t>(-1); return; }
 
   hipc::FullPtr<TaskQueue> q = alloc->template NewObj<TaskQueue>(
-      alloc, 1, 2, queue_depth);
+      alloc, num_lanes, 2, queue_depth);
   *d_out_off = q.IsNull() ? static_cast<size_t>(-1) : q.shm_.off_.load();
 }
 
 hipc::FullPtr<TaskQueue> gpu::InitQueueOnDevice(char *device_data,
                                                   size_t capacity,
+                                                  u32 num_lanes,
                                                   u32 queue_depth) {
-  // Allocate output slot in pinned memory for the queue offset
   size_t *d_out_off = nullptr;
   cudaError_t err = cudaMalloc(&d_out_off, sizeof(size_t));
   if (err != cudaSuccess) {
@@ -346,8 +321,8 @@ hipc::FullPtr<TaskQueue> gpu::InitQueueOnDevice(char *device_data,
     return hipc::FullPtr<TaskQueue>::GetNull();
   }
 
-  gpu_init_queue_kernel<<<1, 1>>>(device_data, capacity, queue_depth,
-                                   d_out_off);
+  gpu_init_queue_kernel<<<1, 1>>>(device_data, capacity, num_lanes,
+                                   queue_depth, d_out_off);
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     HLOG(kError, "InitQueueOnDevice: kernel launch failed: {}",

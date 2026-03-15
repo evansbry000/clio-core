@@ -695,6 +695,10 @@ bool IpcManager::ServerInitGpuQueues() {
  */
 bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
   const std::string sid = std::to_string(gpu_id);
+  ConfigManager *config = CHI_CONFIG_MANAGER;
+  u32 gpu_blocks = config->GetGpuBlocks();
+  u32 gpu_threads = config->GetGpuThreadsPerBlock();
+  u32 num_lanes = gpu_blocks * gpu_threads;
 
   // --- 1. GPU→GPU queue backend (device memory, GpuMalloc) ---
   // Device memory: CPU cannot directly dereference it. Use a GPU kernel
@@ -704,13 +708,18 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     hipc::MemoryBackendId bid(3000 + gpu_id, 0);
     std::string url = "/chi_gpu2gpu_q_" + sid;
     auto backend = std::make_unique<hipc::GpuMalloc>();
-    if (!backend->shm_init(bid, hshm::Unit<size_t>::Megabytes(4), url, gpu_id)) {
+    // Scale backend size with number of lanes
+    size_t backend_size = std::max(
+        hshm::Unit<size_t>::Megabytes(4),
+        static_cast<size_t>(num_lanes) * queue_depth * 256 +
+            hshm::Unit<size_t>::Megabytes(1));
+    if (!backend->shm_init(bid, backend_size, url, gpu_id)) {
       HLOG(kError, "Failed to init gpu2gpu queue backend for GPU {}", gpu_id);
       return false;
     }
     // Initialize allocator + queue entirely on the GPU
     hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
-        backend->data_, backend->data_capacity_, queue_depth);
+        backend->data_, backend->data_capacity_, num_lanes, queue_depth);
     if (q.IsNull()) {
       HLOG(kError, "Failed to init gpu2gpu TaskQueue on device for GPU {}", gpu_id);
       return false;
@@ -718,6 +727,7 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
     gpu2gpu_queues_.push_back(q);
     gpu2gpu_queue_backends_.push_back(std::move(backend));
+    gpu2gpu_num_lanes_ = num_lanes;
   }
 
   // --- 2. GPU→CPU queue backend (pinned host, GpuShmMmap) ---
@@ -3169,6 +3179,7 @@ IpcManagerGpuInfo IpcManager::GetClientGpuInfo(u32 gpu_id) {
       gpu2gpu_queue_backends_[gpu_id]) {
     info.gpu2gpu_queue_base = gpu2gpu_queue_backends_[gpu_id]->data_;
   }
+  info.gpu2gpu_num_lanes = gpu2gpu_num_lanes_;
 
   // CPU→GPU queue (pinned host, orchestrator polls)
   info.cpu2gpu_queue = cpu2gpu_queues_[gpu_id].ptr_;

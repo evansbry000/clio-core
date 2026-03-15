@@ -57,6 +57,7 @@ namespace gpu {
 class Worker {
  public:
   u32 worker_id_;                    /**< Worker identity */
+  u32 lane_id_;                      /**< Lane this worker polls */
   volatile bool is_running_;         /**< Running flag for the poll loop */
   TaskQueue *cpu2gpu_queue_;         /**< CPU → GPU queue (GPU work orchestrator polls) */
   TaskQueue *gpu2gpu_queue_;         /**< GPU → GPU queue (GPU work orchestrator polls) */
@@ -68,17 +69,20 @@ class Worker {
    * Initialize the worker with queue and pool manager pointers.
    *
    * @param worker_id Logical worker ID
+   * @param lane_id Lane index this worker polls from
    * @param cpu2gpu_queue CPU→GPU queue pointer (pinned host memory)
    * @param gpu2gpu_queue GPU→GPU queue pointer (device memory)
    * @param pool_mgr GPU-side pool manager for container lookup
    * @param queue_backend_base Base pointer of queue backend for ShmPtr offsets
    */
   HSHM_GPU_FUN void Init(u32 worker_id,
+                          u32 lane_id,
                           TaskQueue *cpu2gpu_queue,
                           TaskQueue *gpu2gpu_queue,
                           PoolManager *pool_mgr,
                           char *queue_backend_base) {
     worker_id_ = worker_id;
+    lane_id_ = lane_id;
     cpu2gpu_queue_ = cpu2gpu_queue;
     gpu2gpu_queue_ = gpu2gpu_queue;
     pool_mgr_ = pool_mgr;
@@ -101,8 +105,11 @@ class Worker {
    */
   HSHM_GPU_FUN bool PollOnce() {
     bool did_work = false;
-    did_work |= ProcessNewTask(cpu2gpu_queue_);
-    did_work |= ProcessNewTask(gpu2gpu_queue_);
+    // Only lane 0 polls the cpu2gpu queue (single-lane)
+    if (lane_id_ == 0) {
+      did_work |= ProcessCpu2GpuTask();
+    }
+    did_work |= ProcessGpu2GpuTask();
     return did_work;
   }
 
@@ -135,13 +142,19 @@ class Worker {
    * @param queue Queue to pop from
    * @return true if a task was processed, false if queue was empty
    */
-  HSHM_GPU_FUN bool ProcessNewTask(TaskQueue *queue) {
+  HSHM_GPU_FUN bool ProcessCpu2GpuTask() {
+    return ProcessNewTask(cpu2gpu_queue_, 0, false);
+  }
+
+  HSHM_GPU_FUN bool ProcessGpu2GpuTask() {
+    return ProcessNewTask(gpu2gpu_queue_, lane_id_, true);
+  }
+
+  HSHM_GPU_FUN bool ProcessNewTask(TaskQueue *queue, u32 lane_id,
+                                    bool is_gpu2gpu) {
     if (!queue) return false;
 
-    bool is_gpu2gpu = (queue == gpu2gpu_queue_);
-
-    // Try to pop from lane (0, 0)
-    auto &lane = queue->GetLane(0, 0);
+    auto &lane = queue->GetLane(lane_id, 0);
     Future<Task> future;
     if (is_gpu2gpu) {
       if (!lane.PopDevice(future)) return false;
@@ -240,6 +253,8 @@ class Worker {
   HSHM_GPU_FUN void DispatchTask(FutureShm *fshm, Container *container,
                                   u32 method_id, bool is_gpu2gpu) {
 #if !HSHM_IS_HOST
+    long long t0 = clock64();
+
     // Step 1: Deserialize input from FutureShm ring buffer
     hshm::lbm::LbmContext in_ctx;
     in_ctx.copy_space = fshm->copy_space;
@@ -259,6 +274,7 @@ class Worker {
       hshm::lbm::ShmTransport::Recv(load_ar, in_ctx);
     }
     load_ar.SetMsgType(LocalMsgType::kSerializeIn);
+    long long t1 = clock64();
 
     // Step 2: Allocate and load the task via container
     hipc::FullPtr<Task> task_ptr =
@@ -273,12 +289,14 @@ class Worker {
       alloc->Reset();
       return;
     }
+    long long t2 = clock64();
 
     // Step 3: Execute the task (coroutine: resume + destroy)
     {
       TaskResume coro = container->Run(method_id, task_ptr, rctx_);
       coro.resume();
     }
+    long long t3 = clock64();
 
     // Step 4: Serialize output into FutureShm ring buffer
     hshm::lbm::LbmContext out_ctx;
@@ -293,6 +311,7 @@ class Worker {
     } else {
       hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
     }
+    long long t4 = clock64();
 
     // Step 5: Destroy task
     task_ptr.ptr_->~Task();
@@ -306,6 +325,16 @@ class Worker {
 
     // Step 7: Reset arena
     alloc->Reset();
+    long long t5 = clock64();
+
+    printf("[GPU DispatchTask] method=%u deser=%lld alloc_load=%lld run=%lld ser_out=%lld signal_reset=%lld total=%lld\n",
+           (unsigned)method_id,
+           (long long)(t1 - t0),
+           (long long)(t2 - t1),
+           (long long)(t3 - t2),
+           (long long)(t4 - t3),
+           (long long)(t5 - t4),
+           (long long)(t5 - t0));
 #endif  // !HSHM_IS_HOST
   }
 };

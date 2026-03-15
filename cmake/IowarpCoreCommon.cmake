@@ -302,6 +302,9 @@ function(add_cuda_library TARGET SHARED DO_COPY)
             list(APPEND OBJECT_FILES ${OBJ_FILE})
         endforeach()
 
+        # Save source object files (before device link) for fatbin extraction
+        set(_CUDA_SRC_OBJ_FILES ${OBJECT_FILES})
+
         # Device link step: nvcc -dlink resolves __cudaRegisterLinkedBinary__nv_*
         # symbols that clang-cuda -fgpu-rdc compilation leaves undefined.
         set(DEVICE_LINK_OBJ "${CMAKE_CURRENT_BINARY_DIR}/clang_cuda/device_link.o")
@@ -344,6 +347,10 @@ function(add_cuda_library TARGET SHARED DO_COPY)
         )
         set_property(TARGET ${TARGET} APPEND PROPERTY
             LINK_LIBRARIES "-L${WRP_CORE_CLANG_CUDA_PATH}/lib64;-lcudart")
+
+        # Export the Clang-CUDA object files (excluding device_link.o) to parent scope
+        # so embed_gpu_device_code() can extract fatbins from them.
+        set(${TARGET}_CUDA_OBJ_FILES ${_CUDA_SRC_OBJ_FILES} PARENT_SCOPE)
     else()
         # ---- NVCC path ----
         set(CUDA_SOURCE_FILES "")
@@ -888,6 +895,8 @@ function(add_chimod_client)
   set(CHIMAERA_NAMESPACE ${CHIMAERA_NAMESPACE} PARENT_SCOPE)
 endfunction()
 
+#------------------------------------------------------------------------------
+# GPU Device Code Embedding Function
 #------------------------------------------------------------------------------
 # ChiMod Runtime Library Function
 #------------------------------------------------------------------------------

@@ -74,6 +74,8 @@
 struct GpuBenchResult {
   int status;
   long long elapsed_ns;  // GPU clock cycles (not wall-clock ns)
+  long long send_clocks;
+  long long wait_clocks;
 };
 
 extern "C" int run_gpu_bench(
@@ -278,6 +280,19 @@ int main(int argc, char **argv) {
   HLOG(kInfo, "Latency (avg): {} us/op",
        (wall_seconds * 1e6) / (total_ios * ops_multiplier));
   HLOG(kInfo, "==================");
+
+  // Per-block GPU clock breakdown
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Per-block GPU clock breakdown ===");
+  for (int i = 0; i < client_blocks; ++i) {
+    long long total = results[i].elapsed_ns;
+    long long send = results[i].send_clocks;
+    long long wait = results[i].wait_clocks;
+    int send_pct = total > 0 ? static_cast<int>(100 * send / total) : 0;
+    int wait_pct = total > 0 ? static_cast<int>(100 * wait / total) : 0;
+    HLOG(kInfo, "  Block {}: total={} send={} ({}%) wait={} ({}%)",
+         i, total, send, send_pct, wait, wait_pct);
+  }
 
   return 0;
 }

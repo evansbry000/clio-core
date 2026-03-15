@@ -50,9 +50,8 @@
 
 namespace wrp_cte::core {
 
-/** Number of blob lock buckets — must be power of 2 */
-static constexpr int kNumBlobLocks = 8;
-static constexpr int kBlobLockMask = kNumBlobLocks - 1;
+/** Default number of blob map slots (open addressing) */
+static constexpr chi::u32 kDefaultBlobMapCapacity = 4096;
 
 /** FNV-1a hash for chi::priv::string */
 HSHM_GPU_FUN static chi::u32 HashString(const chi::priv::string &s) {
@@ -103,61 +102,156 @@ struct GpuBlobEntry {
 };
 
 /**
- * Per-bucket blob data using chi::priv::vector.
+ * GPU-compatible hash map for blob entries using open addressing.
+ *
+ * Fixed-size slot array with linear probing. Each slot is either empty
+ * (key_.size() == 0) or occupied. Tombstones use a sentinel key.
+ *
+ * Uses a single mutex for simplicity (blob operations are already
+ * fast with O(1) lookup; contention is the rare case).
  */
-struct BlobBucketData {
-  chi::priv::vector<GpuBlobEntry> entries_;
+static constexpr chi::u32 kBlobMapEmpty = 0;
+static constexpr chi::u32 kBlobMapOccupied = 1;
+static constexpr chi::u32 kBlobMapTombstone = 2;
 
-  HSHM_CROSS_FUN BlobBucketData() : entries_(CHI_PRIV_ALLOC) {}
+struct GpuBlobSlot {
+  chi::u32 state_;
+  GpuBlobEntry entry_;
+
+  HSHM_CROSS_FUN GpuBlobSlot()
+      : state_(kBlobMapEmpty), entry_() {}
+
+  HSHM_CROSS_FUN GpuBlobSlot(const GpuBlobSlot &other)
+      : state_(other.state_), entry_(other.entry_) {}
+
+  HSHM_CROSS_FUN GpuBlobSlot &operator=(const GpuBlobSlot &other) {
+    if (this != &other) {
+      state_ = other.state_;
+      entry_ = other.entry_;
+    }
+    return *this;
+  }
+};
+
+struct GpuBlobMap {
+  chi::priv::vector<GpuBlobSlot> slots_;
+  chi::u32 size_;
+  hshm::Mutex lock_;
+
+  HSHM_GPU_FUN GpuBlobMap() : slots_(CHI_PRIV_ALLOC), size_(0) {}
+
+  /** Initialize the map with a given number of slots */
+  HSHM_GPU_FUN void Init(chi::u32 capacity) {
+    size_ = 0;
+    lock_.Init();
+    slots_.resize(capacity);
+  }
+
+  /** Get the lock */
+  HSHM_GPU_FUN hshm::Mutex &Lock(const chi::priv::string &key) {
+    (void)key;
+    return lock_;
+  }
+
+  /** Find a blob entry by key. Returns pointer or nullptr. */
+  HSHM_GPU_FUN GpuBlobEntry *Find(const chi::priv::string &key) {
+    chi::u32 cap = slots_.size();
+    if (cap == 0) return nullptr;
+    chi::u32 h = HashString(key) % cap;
+    for (chi::u32 i = 0; i < cap; ++i) {
+      chi::u32 idx = (h + i) % cap;
+      if (slots_[idx].state_ == kBlobMapEmpty) return nullptr;
+      if (slots_[idx].state_ == kBlobMapOccupied &&
+          slots_[idx].entry_.key_ == key) {
+        return &slots_[idx].entry_;
+      }
+    }
+    return nullptr;
+  }
+
+  /** Insert or find a blob entry. Returns pointer to the entry. */
+  HSHM_GPU_FUN GpuBlobEntry *InsertOrFind(const chi::priv::string &key) {
+    chi::u32 cap = slots_.size();
+    if (cap == 0) return nullptr;
+    chi::u32 h = HashString(key) % cap;
+    chi::u32 first_avail = cap;
+    for (chi::u32 i = 0; i < cap; ++i) {
+      chi::u32 idx = (h + i) % cap;
+      if (slots_[idx].state_ == kBlobMapOccupied &&
+          slots_[idx].entry_.key_ == key) {
+        return &slots_[idx].entry_;
+      }
+      if (slots_[idx].state_ != kBlobMapOccupied && first_avail == cap) {
+        first_avail = idx;
+      }
+      if (slots_[idx].state_ == kBlobMapEmpty) {
+        break;
+      }
+    }
+    if (first_avail >= cap) return nullptr;
+    slots_[first_avail].state_ = kBlobMapOccupied;
+    slots_[first_avail].entry_.key_ = key;
+    ++size_;
+    return &slots_[first_avail].entry_;
+  }
+
+  /** Erase a blob entry by key. Returns true if erased. */
+  HSHM_GPU_FUN bool Erase(const chi::priv::string &key) {
+    chi::u32 cap = slots_.size();
+    if (cap == 0) return false;
+    chi::u32 h = HashString(key) % cap;
+    for (chi::u32 i = 0; i < cap; ++i) {
+      chi::u32 idx = (h + i) % cap;
+      if (slots_[idx].state_ == kBlobMapEmpty) return false;
+      if (slots_[idx].state_ == kBlobMapOccupied &&
+          slots_[idx].entry_.key_ == key) {
+        slots_[idx].state_ = kBlobMapTombstone;
+        slots_[idx].entry_.key_ = chi::priv::string(CHI_PRIV_ALLOC);
+        --size_;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Erase all entries whose key starts with prefix. Returns count erased. */
+  HSHM_GPU_FUN int EraseByPrefix(const chi::priv::string &prefix) {
+    int erased = 0;
+    chi::u32 cap = slots_.size();
+    for (chi::u32 i = 0; i < cap; ++i) {
+      if (slots_[i].state_ != kBlobMapOccupied) continue;
+      const chi::priv::string &key = slots_[i].entry_.key_;
+      bool match = (key.size() >= prefix.size());
+      if (match) {
+        const char *kd = key.data();
+        const char *pd = prefix.data();
+        for (size_t c = 0; c < prefix.size() && match; ++c) {
+          match = (kd[c] == pd[c]);
+        }
+      }
+      if (match) {
+        slots_[i].state_ = kBlobMapTombstone;
+        slots_[i].entry_.key_ = chi::priv::string(CHI_PRIV_ALLOC);
+        --size_;
+        ++erased;
+      }
+    }
+    return erased;
+  }
 };
 
 /**
  * GPU-resident metadata store for CTE Core GpuRuntime.
  * Uses chi::priv data structures backed by ThreadAllocator.
- *
- * Locking strategy:
- *   tag_lock_  — single lock for the tag store
- *   blob_locks_[kNumBlobLocks] — hash-partitioned locks for the blob store
  */
 struct GpuMetadata {
   hshm::Mutex tag_lock_;
-  hshm::Mutex blob_locks_[kNumBlobLocks];
-  BlobBucketData blob_data_[kNumBlobLocks];
+  GpuBlobMap blob_map_;
   chi::priv::vector<TagInfo> tags_;
 
   HSHM_GPU_FUN GpuMetadata() : tags_(CHI_PRIV_ALLOC) {
     tag_lock_.Init();
-    for (int i = 0; i < kNumBlobLocks; ++i) {
-      blob_locks_[i].Init();
-    }
-  }
-
-  /** Get the bucket index for a given compound key */
-  HSHM_GPU_FUN static int BucketIdx(const chi::priv::string &key) {
-    return HashString(key) & kBlobLockMask;
-  }
-
-  /** Get the bucket lock for a given compound key */
-  HSHM_GPU_FUN hshm::Mutex &BlobLock(const chi::priv::string &key) {
-    return blob_locks_[BucketIdx(key)];
-  }
-
-  /** Get the bucket data for a given compound key */
-  HSHM_GPU_FUN BlobBucketData &BlobData(const chi::priv::string &key) {
-    return blob_data_[BucketIdx(key)];
-  }
-
-  /** Lock ALL blob buckets (for operations that scan the entire blob store) */
-  HSHM_GPU_FUN void LockAllBuckets() {
-    for (int i = 0; i < kNumBlobLocks; ++i) {
-      blob_locks_[i].Lock(0);
-    }
-  }
-
-  HSHM_GPU_FUN void UnlockAllBuckets() {
-    for (int i = kNumBlobLocks - 1; i >= 0; --i) {
-      blob_locks_[i].Unlock();
-    }
+    blob_map_.Init(kDefaultBlobMapCapacity);
   }
 };
 
@@ -288,17 +382,8 @@ HSHM_GPU_FUN TagInfo *GpuRuntime::UpsertTag(const chi::priv::string &tag_name,
 }
 
 //==============================================================================
-// Blob bucket operations
+// Blob map operations
 //==============================================================================
-
-/** Find blob entry by compound key in bucket. Returns index or -1. */
-HSHM_GPU_FUN static int FindGpuBlob(BlobBucketData &bdata,
-                                      const chi::priv::string &key) {
-  for (size_t i = 0; i < bdata.entries_.size(); ++i) {
-    if (bdata.entries_[i].key_ == key) return static_cast<int>(i);
-  }
-  return -1;
-}
 
 HSHM_GPU_FUN chi::priv::string GpuRuntime::MakeBlobKey(const TagId &tag_id,
                                                          const chi::priv::string &blob_name) {
@@ -364,7 +449,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
   (void)rctx;
   EnsureMetaInit();
   hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
-  meta_->LockAllBuckets();
 
   TagId tag_id = task->tag_id_;
 
@@ -372,13 +456,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
   if (tag_id.IsNull()) {
     chi::priv::string name(CHI_PRIV_ALLOC, task->tag_name_.data());
     if (name.size() == 0) {
-      meta_->UnlockAllBuckets();
       task->return_code_ = 1;
       co_return;
     }
     TagId *found = FindTagIdByName(name);
     if (found == nullptr) {
-      meta_->UnlockAllBuckets();
       task->return_code_ = 1;
       co_return;
     }
@@ -386,41 +468,13 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
     task->tag_id_ = tag_id;
   }
 
-  // Build prefix "major.minor." for matching
+  // Build prefix "major.minor." for matching and erase all matching blobs
   chi::priv::string prefix = MakeCompoundKey(tag_id, "", 0);
-
-  // Scan all buckets and erase matching blobs
-  for (int b = 0; b < kNumBlobLocks; ++b) {
-    BlobBucketData &bdata = meta_->blob_data_[b];
-    size_t i = 0;
-    while (i < bdata.entries_.size()) {
-      const chi::priv::string &key = bdata.entries_[i].key_;
-      // Check if key starts with prefix
-      bool match = (key.size() >= prefix.size());
-      if (match) {
-        const char *kd = key.data();
-        const char *pd = prefix.data();
-        for (size_t c = 0; c < prefix.size() && match; ++c) {
-          match = (kd[c] == pd[c]);
-        }
-      }
-      if (match) {
-        // Swap with last and decrement
-        size_t last = bdata.entries_.size() - 1;
-        if (i != last) {
-          bdata.entries_[i] = bdata.entries_[last];
-        }
-        bdata.entries_.pop_back();
-      } else {
-        ++i;
-      }
-    }
-  }
+  meta_->blob_map_.EraseByPrefix(prefix);
 
   // Erase tag from tag store
   TagInfo *tag_info = FindTagById(tag_id);
   if (tag_info != nullptr) {
-    // Find index of tag_info in tags_ vector
     size_t tag_idx = tag_info - meta_->tags_.data();
     size_t last = meta_->tags_.size() - 1;
     if (tag_idx != last) {
@@ -429,7 +483,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
     meta_->tags_.pop_back();
   }
 
-  meta_->UnlockAllBuckets();
   task->return_code_ = 0;
   co_return;
 }
@@ -471,21 +524,17 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
 
   // Build compound key and lock the bucket
   chi::priv::string ck = MakeCompoundKey(tag_id, blob_name, blob_name_len);
-  hshm::ScopedMutex blob_guard(meta_->BlobLock(ck), 0);
-  BlobBucketData &bdata = meta_->BlobData(ck);
+  hshm::ScopedMutex blob_guard(meta_->blob_map_.Lock(ck), 0);
 
-  int idx = FindGpuBlob(bdata, ck);
-
-  if (idx < 0) {
+  GpuBlobEntry *entry = meta_->blob_map_.Find(ck);
+  if (entry == nullptr) {
     // Create new blob entry
-    GpuBlobEntry entry;
-    entry.key_ = ck;
-    entry.data_ptr_ = reinterpret_cast<chi::u64>(data_ptr.ptr_);
-    entry.size_ = size;
-    entry.score_ = blob_score;
-    entry.last_modified_ = GetCurrentTimeNs();
-    entry.last_read_ = 0;
-    bdata.entries_.push_back(entry);
+    entry = meta_->blob_map_.InsertOrFind(ck);
+    entry->data_ptr_ = reinterpret_cast<chi::u64>(data_ptr.ptr_);
+    entry->size_ = size;
+    entry->score_ = blob_score;
+    entry->last_modified_ = GetCurrentTimeNs();
+    entry->last_read_ = 0;
 
     // Update tag total_size_
     hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
@@ -493,11 +542,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
     if (tag != nullptr) tag->total_size_ += size;
   } else {
     // Update existing blob
-    chi::u64 old_size = bdata.entries_[idx].size_;
-    bdata.entries_[idx].data_ptr_ = reinterpret_cast<chi::u64>(data_ptr.ptr_);
-    bdata.entries_[idx].size_ = size;
-    bdata.entries_[idx].score_ = blob_score;
-    bdata.entries_[idx].last_modified_ = GetCurrentTimeNs();
+    chi::u64 old_size = entry->size_;
+    entry->data_ptr_ = reinterpret_cast<chi::u64>(data_ptr.ptr_);
+    entry->size_ = size;
+    entry->score_ = blob_score;
+    entry->last_modified_ = GetCurrentTimeNs();
 
     // Update tag total_size_
     hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
@@ -528,25 +577,22 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetBlob(
   if (size == 0 || blob_name_len == 0) { task->return_code_ = 1; co_return; }
 
   chi::priv::string ck = MakeCompoundKey(tag_id, blob_name, blob_name_len);
-  hshm::ScopedMutex blob_guard(meta_->BlobLock(ck), 0);
-  BlobBucketData &bdata = meta_->BlobData(ck);
+  hshm::ScopedMutex blob_guard(meta_->blob_map_.Lock(ck), 0);
 
-  int idx = FindGpuBlob(bdata, ck);
-  if (idx < 0) { task->return_code_ = 1; co_return; }
+  GpuBlobEntry *entry = meta_->blob_map_.Find(ck);
+  if (entry == nullptr) { task->return_code_ = 1; co_return; }
 
   // Resolve output buffer
   auto out_ptr = CHI_IPC->ToFullPtr(task->blob_data_);
   if (out_ptr.IsNull()) { task->return_code_ = 1; co_return; }
-
   // Copy data from blob to output buffer
-  GpuBlobEntry &entry = bdata.entries_[idx];
-  char *src = reinterpret_cast<char *>(entry.data_ptr_) + offset;
+  char *src = reinterpret_cast<char *>(entry->data_ptr_) + offset;
   char *dst = reinterpret_cast<char *>(out_ptr.ptr_);
-  chi::u64 can_read = (offset < entry.size_) ? (entry.size_ - offset) : 0;
+  chi::u64 can_read = (offset < entry->size_) ? (entry->size_ - offset) : 0;
   chi::u64 to_read = (can_read < size) ? can_read : size;
   memcpy(dst, src, to_read);
 
-  entry.last_read_ = GetCurrentTimeNs();
+  entry->last_read_ = GetCurrentTimeNs();
   task->return_code_ = (to_read == size) ? 0 : 1;
   co_return;
 }
@@ -570,13 +616,12 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::ReorganizeBlob(
   }
 
   chi::priv::string ck = MakeCompoundKey(tag_id, blob_name, blob_name_len);
-  hshm::ScopedMutex blob_guard(meta_->BlobLock(ck), 0);
-  BlobBucketData &bdata = meta_->BlobData(ck);
+  hshm::ScopedMutex blob_guard(meta_->blob_map_.Lock(ck), 0);
 
-  int idx = FindGpuBlob(bdata, ck);
-  if (idx < 0) { task->return_code_ = 3; co_return; }
+  GpuBlobEntry *entry = meta_->blob_map_.Find(ck);
+  if (entry == nullptr) { task->return_code_ = 3; co_return; }
 
-  bdata.entries_[idx].score_ = new_score;
+  entry->score_ = new_score;
   task->return_code_ = 0;
   co_return;
 }
@@ -596,20 +641,13 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelBlob(
   if (blob_name_len == 0) { task->return_code_ = 1; co_return; }
 
   chi::priv::string ck = MakeCompoundKey(tag_id, blob_name, blob_name_len);
-  hshm::ScopedMutex blob_guard(meta_->BlobLock(ck), 0);
-  BlobBucketData &bdata = meta_->BlobData(ck);
+  hshm::ScopedMutex blob_guard(meta_->blob_map_.Lock(ck), 0);
 
-  int idx = FindGpuBlob(bdata, ck);
-  if (idx < 0) { task->return_code_ = 1; co_return; }
+  GpuBlobEntry *entry = meta_->blob_map_.Find(ck);
+  if (entry == nullptr) { task->return_code_ = 1; co_return; }
 
-  chi::u64 blob_size = bdata.entries_[idx].size_;
-
-  // Swap with last and pop
-  size_t last = bdata.entries_.size() - 1;
-  if (static_cast<size_t>(idx) != last) {
-    bdata.entries_[idx] = bdata.entries_[last];
-  }
-  bdata.entries_.pop_back();
+  chi::u64 blob_size = entry->size_;
+  meta_->blob_map_.Erase(ck);
 
   // Update tag total_size_
   hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);

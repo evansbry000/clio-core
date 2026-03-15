@@ -71,6 +71,8 @@ struct GpuBenchParams {
 struct GpuBenchResult {
   int status;              // 1=success, negative=error
   long long elapsed_ns;    // Nanoseconds elapsed for this block
+  long long send_clocks;   // Total clocks in AsyncPutBlob/AsyncGetBlob (send side)
+  long long wait_clocks;   // Total clocks in future.Wait() (receive side)
 };
 
 /**
@@ -80,8 +82,6 @@ struct GpuBenchResult {
 __global__ void gpu_bench_kernel(
     chi::IpcManagerGpuInfo gpu_info,
     GpuBenchParams params,
-    char **block_put_buffers,
-    char **block_get_buffers,
     GpuBenchResult *results,
     chi::u32 num_blocks) {
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
@@ -90,54 +90,92 @@ __global__ void gpu_bench_kernel(
 
   int block_id = blockIdx.x;
   GpuBenchResult *my_result = &results[block_id];
-  // Status convention: 0 = not started / in progress, 1 = success, <0 = error.
-  // Do NOT set a non-zero value here — the host polls for status != 0.
 
   wrp_cte::core::Client client(params.pool_id);
 
-  char *put_buf = block_put_buffers[block_id];
-  char *get_buf = block_get_buffers[block_id];
+  // Allocate put/get buffers from GPU device memory
+  auto put_full = CHI_IPC->AllocateDeviceData(params.io_size);
+  if (put_full.IsNull()) { my_result->status = -10; return; }
+  auto get_full = CHI_IPC->AllocateDeviceData(params.io_size);
+  if (get_full.IsNull()) { my_result->status = -11; return; }
+
+  // Fill put buffer with pattern
+  char *put_buf = put_full.ptr_;
+  char *get_buf = get_full.ptr_;
+  memset(put_buf, 0xAB, params.io_size);
+  memset(get_buf, 0x00, params.io_size);
+
+  // Build ShmPtr from the FullPtr (carries allocator ID + offset)
+  hipc::ShmPtr<> put_shm(put_full.shm_);
+  hipc::ShmPtr<> get_shm(get_full.shm_);
+
+  // Build per-block blob name: "blob_0", "blob_1", etc.
+  char blob_name[32];
+  int name_len = 0;
+  const char *prefix = "blob_";
+  for (int i = 0; prefix[i]; ++i) blob_name[name_len++] = prefix[i];
+  // Convert block_id to string digits
+  char digits[16];
+  int num_digits = 0;
+  int tmp = block_id;
+  if (tmp == 0) { digits[num_digits++] = '0'; }
+  else { while (tmp > 0) { digits[num_digits++] = '0' + (tmp % 10); tmp /= 10; } }
+  for (int i = num_digits - 1; i >= 0; --i) blob_name[name_len++] = digits[i];
+  blob_name[name_len] = '\0';
 
   // Use GPU clock for timing
   long long start_clock = clock64();
+  long long total_send = 0, total_wait = 0;
 
   if (params.mode == 0 || params.mode == 2) {
     // Put phase
     for (int i = 0; i < params.io_count; ++i) {
+      long long t0 = clock64();
       auto future = client.AsyncPutBlob(
-          params.tag_id, "blob",
+          params.tag_id, blob_name,
           chi::u64(0), params.io_size,
-          hipc::ShmPtr<>::FromRaw(put_buf), 0.5f,
+          put_shm, 0.5f,
           wrp_cte::core::Context(),
           chi::u32(0),
           chi::PoolQuery::Local());
+      long long t1 = clock64();
+      total_send += (t1 - t0);
       if (future.IsNull()) {
         my_result->status = -2;
         return;
       }
       future.Wait();
+      long long t2 = clock64();
+      total_wait += (t2 - t1);
     }
   }
 
   if (params.mode == 1 || params.mode == 2) {
     // Get phase
     for (int i = 0; i < params.io_count; ++i) {
+      long long t0 = clock64();
       auto future = client.AsyncGetBlob(
-          params.tag_id, "blob",
+          params.tag_id, blob_name,
           chi::u64(0), params.io_size,
           chi::u32(0),
-          hipc::ShmPtr<>::FromRaw(get_buf),
+          get_shm,
           chi::PoolQuery::Local());
+      long long t1 = clock64();
+      total_send += (t1 - t0);
       if (future.IsNull()) {
         my_result->status = -3;
         return;
       }
       future.Wait();
+      long long t2 = clock64();
+      total_wait += (t2 - t1);
     }
   }
 
   long long end_clock = clock64();
   my_result->elapsed_ns = end_clock - start_clock;
+  my_result->send_clocks = total_send;
+  my_result->wait_clocks = total_wait;
   my_result->status = 1;
 }
 
@@ -166,12 +204,16 @@ extern "C" int run_gpu_bench(
     GpuBenchResult *results) {
 
   // Create GPU memory backend for client kernel allocations
-  // Scale with num_blocks: 4 MB per block (min 64 MB)
+  // Backend is split into (num_blocks * num_threads) BuddyAllocator partitions.
+  // Only thread 0 per block allocates, but all threads need a partition.
   hipc::MemoryBackendId backend_id(20, 0);
   hipc::GpuShmMmap gpu_backend;
+  size_t per_thread = std::max(
+      static_cast<size_t>(4) * 1024 * 1024,
+      static_cast<size_t>(8) * io_size);
   size_t backend_size = std::max(
       static_cast<size_t>(64) * 1024 * 1024,
-      static_cast<size_t>(num_blocks) * 4 * 1024 * 1024);
+      static_cast<size_t>(num_blocks * num_threads) * per_thread);
   if (!gpu_backend.shm_init(backend_id, backend_size,
                              "/cte_gpu_bench", 0))
     return -100;
@@ -191,24 +233,6 @@ extern "C" int run_gpu_bench(
   chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
   gpu_info.gpu_heap_backend = gpu_heap;
-
-  // Allocate per-block pinned buffers
-  char **h_put_ptrs = new char*[num_blocks];
-  char **h_get_ptrs = new char*[num_blocks];
-  for (int i = 0; i < num_blocks; ++i) {
-    cudaMallocHost(&h_put_ptrs[i], io_size);
-    cudaMallocHost(&h_get_ptrs[i], io_size);
-    if (!h_put_ptrs[i] || !h_get_ptrs[i]) return -101;
-    memset(h_put_ptrs[i], 0xAB, io_size);
-    memset(h_get_ptrs[i], 0x00, io_size);
-  }
-
-  // Copy pointer arrays to pinned memory (GPU-accessible)
-  char **d_put_ptrs, **d_get_ptrs;
-  cudaMallocHost(&d_put_ptrs, num_blocks * sizeof(char*));
-  cudaMallocHost(&d_get_ptrs, num_blocks * sizeof(char*));
-  memcpy(d_put_ptrs, h_put_ptrs, num_blocks * sizeof(char*));
-  memcpy(d_get_ptrs, h_get_ptrs, num_blocks * sizeof(char*));
 
   // Initialize results
   for (int i = 0; i < num_blocks; ++i) {
@@ -232,15 +256,13 @@ extern "C" int run_gpu_bench(
   void *stream = hshm::GpuApi::CreateStream();
   gpu_bench_kernel<<<num_blocks, num_threads, 0,
       static_cast<cudaStream_t>(stream)>>>(
-      gpu_info, params, d_put_ptrs, d_get_ptrs, results,
+      gpu_info, params, results,
       static_cast<chi::u32>(num_blocks));
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     CHI_IPC->ResumeGpuOrchestrator();
     hshm::GpuApi::DestroyStream(stream);
-    delete[] h_put_ptrs;
-    delete[] h_get_ptrs;
     return -201;
   }
 
@@ -263,9 +285,6 @@ extern "C" int run_gpu_bench(
   }
 
   hshm::GpuApi::DestroyStream(stream);
-  delete[] h_put_ptrs;
-  delete[] h_get_ptrs;
-  // Intentional leak of pinned buffers (cudaFreeHost blocks on persistent kernel)
 
   // Check for errors
   for (int i = 0; i < num_blocks; ++i) {

@@ -396,7 +396,7 @@ class LocalSaveTaskArchive : public LocalLbmBase {
    *
    * @return Reference to buffer containing serialized data
    */
-  const chi::priv::vector<char> &GetData() const { return buffer_; }
+  HSHM_CROSS_FUN const chi::priv::vector<char> &GetData() const { return buffer_; }
 
   /**
    * Move serialized data out of the archive

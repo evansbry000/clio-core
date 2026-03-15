@@ -564,6 +564,10 @@ target_link_libraries(${GPU_CLIENT_PROCESS_TEST_TARGET}
   hshm::cxx                       # HermesShm library
   ${CMAKE_THREAD_LIBS_INIT}       # Threading support
 )
+if(WRP_CORE_ENABLE_CUDA AND WRP_CORE_CLANG_CUDA_PATH)
+  set_property(TARGET ${GPU_CLIENT_PROCESS_TEST_TARGET} APPEND PROPERTY
+    LINK_LIBRARIES "-L${WRP_CORE_CLANG_CUDA_PATH}/lib64;-lcudart")
+endif()
 
 set_target_properties(${GPU_CLIENT_PROCESS_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20

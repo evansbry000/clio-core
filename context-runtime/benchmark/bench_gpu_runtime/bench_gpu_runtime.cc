@@ -182,9 +182,8 @@ static bool CreateBenchPool(const chi::PoolId &pool_id) {
  * @param elapsed_ms  Total elapsed time in ms
  */
 static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
-  // The kernel launches 1 thread per block (only thread 0 does work).
-  // client_threads is unused by the actual kernel launch.
-  chi::u64 num_threads = static_cast<chi::u64>(cfg.client_blocks);  // 1 active thread/block
+  chi::u64 num_threads = static_cast<chi::u64>(cfg.client_blocks) *
+                          static_cast<chi::u64>(cfg.client_threads);
   chi::u64 total_ops = num_threads * static_cast<chi::u64>(cfg.total_tasks);
   double throughput = (total_ops * 1000.0) / elapsed_ms;   // tasks/sec
   double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task per thread
