@@ -129,6 +129,7 @@ class ShmTransport
     meta_buf.reserve(ctx.shm_info_->copy_space_size_.load());
     hshm::ipc::LocalSerialize<CharVec> ar(meta_buf);
     ar(meta);
+    ar.Finalize();
 
     // 2. Transfer serialized size then metadata
     uint32_t meta_len = static_cast<uint32_t>(meta_buf.size());
@@ -217,6 +218,7 @@ class ShmTransport
     meta_buf.reserve(ctx.shm_info_->copy_space_size_.load());
     hshm::ipc::LocalSerialize<CharVec> ar(meta_buf);
     ar(meta);
+    ar.Finalize();
 
     uint32_t meta_len = static_cast<uint32_t>(meta_buf.size());
     WriteTransferDevice(reinterpret_cast<const char*>(&meta_len),
@@ -395,19 +397,30 @@ class ShmTransport
 #else
     // Use volatile reads to bypass GPU L2 cache for cross-device visibility.
     // Copy 8 bytes at a time for performance, then handle remainder.
-    size_t chunks8 = n / 8;
-    if (chunks8 > 0) {
-      const volatile unsigned long long* vsrc8 =
-          reinterpret_cast<const volatile unsigned long long*>(src);
-      unsigned long long* dst8 = reinterpret_cast<unsigned long long*>(dst);
-      for (size_t i = 0; i < chunks8; ++i) {
-        dst8[i] = vsrc8[i];
+    // Both src and dst must be 8-byte aligned for the fast path.
+    bool aligned = ((reinterpret_cast<uintptr_t>(src) % 8) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(dst) % 8) == 0);
+    if (aligned) {
+      size_t chunks8 = n / 8;
+      if (chunks8 > 0) {
+        const volatile unsigned long long* vsrc8 =
+            reinterpret_cast<const volatile unsigned long long*>(src);
+        unsigned long long* dst8 = reinterpret_cast<unsigned long long*>(dst);
+        for (size_t i = 0; i < chunks8; ++i) {
+          dst8[i] = vsrc8[i];
+        }
       }
-    }
-    size_t tail = chunks8 * 8;
-    const volatile char* vsrc = src;
-    for (size_t i = tail; i < n; ++i) {
-      dst[i] = vsrc[i];
+      size_t tail = chunks8 * 8;
+      const volatile char* vsrc = src;
+      for (size_t i = tail; i < n; ++i) {
+        dst[i] = vsrc[i];
+      }
+    } else {
+      // Byte-by-byte fallback for misaligned addresses (e.g., host-mapped mem)
+      const volatile char* vsrc = src;
+      for (size_t i = 0; i < n; ++i) {
+        dst[i] = vsrc[i];
+      }
     }
 #endif
   }

@@ -54,6 +54,7 @@
 #include <chimaera/MOD_NAME/autogen/MOD_NAME_methods.h>
 #include <chimaera/local_task_archives.h>
 #include <wrp_cte/core/core_tasks.h>
+#include <wrp_cte/core/core_client.h>
 #include <hermes_shm/util/gpu_api.h>
 #include <hermes_shm/memory/backend/gpu_shm_mmap.h>
 #include <hermes_shm/memory/backend/gpu_malloc.h>
@@ -1424,6 +1425,241 @@ extern "C" int run_gpu_bench_string_alloc(
   if (sync_err != cudaSuccess) {
     printf("string_alloc kernel error: %s\n", cudaGetErrorString(sync_err));
   }
+
+  cudaFreeHost(d_done);
+  hshm::GpuApi::DestroyStream(stream);
+
+  return completed ? 0 : -4;
+}
+
+// ==========================================================================
+// PutBlob data placement benchmark
+// ==========================================================================
+
+/**
+ * Kernel 1: Initialize a BuddyAllocator over device memory and allocate
+ * a contiguous array of `total_bytes` bytes.  Returns the FullPtr via
+ * pinned host memory so the CPU can read it.
+ */
+__global__ void gpu_putblob_alloc_kernel(
+    hipc::MemoryBackend data_backend,
+    chi::u64 total_bytes,
+    hipc::FullPtr<char> *d_out_ptr) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+  using AllocT = hipc::PrivateBuddyAllocator;
+  auto *alloc = data_backend.MakeAlloc<AllocT>(data_backend.data_capacity_);
+  if (!alloc) {
+    d_out_ptr->SetNull();
+    return;
+  }
+  auto result = alloc->AllocateObjs<char>(total_bytes);
+  *d_out_ptr = result;
+}
+
+/**
+ * Kernel 2: Each warp memsets its slice of A to a constant, then calls
+ * AsyncPutBlob to store that slice as a blob via the CTE runtime.
+ * Only the warp scheduler (lane 0) submits the PutBlob task.
+ */
+__global__ void gpu_putblob_kernel(
+    chi::IpcManagerGpu gpu_info,
+    chi::PoolId cte_pool_id,
+    wrp_cte::core::TagId tag_id,
+    chi::u32 num_blocks,
+    hipc::FullPtr<char> array_ptr,
+    hipc::AllocatorId data_alloc_id,
+    chi::u64 total_bytes,
+    chi::u32 total_warps,
+    bool to_cpu,
+    int *d_done) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
+
+  chi::u32 warp_id = chi::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+
+  if (warp_id < total_warps) {
+    // Compute this warp's slice of the array
+    chi::u64 slice_size = total_bytes / total_warps;
+    chi::u64 my_offset = static_cast<chi::u64>(warp_id) * slice_size;
+    char *my_data = array_ptr.ptr_ + my_offset;
+
+    // All lanes participate in memset
+    for (chi::u64 i = lane_id; i < slice_size; i += 32) {
+      my_data[i] = static_cast<char>(warp_id & 0xFF);
+    }
+    __syncwarp();
+
+    // Only lane 0 submits PutBlob
+    if (chi::IpcManager::IsWarpScheduler()) {
+      wrp_cte::core::Client cte_client(cte_pool_id);
+
+      // Build ShmPtr referencing the data allocator backend
+      hipc::ShmPtr<> blob_shm;
+      blob_shm.alloc_id_ = data_alloc_id;
+      // offset = distance from backend base
+      size_t base_off = array_ptr.shm_.off_.load();
+      blob_shm.off_.exchange(base_off + my_offset);
+
+      // Build blob name: "warp_<id>"
+      char name_buf[32];
+      int pos = 0;
+      name_buf[pos++] = 'w';
+      name_buf[pos++] = '_';
+      chi::u32 wid = warp_id;
+      // Simple itoa
+      char digits[10];
+      int nd = 0;
+      do { digits[nd++] = '0' + (wid % 10); wid /= 10; } while (wid > 0);
+      for (int d = nd - 1; d >= 0; --d) name_buf[pos++] = digits[d];
+      name_buf[pos] = '\0';
+
+      auto future = cte_client.AsyncPutBlob(
+          tag_id, name_buf,
+          /*offset=*/0, /*size=*/slice_size,
+          blob_shm, /*score=*/-1.0f,
+          wrp_cte::core::Context(), /*flags=*/0,
+          to_cpu ? chi::PoolQuery::ToLocalCpu()
+                 : chi::PoolQuery::Local());
+
+      future.Wait();
+    }
+  }
+
+  __syncwarp();
+  if (chi::IpcManager::IsWarpScheduler()) {
+    __threadfence();
+    int prev = atomicAdd(d_done, 1);
+    if (prev == static_cast<int>(total_warps) - 1) {
+      __threadfence_system();
+    }
+  }
+}
+
+/**
+ * CPU-side launcher for the PutBlob data placement benchmark.
+ *
+ * 1. Allocates a device memory backend + BuddyAllocator
+ * 2. Runs alloc kernel to allocate array A
+ * 3. Registers backend with runtime
+ * 4. Creates CTE pool + tag
+ * 5. Launches data placement kernel (memset + PutBlob per warp)
+ */
+extern "C" int run_gpu_bench_putblob(
+    chi::PoolId cte_pool_id,
+    wrp_cte::core::TagId tag_id,
+    chi::u32 rt_blocks,
+    chi::u32 rt_threads,
+    chi::u32 client_blocks,
+    chi::u32 client_threads,
+    chi::u64 total_bytes,
+    bool to_cpu,
+    float *out_elapsed_ms) {
+  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+
+  // Pause GPU orchestrator before any cudaDeviceSynchronize / GPU init.
+  // The orchestrator is a persistent kernel; cudaDeviceSynchronize would block
+  // forever waiting for it.
+  CHI_IPC->PauseGpuOrchestrator();
+
+  // --- 1. Data backend: device memory for array A ---
+  hipc::MemoryBackendId data_backend_id(200, 0);
+  hipc::GpuMalloc data_backend;
+  // Extra space for BuddyAllocator header
+  size_t data_backend_size = total_bytes + 4 * 1024 * 1024;
+  if (!data_backend.shm_init(data_backend_id, data_backend_size, "", 0)) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
+  }
+
+  // --- 2. Client scratch backend (for FutureShm, serialization) ---
+  constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
+  size_t scratch_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
+  hipc::MemoryBackendId scratch_id(201, 0);
+  hipc::GpuMalloc scratch_backend;
+  if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
+  }
+
+  // --- 3. GPU heap backend (for ThreadAllocator) ---
+  constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
+  size_t heap_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
+  hipc::MemoryBackendId heap_id(202, 0);
+  hipc::GpuMalloc heap_backend;
+  if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
+  }
+
+  // --- 4. Run alloc kernel to initialize allocator + allocate A ---
+  hipc::FullPtr<char> *d_array_ptr;
+  cudaMallocHost(&d_array_ptr, sizeof(hipc::FullPtr<char>));
+  d_array_ptr->SetNull();
+
+  gpu_putblob_alloc_kernel<<<1, 1>>>(
+      static_cast<hipc::MemoryBackend &>(data_backend),
+      total_bytes, d_array_ptr);
+  cudaDeviceSynchronize();
+
+  if (d_array_ptr->IsNull()) {
+    cudaFreeHost(d_array_ptr);
+    return -2;
+  }
+
+  hipc::FullPtr<char> array_ptr = *d_array_ptr;
+  cudaFreeHost(d_array_ptr);
+
+  // --- 5. Register data backend with runtime for ShmPtr resolution ---
+  CHI_IPC->RegisterGpuAllocator(data_backend_id, data_backend.data_,
+                                 data_backend.data_capacity_);
+
+  // --- 6. Build GPU info and launch data placement kernel ---
+  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info.backend = scratch_backend;
+  gpu_info.gpu_heap_backend = heap_backend;
+
+  chi::u32 total_warps = (client_blocks * client_threads) / 32;
+  if (total_warps == 0) total_warps = 1;
+
+  int *d_done;
+  cudaMallocHost(&d_done, sizeof(int));
+  *d_done = 0;
+
+  void *stream = hshm::GpuApi::CreateStream();
+
+  // Orchestrator is already paused from function start
+  cudaGetLastError();
+
+  gpu_putblob_kernel<<<
+      client_blocks, client_threads, 0,
+      static_cast<cudaStream_t>(stream)>>>(
+      gpu_info, cte_pool_id, tag_id, client_blocks,
+      array_ptr,
+      hipc::AllocatorId(data_backend_id.major_, data_backend_id.minor_),
+      total_bytes, total_warps, to_cpu, d_done);
+
+  cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    cudaFreeHost(d_done);
+    hshm::GpuApi::DestroyStream(stream);
+    return -3;
+  }
+
+  CHI_IPC->ResumeGpuOrchestrator();
+  auto t_start = std::chrono::high_resolution_clock::now();
+
+  constexpr int kTimeoutUs = 60000000;  // 60s
+  bool completed = PollDone(d_done, static_cast<int>(total_warps), kTimeoutUs);
+
+  auto t_end = std::chrono::high_resolution_clock::now();
+  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          t_end - t_start).count();
+  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
+  hshm::GpuApi::Synchronize(stream);
+  CHI_IPC->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);

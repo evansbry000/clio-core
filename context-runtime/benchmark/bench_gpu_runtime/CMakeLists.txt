@@ -60,12 +60,10 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
   )
 
   target_link_libraries(${BENCH_TARGET}
-    cxx                               # Core Chimaera runtime
+    chimaera::cxx                     # Core Chimaera runtime + admin
     chimaera_cxx_gpu                  # GPU work orchestrator (WorkOrchestrator::Resume)
-    chimaera_admin_runtime            # Admin module runtime
-    chimaera_admin_client             # Admin module client
-    chimaera_MOD_NAME_runtime         # MOD_NAME module runtime (GpuSubmit handler)
     chimaera_MOD_NAME_client          # MOD_NAME module client
+    wrp_cte::core_client              # CTE core client (PutBlob benchmark)
     hshm::cxx                         # HermesShm shared memory framework (CPU)
     hshm::cuda_cxx                    # HermesShm CUDA extensions (GPU kernels)
     ${CMAKE_THREAD_LIBS_INIT}
@@ -98,15 +96,15 @@ else()
   target_include_directories(${BENCH_TARGET} PRIVATE
     ${CHIMAERA_ROOT}/include
     ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/bdev/include
     ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
   )
 
   target_link_libraries(${BENCH_TARGET}
-    cxx
-    chimaera_admin_runtime
-    chimaera_admin_client
-    chimaera_MOD_NAME_runtime
+    chimaera::cxx
     chimaera_MOD_NAME_client
+    wrp_cte::core_client
     hshm::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )

@@ -842,6 +842,11 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // This prevents use-after-free since client may free future_shm after
   // SetComplete()
   auto future_shm = run_ctx->future_.GetFutureShm();
+  if (future_shm.IsNull()) {
+    HLOG(kError, "EndTask: future_shm is NULL for pool={} method={}",
+         task_ptr->pool_id_, task_ptr->method_);
+    return;
+  }
   bool was_copied = future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED);
 
   // Copy parent task pointer before transfer begins (may be modified during

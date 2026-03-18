@@ -51,6 +51,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
 #include <chimaera/MOD_NAME/MOD_NAME_client.h>
+#include <wrp_cte/core/core_client.h>
 #include <hermes_shm/util/logging.h>
 
 #include <chrono>
@@ -94,6 +95,15 @@ extern "C" int run_gpu_bench_serde(chi::PoolId pool_id,
                                     float *out_elapsed_ms);
 extern "C" int run_gpu_bench_string_alloc(chi::u32 total_tasks,
                                            float *out_elapsed_ms);
+extern "C" int run_gpu_bench_putblob(chi::PoolId cte_pool_id,
+                                      wrp_cte::core::TagId tag_id,
+                                      chi::u32 rt_blocks,
+                                      chi::u32 rt_threads,
+                                      chi::u32 client_blocks,
+                                      chi::u32 client_threads,
+                                      chi::u64 total_bytes,
+                                      bool to_cpu,
+                                      float *out_elapsed_ms);
 #else
 extern "C" __attribute__((weak)) int run_gpu_bench_latency(
     chi::PoolId, chi::u32, chi::u32, chi::u32, chi::u32, chi::u32,
@@ -119,10 +129,15 @@ extern "C" __attribute__((weak)) int run_gpu_bench_string_alloc(
     chi::u32, float *) {
   return -200;  // No GPU support compiled
 }
+extern "C" __attribute__((weak)) int run_gpu_bench_putblob(
+    chi::PoolId, wrp_cte::core::TagId, chi::u32, chi::u32,
+    chi::u32, chi::u32, chi::u64, bool, float *) {
+  return -200;  // No GPU support compiled
+}
 #endif
 
 /** Supported benchmark test cases */
-enum class TestCase { kLatency, kCoroutine, kAlloc, kSerde, kStringAlloc };
+enum class TestCase { kLatency, kCoroutine, kAlloc, kSerde, kStringAlloc, kPutBlob, kPutBlobGpu };
 
 /**
  * Configuration for the GPU runtime benchmark.
@@ -137,6 +152,7 @@ struct BenchmarkConfig {
   chi::u32 batch_size = 1;      /**< Tasks per batch per GPU thread */
   chi::u32 total_tasks = 100;   /**< Total tasks per GPU thread */
   chi::u32 subtasks = 1;        /**< Subtasks per coroutine task (coroutine test) */
+  chi::u64 total_bytes = 64 * 1024 * 1024;  /**< Total I/O size in bytes (putblob test) */
 };
 
 /**
@@ -147,7 +163,7 @@ struct BenchmarkConfig {
 static void PrintHelp(const char *prog) {
   HIPRINT("Usage: {} [options]", prog);
   HIPRINT("Options:");
-  HIPRINT("  --test-case <case>     Test case: 'latency', 'coroutine', 'alloc', 'serde', or 'string_alloc' (default: latency)");
+  HIPRINT("  --test-case <case>     Test case: 'latency', 'coroutine', 'alloc', 'serde', 'string_alloc', 'putblob', or 'putblob_gpu' (default: latency)");
   HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
   HIPRINT("  --rt-threads <N>       GPU runtime orchestrator threads/block (default: 32)");
   HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
@@ -155,6 +171,7 @@ static void PrintHelp(const char *prog) {
   HIPRINT("  --batch-size <N>       Tasks per batch per GPU thread (default: 1)");
   HIPRINT("  --total-tasks <N>      Total tasks per GPU thread (default: 100)");
   HIPRINT("  --subtasks <N>         Subtasks per coroutine task (default: 1)");
+  HIPRINT("  --io-size <bytes>      Total I/O size in bytes (putblob test, default: 67108864)");
   HIPRINT("  --help, -h             Show this help");
 }
 
@@ -184,8 +201,12 @@ static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
         cfg.test_case = TestCase::kSerde;
       } else if (tc == "string_alloc") {
         cfg.test_case = TestCase::kStringAlloc;
+      } else if (tc == "putblob") {
+        cfg.test_case = TestCase::kPutBlob;
+      } else if (tc == "putblob_gpu") {
+        cfg.test_case = TestCase::kPutBlobGpu;
       } else {
-        HLOG(kError, "Unknown test case '{}'; use 'latency', 'coroutine', 'alloc', 'serde', or 'string_alloc'", tc);
+        HLOG(kError, "Unknown test case '{}'; use 'latency', 'coroutine', 'alloc', 'serde', 'string_alloc', 'putblob', or 'putblob_gpu'", tc);
         return false;
       }
     } else if (arg == "--rt-blocks" && i + 1 < argc) {
@@ -202,6 +223,8 @@ static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
       cfg.total_tasks = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--subtasks" && i + 1 < argc) {
       cfg.subtasks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--io-size" && i + 1 < argc) {
+      cfg.total_bytes = static_cast<chi::u64>(std::stoull(argv[++i]));
     } else {
       HLOG(kError, "Unknown argument: {}", arg);
       return false;
@@ -245,7 +268,9 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
   const char *tc_name = (cfg.test_case == TestCase::kSerde) ? "serde" :
                          (cfg.test_case == TestCase::kAlloc) ? "alloc" :
                          (cfg.test_case == TestCase::kStringAlloc) ? "string_alloc" :
-                         (cfg.test_case == TestCase::kCoroutine) ? "coroutine" : "latency";
+                         (cfg.test_case == TestCase::kCoroutine) ? "coroutine" :
+                         (cfg.test_case == TestCase::kPutBlobGpu) ? "putblob_gpu" :
+                         (cfg.test_case == TestCase::kPutBlob) ? "putblob" : "latency";
   HIPRINT("\n=== GPU Runtime Benchmark Results ===");
   HIPRINT("Test case:           {}", tc_name);
   HIPRINT("RT blocks:           {}", cfg.rt_blocks);
@@ -256,6 +281,12 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
   HIPRINT("Total tasks/warp:    {}", cfg.total_tasks);
   if (cfg.test_case == TestCase::kCoroutine) {
     HIPRINT("Subtasks/task:       {}", cfg.subtasks);
+  }
+  if (cfg.test_case == TestCase::kPutBlob || cfg.test_case == TestCase::kPutBlobGpu) {
+    HIPRINT("Total I/O size:      {} bytes ({} MB)", cfg.total_bytes,
+            cfg.total_bytes / (1024 * 1024));
+    double bw_gbps = (cfg.total_bytes / 1e9) / (elapsed_ms / 1e3);
+    printf("Bandwidth:           %.3f GB/s\n", bw_gbps);
   }
   HIPRINT("GPU client warps:    {}", num_warps);
   HIPRINT("Total task ops:      {}", total_ops);
@@ -279,12 +310,14 @@ static int RunBenchmark(const BenchmarkConfig &cfg) {
   return 1;
 #endif
 
-  // Initialize Chimaera in server mode (starts GPU work orchestrator)
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer)) {
-    HLOG(kError, "Failed to initialize Chimaera server");
+  // Initialize Chimaera in client mode with runtime
+  // (matches CTE benchmark pattern — kClient + env CHI_WITH_RUNTIME=1)
+  HIPRINT("Initializing Chimaera runtime...");
+  setenv("CHI_WITH_RUNTIME", "1", 1);
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient)) {
+    HLOG(kError, "Failed to initialize Chimaera");
     return 1;
   }
-
   const chi::PoolId pool_id(9000, 0);
   float elapsed_ms = 0.0f;
   int rc;
@@ -305,6 +338,30 @@ static int RunBenchmark(const BenchmarkConfig &cfg) {
                                 cfg.client_blocks, cfg.client_threads,
                                 cfg.total_tasks, &elapsed_ms);
     }
+  } else if (cfg.test_case == TestCase::kPutBlob ||
+             cfg.test_case == TestCase::kPutBlobGpu) {
+    // Use the cte_main pool from compose config (PoolId 512,0)
+    std::this_thread::sleep_for(500ms);
+
+    const chi::PoolId cte_pool_id(512, 0);
+    wrp_cte::core::Client cte_client(cte_pool_id);
+
+    // Create tag using the compose pool
+    auto tag_task = cte_client.AsyncGetOrCreateTag("gpu_bench_tag");
+    tag_task.Wait();
+    if (tag_task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to create CTE tag (rc={})", tag_task->GetReturnCode());
+      chi::CHIMAERA_FINALIZE();
+      return 1;
+    }
+    wrp_cte::core::TagId tag_id = tag_task->tag_id_;
+
+    bool to_cpu = (cfg.test_case == TestCase::kPutBlob);
+    std::this_thread::sleep_for(200ms);
+    rc = run_gpu_bench_putblob(cte_pool_id, tag_id,
+                                cfg.rt_blocks, cfg.rt_threads,
+                                cfg.client_blocks, cfg.client_threads,
+                                cfg.total_bytes, to_cpu, &elapsed_ms);
   } else {
     // Runtime tests need pool + orchestrator stabilization
     std::this_thread::sleep_for(500ms);

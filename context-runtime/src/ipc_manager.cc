@@ -2516,6 +2516,9 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     // If container is plugged or gone, add to retry queue
     if (result == RouteResult::Retry || result == RouteResult::Dne) {
       Worker *worker = CHI_CUR_WORKER;
+      HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
+           (int)result, task_ptr->pool_id_, task_ptr->method_,
+           worker ? (int)worker->GetId() : -1);
       if (worker && task_ptr->run_ctx_) {
         worker->AddToRetryQueue(task_ptr->run_ctx_.get());
       }
@@ -2598,9 +2601,12 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
       pool_manager->GetContainer(task_ptr->pool_id_, container_id, is_plugged);
 
   if (!exec_container) {
+    HLOG(kError, "RouteLocal: Container not found for pool={} container_id={} method={}",
+         task_ptr->pool_id_, container_id, task_ptr->method_);
     return RouteResult::Dne;
   }
   if (is_plugged) {
+    HLOG(kWarning, "RouteLocal: Container plugged for pool={}", task_ptr->pool_id_);
     return RouteResult::Retry;
   }
 

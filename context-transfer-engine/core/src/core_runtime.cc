@@ -700,49 +700,37 @@ chi::TaskResume Runtime::GetOrCreateTag(
     chi::u32 local_node_id = ipc_manager->GetNodeId();
 
     // Check if this is a returning task from a remote canonical node
-    // If preferred_id is already set and not local, we're receiving a remote
-    // tag
     bool is_remote_tag =
         (preferred_id.major_ != 0 && preferred_id.major_ != local_node_id);
 
     if (is_remote_tag) {
-      // Non-canonical node: Only cache the name→TagId mapping
       chi::ScopedCoRwWriteLock write_lock(tag_map_lock_);
-
-      // Check if already cached
       TagId *existing_tag_id_ptr = tag_name_to_id_.find(tag_name);
       if (existing_tag_id_ptr == nullptr) {
-        // Cache the mapping without creating TagInfo
         tag_name_to_id_.insert_or_assign(tag_name, preferred_id);
       }
-
       task->tag_id_ = preferred_id;
       task->return_code_ = 0;
       co_return;
     }
 
-    // Canonical node: Create full TagInfo structure
     TagId tag_id = GetOrAssignTagId(tag_name, preferred_id);
     task->tag_id_ = tag_id;
 
-    // Update timestamp and log telemetry
     auto now = GetCurrentTimeNs();
     {
       chi::ScopedCoRwWriteLock write_lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
       if (tag_info_ptr != nullptr) {
-        // Update read timestamp
         tag_info_ptr->last_read_ = now;
-
-        // Log telemetry for GetOrCreateTag operation
         LogTelemetry(CteOp::kGetOrCreateTag, 0, 0, tag_id,
                      tag_info_ptr->last_modified_, now);
       }
     }
-
-    task->return_code_ = 0;  // Success
+    task->return_code_ = 0;
 
   } catch (const std::exception &e) {
+    HLOG(kError, "GetOrCreateTag: Exception: {}", e.what());
     task->return_code_ = 1;
   }
   co_return;

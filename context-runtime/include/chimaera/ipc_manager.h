@@ -1976,9 +1976,6 @@ class IpcManager {
     auto &lane = cpu2gpu_queues_[gpu_id].ptr_->GetLane(0, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
     lane.Push(task_future);
-    HLOG(kInfo, "SendToGpu: pushed task pool={}.{} method={} to gpu={}",
-         task_ptr->pool_id_.major_, task_ptr->pool_id_.minor_,
-         task_ptr->method_, gpu_id);
 
     return future;
 #else
