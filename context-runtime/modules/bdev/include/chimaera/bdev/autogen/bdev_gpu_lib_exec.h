@@ -115,3 +115,37 @@ HSHM_GPU_FUN void LocalSaveTask(
     default: break;
   }
 }
+
+HSHM_GPU_FUN void LocalLoadTaskOutput(
+    chi::u32 method, chi::LocalLoadTaskArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override {
+  archive.SetMsgType(chi::LocalMsgType::kSerializeOut);
+  switch (method) {
+    case Method::kUpdate: {
+      auto typed = task.template Cast<UpdateTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kAllocateBlocks: {
+      auto typed = task.template Cast<AllocateBlocksTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kFreeBlocks: {
+      auto typed = task.template Cast<FreeBlocksTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kWrite: {
+      auto typed = task.template Cast<WriteTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kRead: {
+      auto typed = task.template Cast<ReadTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    default: break;
+  }
+}

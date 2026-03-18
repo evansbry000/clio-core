@@ -39,8 +39,7 @@
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
 #if HSHM_IS_HOST
 #include <yaml-cpp/yaml.h>
-#include <cereal/types/string.hpp>
-#include <cereal/types/unordered_map.hpp>
+#include "hermes_shm/data_structures/serialization/global_serialize.h"
 #include <unordered_map>
 #endif
 #include <cstring>
@@ -70,7 +69,7 @@ struct CreateParams {
   // Default constructor
   CreateParams() = default;
 
-  // Serialization support for cereal
+  // Serialization support
   template <class Archive>
   void serialize(Archive &ar) {
     // No additional fields to serialize for admin
@@ -1164,7 +1163,7 @@ class TaskBatch {
   size_t GetTaskCount() const { return task_infos_.size(); }
 
   /**
-   * Serialize for cereal
+   * Serialize
    * @tparam Archive Archive type
    * @param ar Archive instance
    */

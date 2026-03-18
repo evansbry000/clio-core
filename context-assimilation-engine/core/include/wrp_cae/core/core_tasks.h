@@ -39,9 +39,7 @@
 #include <wrp_cae/core/autogen/core_methods.h>
 #include <wrp_cae/core/factory/assimilation_ctx.h>
 
-#include <cereal/archives/binary.hpp>
-#include <cereal/types/vector.hpp>
-#include <sstream>
+#include "hermes_shm/data_structures/serialization/global_serialize.h"
 #include <vector>
 
 namespace wrp_cae::core {
@@ -62,7 +60,7 @@ struct CreateParams {
   // Copy constructor (for BaseCreateTask)
   CreateParams(const CreateParams &other) {}
 
-  // Serialization support for cereal
+  // Serialization support
   template <class Archive>
   void serialize(Archive &ar) {
     // No members to serialize
@@ -116,13 +114,14 @@ struct ParseOmniTask : public chi::Task {
     task_flags_.Clear();
     pool_query_ = pool_query;
 
-    // Serialize the vector of contexts transparently using cereal
-    std::stringstream ss;
+    // Serialize the vector of contexts using GlobalSerialize
+    std::vector<char> buf;
     {
-      cereal::BinaryOutputArchive ar(ss);
+      hshm::ipc::GlobalSerialize<std::vector<char>> ar(buf);
       ar(contexts);
+      ar.Finalize();
     }
-    serialized_ctx_ = chi::priv::string(HSHM_MALLOC, ss.str());
+    serialized_ctx_ = chi::priv::string(HSHM_MALLOC, std::string(buf.begin(), buf.end()));
   }
 
   /**

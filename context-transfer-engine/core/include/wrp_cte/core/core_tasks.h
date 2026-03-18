@@ -43,10 +43,12 @@
 #include <chimaera/bdev/bdev_tasks.h>
 // Include bdev client for TargetInfo
 #include <chimaera/bdev/bdev_client.h>
+// Include mutex for BlobInfo prealloc_lock_
+#include <hermes_shm/thread/lock/mutex.h>
 #if HSHM_IS_HOST
 #include <yaml-cpp/yaml.h>
-#include <cereal/archives/binary.hpp>
-#include <cereal/cereal.hpp>
+
+#include <hermes_shm/data_structures/serialization/global_serialize.h>
 #include <chrono>
 #endif
 
@@ -167,8 +169,8 @@ using DestroyTask = chimaera::admin::DestroyTask;
  * Target information structure
  */
 struct TargetInfo {
-  std::string target_name_;
-  std::string bdev_pool_name_;
+  chi::priv::string target_name_;
+  chi::priv::string bdev_pool_name_;
   chimaera::bdev::Client bdev_client_;  // Bdev client for this target
   chi::PoolQuery target_query_;         // Target pool query for bdev API calls
   chi::u64 bytes_read_;
@@ -178,17 +180,63 @@ struct TargetInfo {
   float target_score_;        // Target score (0-1, normalized log bandwidth)
   chi::u64 remaining_space_;  // Remaining allocatable space in bytes
   chimaera::bdev::PerfMetrics perf_metrics_;  // Performance metrics from bdev
-  chimaera::bdev::PersistenceLevel persistence_level_ = chimaera::bdev::PersistenceLevel::kVolatile;
+  chimaera::bdev::PersistenceLevel persistence_level_;
 
-  TargetInfo() = default;
-
-  explicit TargetInfo(int /*unused*/)
-      : bytes_read_(0),
+  HSHM_CROSS_FUN TargetInfo()
+      : target_name_(CHI_PRIV_ALLOC),
+        bdev_pool_name_(CHI_PRIV_ALLOC),
+        bytes_read_(0),
         bytes_written_(0),
         ops_read_(0),
         ops_written_(0),
         target_score_(0.0f),
-        remaining_space_(0) {}
+        remaining_space_(0),
+        persistence_level_(chimaera::bdev::PersistenceLevel::kVolatile) {}
+
+#if HSHM_IS_HOST
+  TargetInfo(const std::string &name, const std::string &bdev_name)
+      : target_name_(CHI_PRIV_ALLOC, name),
+        bdev_pool_name_(CHI_PRIV_ALLOC, bdev_name),
+        bytes_read_(0),
+        bytes_written_(0),
+        ops_read_(0),
+        ops_written_(0),
+        target_score_(0.0f),
+        remaining_space_(0),
+        persistence_level_(chimaera::bdev::PersistenceLevel::kVolatile) {}
+#endif
+
+  HSHM_CROSS_FUN TargetInfo(const TargetInfo &other)
+      : target_name_(other.target_name_),
+        bdev_pool_name_(other.bdev_pool_name_),
+        bdev_client_(other.bdev_client_),
+        target_query_(other.target_query_),
+        bytes_read_(other.bytes_read_),
+        bytes_written_(other.bytes_written_),
+        ops_read_(other.ops_read_),
+        ops_written_(other.ops_written_),
+        target_score_(other.target_score_),
+        remaining_space_(other.remaining_space_),
+        perf_metrics_(other.perf_metrics_),
+        persistence_level_(other.persistence_level_) {}
+
+  HSHM_CROSS_FUN TargetInfo &operator=(const TargetInfo &other) {
+    if (this != &other) {
+      target_name_ = other.target_name_;
+      bdev_pool_name_ = other.bdev_pool_name_;
+      bdev_client_ = other.bdev_client_;
+      target_query_ = other.target_query_;
+      bytes_read_ = other.bytes_read_;
+      bytes_written_ = other.bytes_written_;
+      ops_read_ = other.ops_read_;
+      ops_written_ = other.ops_written_;
+      target_score_ = other.target_score_;
+      remaining_space_ = other.remaining_space_;
+      perf_metrics_ = other.perf_metrics_;
+      persistence_level_ = other.persistence_level_;
+    }
+    return *this;
+  }
 };
 
 /**
@@ -204,7 +252,7 @@ struct RegisterTargetTask : public chi::Task {
   IN chi::PoolId bdev_id_;          // PoolId to create for the underlying bdev
 
   // SHM constructor
-  RegisterTargetTask()
+  HSHM_CROSS_FUN RegisterTargetTask()
       : chi::Task(),
         target_name_(CHI_PRIV_ALLOC),
         bdev_type_(chimaera::bdev::BdevType::kFile),
@@ -284,9 +332,9 @@ struct UnregisterTargetTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit UnregisterTargetTask(const chi::TaskId &task_id,
-                                const chi::PoolId &pool_id,
-                                const chi::PoolQuery &pool_query,
-                                const std::string &target_name)
+                                               const chi::PoolId &pool_id,
+                                               const chi::PoolQuery &pool_query,
+                                               const std::string &target_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kUnregisterTarget),
         target_name_(CHI_PRIV_ALLOC, target_name) {
     task_id_ = task_id;
@@ -345,8 +393,8 @@ struct ListTargetsTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit ListTargetsTask(const chi::TaskId &task_id,
-                           const chi::PoolId &pool_id,
-                           const chi::PoolQuery &pool_query)
+                                          const chi::PoolId &pool_id,
+                                          const chi::PoolQuery &pool_query)
       : chi::Task(task_id, pool_id, pool_query, Method::kListTargets) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -404,8 +452,8 @@ struct StatTargetsTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit StatTargetsTask(const chi::TaskId &task_id,
-                           const chi::PoolId &pool_id,
-                           const chi::PoolQuery &pool_query)
+                                          const chi::PoolId &pool_id,
+                                          const chi::PoolQuery &pool_query)
       : chi::Task(task_id, pool_id, pool_query, Method::kStatTargets) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -478,9 +526,9 @@ struct GetTargetInfoTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit GetTargetInfoTask(const chi::TaskId &task_id,
-                             const chi::PoolId &pool_id,
-                             const chi::PoolQuery &pool_query,
-                             const std::string &target_name)
+                                            const chi::PoolId &pool_id,
+                                            const chi::PoolQuery &pool_query,
+                                            const std::string &target_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetTargetInfo),
         target_name_(CHI_PRIV_ALLOC, target_name),
         target_score_(0.0f),
@@ -566,7 +614,8 @@ namespace wrp_cte::core {
 struct TagInfo {
   chi::priv::string tag_name_;
   TagId tag_id_;
-  chi::u64 total_size_;  // Total size of all blobs in this tag (non-atomic for GPU)
+  chi::u64
+      total_size_;  // Total size of all blobs in this tag (non-atomic for GPU)
   Timestamp last_modified_;
   Timestamp last_read_;
 
@@ -622,10 +671,11 @@ struct BlobBlock {
   chi::u64 target_offset_;  // Offset within target where this block is stored
   chi::u64 size_;           // Size of this block in bytes
 
-  BlobBlock() = default;
+  HSHM_CROSS_FUN BlobBlock() : target_offset_(0), size_(0) {}
 
-  BlobBlock(const chimaera::bdev::Client &client,
-            const chi::PoolQuery &target_query, chi::u64 offset, chi::u64 size)
+  HSHM_CROSS_FUN BlobBlock(const chimaera::bdev::Client &client,
+                           const chi::PoolQuery &target_query, chi::u64 offset,
+                           chi::u64 size)
       : bdev_client_(client),
         target_query_(target_query),
         target_offset_(offset),
@@ -641,9 +691,13 @@ struct BlobInfo {
   float score_;  // 0-1 score for reorganization
   Timestamp last_modified_;
   Timestamp last_read_;
-  int compress_lib_;     // Compression library ID used for this blob (0 = no compression)
+  int compress_lib_;     // Compression library ID used for this blob (0 = no
+                         // compression)
   int compress_preset_;  // Compression preset used (1=FAST, 2=BALANCED, 3=BEST)
-  chi::u64 trace_key_;   // Unique trace ID for linking to trace logs (0 = not traced)
+  chi::u64
+      trace_key_;  // Unique trace ID for linking to trace logs (0 = not traced)
+  chi::u64 preallocated_size_;  // Total preallocated capacity in bytes
+  hshm::Mutex prealloc_lock_;   // Mutex for preallocation
 
   HSHM_CROSS_FUN BlobInfo()
       : blob_name_(CHI_PRIV_ALLOC),
@@ -653,7 +707,10 @@ struct BlobInfo {
         last_read_(0),
         compress_lib_(0),
         compress_preset_(2),
-        trace_key_(0) {}
+        trace_key_(0),
+        preallocated_size_(0) {
+    prealloc_lock_.Init();
+  }
 
   HSHM_CROSS_FUN BlobInfo(const chi::priv::string &blob_name, float score)
       : blob_name_(blob_name),
@@ -663,7 +720,10 @@ struct BlobInfo {
         last_read_(0),
         compress_lib_(0),
         compress_preset_(2),
-        trace_key_(0) {}
+        trace_key_(0),
+        preallocated_size_(0) {
+    prealloc_lock_.Init();
+  }
 
 #if HSHM_IS_HOST
   BlobInfo(const std::string &blob_name, float score)
@@ -674,7 +734,10 @@ struct BlobInfo {
         last_read_(GetCurrentTimeNs()),
         compress_lib_(0),
         compress_preset_(2),
-        trace_key_(0) {}
+        trace_key_(0),
+        preallocated_size_(0) {
+    prealloc_lock_.Init();
+  }
 #endif
 
   HSHM_CROSS_FUN BlobInfo(const BlobInfo &other)
@@ -685,7 +748,10 @@ struct BlobInfo {
         last_read_(other.last_read_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
-        trace_key_(other.trace_key_) {}
+        trace_key_(other.trace_key_),
+        preallocated_size_(other.preallocated_size_) {
+    prealloc_lock_.Init();
+  }
 
   HSHM_CROSS_FUN BlobInfo &operator=(const BlobInfo &other) {
     if (this != &other) {
@@ -697,6 +763,7 @@ struct BlobInfo {
       compress_lib_ = other.compress_lib_;
       compress_preset_ = other.compress_preset_;
       trace_key_ = other.trace_key_;
+      preallocated_size_ = other.preallocated_size_;
     }
     return *this;
   }
@@ -715,6 +782,15 @@ struct BlobInfo {
  * Provides metadata for compression decision-making
  */
 struct Context {
+  int persistence_target_;     // Specific persistence level to target (-1 = use
+                               // min_persistence_level_)
+  int min_persistence_level_;  // 0=volatile,
+                               //   1=temp-nonvolatile, 2=long-term
+
+  chi::u64 preallocate_;  // Preallocate this many bytes for GPU block storage
+                          // (0 = disabled)
+
+#ifdef WRP_CTE_ENABLE_COMPRESSION
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -723,15 +799,14 @@ struct Context {
                           // infinity)
   int psnr_chance_;       // The chance PSNR will be validated (default 100%)
   bool max_performance_;  // Compression objective (performance vs ratio)
-  int consumer_node_;     // The node where consumer will access data (-1 for
-                          // unknown)
-  int data_type_;         // The type of data (e.g., float, char, int, double)
-  bool trace_;            // Enable tracing for this operation
-  chi::u64 trace_key_;    // Unique trace ID for this Put operation
-  int trace_node_;        // Node ID where trace was initiated
-  int min_persistence_level_;  // 0=volatile, 1=temp-nonvolatile, 2=long-term
-  int persistence_target_;     // Specific persistence level to target (-1 = use min_persistence_level_)
 
+  int consumer_node_;   // The node where consumer will access data (-1 for
+                        // unknown)
+  int data_type_;       // The type of data (e.g., float, char, int, double)
+  bool trace_;          // Enable tracing for this operation
+  chi::u64 trace_key_;  // Unique trace ID for this Put operation
+  int trace_node_;      // Node ID where trace was initiated
+                        //
   // Dynamic statistics (populated after compression)
   chi::u64 actual_original_size_;    // Original data size in bytes
   chi::u64 actual_compressed_size_;  // Actual size after compression in bytes
@@ -739,9 +814,15 @@ struct Context {
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
   double actual_psnr_db_;  // Actual PSNR for lossy compression (0 if lossless)
+#endif
 
   HSHM_CROSS_FUN Context()
-      : dynamic_compress_(0),
+      : persistence_target_(-1),
+        min_persistence_level_(0),
+        preallocate_(0)
+#ifdef WRP_CTE_ENABLE_COMPRESSION
+        ,
+        dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
         target_psnr_(0),
@@ -752,21 +833,31 @@ struct Context {
         trace_(false),
         trace_key_(0),
         trace_node_(-1),
-        min_persistence_level_(0),
-        persistence_target_(-1),
         actual_original_size_(0),
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
-        actual_psnr_db_(0.0) {}
+        actual_psnr_db_(0.0)
+#endif
+  {
+  }
 
   template <class Archive>
   HSHM_CROSS_FUN void serialize(Archive &ar) {
-    ar(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
-       psnr_chance_, max_performance_, consumer_node_, data_type_, trace_,
-       trace_key_, trace_node_, min_persistence_level_, persistence_target_,
-       actual_original_size_, actual_compressed_size_,
-       actual_compression_ratio_, actual_compress_time_ms_, actual_psnr_db_);
+    ar.range(persistence_target_, min_persistence_level_, preallocate_);
+#ifdef WRP_CTE_ENABLE_COMPRESSION
+    ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
+             psnr_chance_, max_performance_, consumer_node_, data_type_,
+             trace_, trace_key_, trace_node_, actual_original_size_,
+             actual_compressed_size_, actual_compression_ratio_,
+             actual_compress_time_ms_, actual_psnr_db_);
+#endif
+  }
+
+  HSHM_CROSS_FUN static Context Preallocate(chi::u64 size) {
+    Context ctx;
+    ctx.preallocate_ = size;
+    return ctx;
   }
 };
 
@@ -837,11 +928,10 @@ struct GetOrCreateTagTask : public chi::Task {
       : chi::Task(), tag_name_(CHI_PRIV_ALLOC), tag_id_(TagId::GetNull()) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit GetOrCreateTagTask(const chi::TaskId &task_id,
-                              const chi::PoolId &pool_id,
-                              const chi::PoolQuery &pool_query,
-                              const std::string &tag_name,
-                              const TagId &tag_id = TagId::GetNull())
+  HSHM_CROSS_FUN explicit GetOrCreateTagTask(
+      const chi::TaskId &task_id, const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query, const std::string &tag_name,
+      const TagId &tag_id = TagId::GetNull())
       : chi::Task(task_id, pool_id, pool_query, Method::kGetOrCreateTag),
         tag_name_(CHI_PRIV_ALLOC, tag_name),
         tag_id_(tag_id) {
@@ -919,11 +1009,14 @@ struct PutBlobTask : public chi::Task {
         flags_(0) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit PutBlobTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                       const chi::PoolQuery &pool_query, const TagId &tag_id,
-                       const std::string &blob_name, chi::u64 offset,
-                       chi::u64 size, hipc::ShmPtr<> blob_data, float score,
-                       const Context &context, chi::u32 flags)
+  HSHM_CROSS_FUN explicit PutBlobTask(const chi::TaskId &task_id,
+                                      const chi::PoolId &pool_id,
+                                      const chi::PoolQuery &pool_query,
+                                      const TagId &tag_id,
+                                      const std::string &blob_name,
+                                      chi::u64 offset, chi::u64 size,
+                                      hipc::ShmPtr<> blob_data, float score,
+                                      const Context &context, chi::u32 flags)
       : chi::Task(task_id, pool_id, pool_query, Method::kPutBlob),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -941,11 +1034,14 @@ struct PutBlobTask : public chi::Task {
   }
 
   // GPU-compatible emplace constructor (const char* instead of std::string)
-  HSHM_CROSS_FUN explicit PutBlobTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                       const chi::PoolQuery &pool_query, const TagId &tag_id,
-                       const char *blob_name, chi::u64 offset,
-                       chi::u64 size, hipc::ShmPtr<> blob_data, float score,
-                       const Context &context, chi::u32 flags)
+  HSHM_CROSS_FUN explicit PutBlobTask(const chi::TaskId &task_id,
+                                      const chi::PoolId &pool_id,
+                                      const chi::PoolQuery &pool_query,
+                                      const TagId &tag_id,
+                                      const char *blob_name, chi::u64 offset,
+                                      chi::u64 size, hipc::ShmPtr<> blob_data,
+                                      float score, const Context &context,
+                                      chi::u32 flags)
       : chi::Task(task_id, pool_id, pool_query, Method::kPutBlob),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -968,8 +1064,10 @@ struct PutBlobTask : public chi::Task {
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, offset_, size_, score_, context_, flags_);
-    // Use BULK_XFER to transfer blob data from client to runtime
+    ar.range(tag_id_);          // UniqueId (8 bytes)
+    ar(blob_name_);             // string (non-POD, serialize individually)
+    ar.range(offset_, size_);   // u64 + u64 (16 bytes, contiguous)
+    ar.range(score_, context_, flags_);  // float + Context + u32 (contiguous)
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
@@ -979,8 +1077,8 @@ struct PutBlobTask : public chi::Task {
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(blob_name_, context_);
-    // No bulk transfer needed for PutBlob output (metadata only)
+    ar(blob_name_);       // string (non-POD)
+    ar.range(context_);   // Context (contiguous POD)
   }
 
   /**
@@ -1032,10 +1130,13 @@ struct GetBlobTask : public chi::Task {
         blob_data_(hipc::ShmPtr<>::GetNull()) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit GetBlobTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                       const chi::PoolQuery &pool_query, const TagId &tag_id,
-                       const std::string &blob_name, chi::u64 offset,
-                       chi::u64 size, chi::u32 flags, hipc::ShmPtr<> blob_data)
+  HSHM_CROSS_FUN explicit GetBlobTask(const chi::TaskId &task_id,
+                                      const chi::PoolId &pool_id,
+                                      const chi::PoolQuery &pool_query,
+                                      const TagId &tag_id,
+                                      const std::string &blob_name,
+                                      chi::u64 offset, chi::u64 size,
+                                      chi::u32 flags, hipc::ShmPtr<> blob_data)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -1051,10 +1152,13 @@ struct GetBlobTask : public chi::Task {
   }
 
   // GPU-compatible emplace constructor (const char* instead of std::string)
-  HSHM_CROSS_FUN explicit GetBlobTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                       const chi::PoolQuery &pool_query, const TagId &tag_id,
-                       const char *blob_name, chi::u64 offset,
-                       chi::u64 size, chi::u32 flags, hipc::ShmPtr<> blob_data)
+  HSHM_CROSS_FUN explicit GetBlobTask(const chi::TaskId &task_id,
+                                      const chi::PoolId &pool_id,
+                                      const chi::PoolQuery &pool_query,
+                                      const TagId &tag_id,
+                                      const char *blob_name, chi::u64 offset,
+                                      chi::u64 size, chi::u32 flags,
+                                      hipc::ShmPtr<> blob_data)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -1132,10 +1236,11 @@ struct ReorganizeBlobTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit ReorganizeBlobTask(const chi::TaskId &task_id,
-                              const chi::PoolId &pool_id,
-                              const chi::PoolQuery &pool_query,
-                              const TagId &tag_id, const std::string &blob_name,
-                              float new_score)
+                                             const chi::PoolId &pool_id,
+                                             const chi::PoolQuery &pool_query,
+                                             const TagId &tag_id,
+                                             const std::string &blob_name,
+                                             float new_score)
       : chi::Task(task_id, pool_id, pool_query, Method::kReorganizeBlob),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -1198,9 +1303,11 @@ struct DelBlobTask : public chi::Task {
       : chi::Task(), tag_id_(TagId::GetNull()), blob_name_(CHI_PRIV_ALLOC) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit DelBlobTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                       const chi::PoolQuery &pool_query, const TagId &tag_id,
-                       const std::string &blob_name)
+  HSHM_CROSS_FUN explicit DelBlobTask(const chi::TaskId &task_id,
+                                      const chi::PoolId &pool_id,
+                                      const chi::PoolQuery &pool_query,
+                                      const TagId &tag_id,
+                                      const std::string &blob_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kDelBlob),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name) {
@@ -1262,8 +1369,10 @@ struct DelTagTask : public chi::Task {
       : chi::Task(), tag_id_(TagId::GetNull()), tag_name_(CHI_PRIV_ALLOC) {}
 
   // Emplace constructor with tag ID
-  HSHM_CROSS_FUN explicit DelTagTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                      const chi::PoolQuery &pool_query, const TagId &tag_id)
+  HSHM_CROSS_FUN explicit DelTagTask(const chi::TaskId &task_id,
+                                     const chi::PoolId &pool_id,
+                                     const chi::PoolQuery &pool_query,
+                                     const TagId &tag_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kDelTag),
         tag_id_(tag_id),
         tag_name_(CHI_PRIV_ALLOC) {
@@ -1275,9 +1384,10 @@ struct DelTagTask : public chi::Task {
   }
 
   // Emplace constructor with tag name
-  HSHM_CROSS_FUN explicit DelTagTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                      const chi::PoolQuery &pool_query,
-                      const std::string &tag_name)
+  HSHM_CROSS_FUN explicit DelTagTask(const chi::TaskId &task_id,
+                                     const chi::PoolId &pool_id,
+                                     const chi::PoolQuery &pool_query,
+                                     const std::string &tag_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kDelTag),
         tag_id_(TagId::GetNull()),
         tag_name_(CHI_PRIV_ALLOC, tag_name) {
@@ -1338,8 +1448,9 @@ struct GetTagSizeTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit GetTagSizeTask(const chi::TaskId &task_id,
-                          const chi::PoolId &pool_id,
-                          const chi::PoolQuery &pool_query, const TagId &tag_id)
+                                         const chi::PoolId &pool_id,
+                                         const chi::PoolQuery &pool_query,
+                                         const TagId &tag_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetTagSize),
         tag_id_(tag_id),
         tag_size_(0) {
@@ -1405,10 +1516,9 @@ struct PollTelemetryLogTask : public chi::Task {
         entries_(CHI_PRIV_ALLOC) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit PollTelemetryLogTask(const chi::TaskId &task_id,
-                                const chi::PoolId &pool_id,
-                                const chi::PoolQuery &pool_query,
-                                std::uint64_t minimum_logical_time)
+  HSHM_CROSS_FUN explicit PollTelemetryLogTask(
+      const chi::TaskId &task_id, const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query, std::uint64_t minimum_logical_time)
       : chi::Task(task_id, pool_id, pool_query, Method::kPollTelemetryLog),
         minimum_logical_time_(minimum_logical_time),
         last_logical_time_(0),
@@ -1476,9 +1586,10 @@ struct GetBlobScoreTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit GetBlobScoreTask(const chi::TaskId &task_id,
-                            const chi::PoolId &pool_id,
-                            const chi::PoolQuery &pool_query,
-                            const TagId &tag_id, const std::string &blob_name)
+                                           const chi::PoolId &pool_id,
+                                           const chi::PoolQuery &pool_query,
+                                           const TagId &tag_id,
+                                           const std::string &blob_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetBlobScore),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -1546,9 +1657,10 @@ struct GetBlobSizeTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit GetBlobSizeTask(const chi::TaskId &task_id,
-                           const chi::PoolId &pool_id,
-                           const chi::PoolQuery &pool_query,
-                           const TagId &tag_id, const std::string &blob_name)
+                                          const chi::PoolId &pool_id,
+                                          const chi::PoolQuery &pool_query,
+                                          const TagId &tag_id,
+                                          const std::string &blob_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetBlobSize),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -1645,9 +1757,10 @@ struct GetBlobInfoTask : public chi::Task {
 
   // Emplace constructor
   HSHM_CROSS_FUN explicit GetBlobInfoTask(const chi::TaskId &task_id,
-                           const chi::PoolId &pool_id,
-                           const chi::PoolQuery &pool_query,
-                           const TagId &tag_id, const std::string &blob_name)
+                                          const chi::PoolId &pool_id,
+                                          const chi::PoolQuery &pool_query,
+                                          const TagId &tag_id,
+                                          const std::string &blob_name)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetBlobInfo),
         tag_id_(tag_id),
         blob_name_(CHI_PRIV_ALLOC, blob_name),
@@ -1711,10 +1824,9 @@ struct GetContainedBlobsTask : public chi::Task {
   GetContainedBlobsTask() : chi::Task(), tag_id_(TagId::GetNull()) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit GetContainedBlobsTask(const chi::TaskId &task_id,
-                                 const chi::PoolId &pool_id,
-                                 const chi::PoolQuery &pool_query,
-                                 const TagId &tag_id)
+  HSHM_CROSS_FUN explicit GetContainedBlobsTask(
+      const chi::TaskId &task_id, const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query, const TagId &tag_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetContainedBlobs),
         tag_id_(tag_id) {
     task_id_ = task_id;
@@ -1789,9 +1901,11 @@ struct TagQueryTask : public chi::Task {
         total_tags_matched_(0) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit TagQueryTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                        const chi::PoolQuery &pool_query,
-                        const std::string &tag_regex, chi::u32 max_tags = 0)
+  HSHM_CROSS_FUN explicit TagQueryTask(const chi::TaskId &task_id,
+                                       const chi::PoolId &pool_id,
+                                       const chi::PoolQuery &pool_query,
+                                       const std::string &tag_regex,
+                                       chi::u32 max_tags = 0)
       : chi::Task(task_id, pool_id, pool_query, Method::kTagQuery),
         tag_regex_(CHI_PRIV_ALLOC, tag_regex),
         max_tags_(max_tags),
@@ -1878,10 +1992,12 @@ struct BlobQueryTask : public chi::Task {
         total_blobs_matched_(0) {}
 
   // Emplace constructor
-  HSHM_CROSS_FUN explicit BlobQueryTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                         const chi::PoolQuery &pool_query,
-                         const std::string &tag_regex,
-                         const std::string &blob_regex, chi::u32 max_blobs = 0)
+  HSHM_CROSS_FUN explicit BlobQueryTask(const chi::TaskId &task_id,
+                                        const chi::PoolId &pool_id,
+                                        const chi::PoolQuery &pool_query,
+                                        const std::string &tag_regex,
+                                        const std::string &blob_regex,
+                                        chi::u32 max_blobs = 0)
       : chi::Task(task_id, pool_id, pool_query, Method::kBlobQuery),
         tag_regex_(CHI_PRIV_ALLOC, tag_regex),
         blob_regex_(CHI_PRIV_ALLOC, blob_regex),
@@ -1947,7 +2063,8 @@ struct BlobQueryTask : public chi::Task {
 };
 
 /**
- * FlushMetadataTask - Periodic task to flush tag/blob metadata to durable storage
+ * FlushMetadataTask - Periodic task to flush tag/blob metadata to durable
+ * storage
  */
 struct FlushMetadataTask : public chi::Task {
   OUT chi::u64 entries_flushed_;
@@ -1957,8 +2074,8 @@ struct FlushMetadataTask : public chi::Task {
 
   /** Emplace constructor */
   HSHM_CROSS_FUN explicit FlushMetadataTask(const chi::TaskId &task_node,
-                             const chi::PoolId &pool_id,
-                             const chi::PoolQuery &pool_query)
+                                            const chi::PoolId &pool_id,
+                                            const chi::PoolQuery &pool_query)
       : chi::Task(task_node, pool_id, pool_query, Method::kFlushMetadata),
         entries_flushed_(0) {
     task_id_ = task_node;
@@ -1991,7 +2108,8 @@ struct FlushMetadataTask : public chi::Task {
 };
 
 /**
- * FlushDataTask - Periodic task to flush data from volatile to non-volatile targets
+ * FlushDataTask - Periodic task to flush data from volatile to non-volatile
+ * targets
  */
 struct FlushDataTask : public chi::Task {
   IN int target_persistence_level_;
@@ -2007,9 +2125,9 @@ struct FlushDataTask : public chi::Task {
 
   /** Emplace constructor */
   HSHM_CROSS_FUN explicit FlushDataTask(const chi::TaskId &task_node,
-                         const chi::PoolId &pool_id,
-                         const chi::PoolQuery &pool_query,
-                         int target_persistence_level = 1)
+                                        const chi::PoolId &pool_id,
+                                        const chi::PoolQuery &pool_query,
+                                        int target_persistence_level = 1)
       : chi::Task(task_node, pool_id, pool_query, Method::kFlushData),
         target_persistence_level_(target_persistence_level),
         bytes_flushed_(0),

@@ -74,16 +74,54 @@ extern "C" int run_gpu_bench_latency(chi::PoolId pool_id,
                                       chi::u32 batch_size,
                                       chi::u32 total_tasks,
                                       float *out_elapsed_ms);
+extern "C" int run_gpu_bench_coroutine(chi::PoolId pool_id,
+                                        chi::u32 rt_blocks,
+                                        chi::u32 rt_threads,
+                                        chi::u32 client_blocks,
+                                        chi::u32 client_threads,
+                                        chi::u32 total_tasks,
+                                        float *out_elapsed_ms);
+extern "C" int run_gpu_bench_alloc(chi::PoolId pool_id,
+                                    chi::u32 client_blocks,
+                                    chi::u32 client_threads,
+                                    chi::u32 total_tasks,
+                                    float *out_elapsed_ms);
+extern "C" int run_gpu_bench_serde(chi::PoolId pool_id,
+                                    chi::u32 client_blocks,
+                                    chi::u32 client_threads,
+                                    chi::u32 total_tasks,
+                                    float *out_elapsed_ms);
+extern "C" int run_gpu_bench_string_alloc(chi::u32 total_tasks,
+                                           float *out_elapsed_ms);
 #else
 extern "C" __attribute__((weak)) int run_gpu_bench_latency(
     chi::PoolId, chi::u32, chi::u32, chi::u32, chi::u32, chi::u32,
     chi::u32, chi::u32, float *) {
   return -200;  // No GPU support compiled
 }
+extern "C" __attribute__((weak)) int run_gpu_bench_coroutine(
+    chi::PoolId, chi::u32, chi::u32, chi::u32, chi::u32,
+    chi::u32, float *) {
+  return -200;  // No GPU support compiled
+}
+extern "C" __attribute__((weak)) int run_gpu_bench_alloc(
+    chi::PoolId, chi::u32, chi::u32,
+    chi::u32, float *) {
+  return -200;  // No GPU support compiled
+}
+extern "C" __attribute__((weak)) int run_gpu_bench_serde(
+    chi::PoolId, chi::u32, chi::u32,
+    chi::u32, float *) {
+  return -200;  // No GPU support compiled
+}
+extern "C" __attribute__((weak)) int run_gpu_bench_string_alloc(
+    chi::u32, float *) {
+  return -200;  // No GPU support compiled
+}
 #endif
 
 /** Supported benchmark test cases */
-enum class TestCase { kLatency };
+enum class TestCase { kLatency, kCoroutine, kAlloc, kSerde, kStringAlloc };
 
 /**
  * Configuration for the GPU runtime benchmark.
@@ -107,7 +145,7 @@ struct BenchmarkConfig {
 static void PrintHelp(const char *prog) {
   HIPRINT("Usage: {} [options]", prog);
   HIPRINT("Options:");
-  HIPRINT("  --test-case <case>     Test case (only 'latency' accepted; default: latency)");
+  HIPRINT("  --test-case <case>     Test case: 'latency', 'coroutine', 'alloc', 'serde', or 'string_alloc' (default: latency)");
   HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
   HIPRINT("  --rt-threads <N>       GPU runtime orchestrator threads/block (default: 32)");
   HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
@@ -133,8 +171,18 @@ static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
       return false;
     } else if (arg == "--test-case" && i + 1 < argc) {
       std::string tc = argv[++i];
-      if (tc != "latency") {
-        HLOG(kError, "Only 'latency' test case is supported; got '{}'", tc);
+      if (tc == "latency") {
+        cfg.test_case = TestCase::kLatency;
+      } else if (tc == "coroutine") {
+        cfg.test_case = TestCase::kCoroutine;
+      } else if (tc == "alloc") {
+        cfg.test_case = TestCase::kAlloc;
+      } else if (tc == "serde") {
+        cfg.test_case = TestCase::kSerde;
+      } else if (tc == "string_alloc") {
+        cfg.test_case = TestCase::kStringAlloc;
+      } else {
+        HLOG(kError, "Unknown test case '{}'; use 'latency', 'coroutine', 'alloc', 'serde', or 'string_alloc'", tc);
         return false;
       }
     } else if (arg == "--rt-blocks" && i + 1 < argc) {
@@ -188,8 +236,12 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
   double throughput = (total_ops * 1000.0) / elapsed_ms;   // tasks/sec
   double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task per thread
 
+  const char *tc_name = (cfg.test_case == TestCase::kSerde) ? "serde" :
+                         (cfg.test_case == TestCase::kAlloc) ? "alloc" :
+                         (cfg.test_case == TestCase::kStringAlloc) ? "string_alloc" :
+                         (cfg.test_case == TestCase::kCoroutine) ? "coroutine" : "latency";
   HIPRINT("\n=== GPU Runtime Benchmark Results ===");
-  HIPRINT("Test case:           latency");
+  HIPRINT("Test case:           {}", tc_name);
   HIPRINT("RT blocks:           {}", cfg.rt_blocks);
   HIPRINT("RT threads/block:    {}", cfg.rt_threads);
   HIPRINT("Client blocks:       {}", cfg.client_blocks);
@@ -223,24 +275,50 @@ static int RunBenchmark(const BenchmarkConfig &cfg) {
     HLOG(kError, "Failed to initialize Chimaera server");
     return 1;
   }
-  // Allow runtime to stabilize before issuing tasks
-  std::this_thread::sleep_for(500ms);
 
   const chi::PoolId pool_id(9000, 0);
-  if (!CreateBenchPool(pool_id)) {
-    chi::CHIMAERA_FINALIZE();
-    return 1;
-  }
-  // Wait for pool registration to propagate to the GPU orchestrator
-  std::this_thread::sleep_for(200ms);
-
-  const chi::u32 method_id = chimaera::MOD_NAME::Method::kGpuSubmit;
   float elapsed_ms = 0.0f;
-  int rc = run_gpu_bench_latency(pool_id, method_id,
+  int rc;
+
+  if (cfg.test_case == TestCase::kStringAlloc) {
+    // String alloc test doesn't need Chimaera runtime at all
+    CHI_IPC->PauseGpuOrchestrator();
+    rc = run_gpu_bench_string_alloc(cfg.total_tasks, &elapsed_ms);
+  } else if (cfg.test_case == TestCase::kSerde || cfg.test_case == TestCase::kAlloc) {
+    // Client-only tests: kill the orchestrator immediately, no pool needed
+    CHI_IPC->PauseGpuOrchestrator();
+    if (cfg.test_case == TestCase::kSerde) {
+      rc = run_gpu_bench_serde(pool_id,
+                                cfg.client_blocks, cfg.client_threads,
+                                cfg.total_tasks, &elapsed_ms);
+    } else {
+      rc = run_gpu_bench_alloc(pool_id,
+                                cfg.client_blocks, cfg.client_threads,
+                                cfg.total_tasks, &elapsed_ms);
+    }
+  } else {
+    // Runtime tests need pool + orchestrator stabilization
+    std::this_thread::sleep_for(500ms);
+    if (!CreateBenchPool(pool_id)) {
+      chi::CHIMAERA_FINALIZE();
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    if (cfg.test_case == TestCase::kCoroutine) {
+      rc = run_gpu_bench_coroutine(pool_id,
+                                    cfg.rt_blocks, cfg.rt_threads,
+                                    cfg.client_blocks, cfg.client_threads,
+                                    cfg.total_tasks, &elapsed_ms);
+    } else {
+      const chi::u32 method_id = chimaera::MOD_NAME::Method::kGpuSubmit;
+      rc = run_gpu_bench_latency(pool_id, method_id,
                                   cfg.rt_blocks, cfg.rt_threads,
                                   cfg.client_blocks, cfg.client_threads,
                                   cfg.batch_size, cfg.total_tasks,
                                   &elapsed_ms);
+    }
+  }
   chi::CHIMAERA_FINALIZE();
 
   if (rc != 0) {

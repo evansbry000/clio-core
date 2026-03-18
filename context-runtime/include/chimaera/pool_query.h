@@ -403,7 +403,8 @@ class PoolQuery {
    */
   template <class Archive>
   HSHM_CROSS_FUN void serialize(Archive& ar) {
-    ar(routing_mode_, hash_value_, container_id_, range_offset_, range_count_, node_id_, ret_node_, net_timeout_);
+    ar.range(routing_mode_, hash_value_, container_id_, range_offset_,
+             range_count_, node_id_, ret_node_, net_timeout_);
   }
 
  private:

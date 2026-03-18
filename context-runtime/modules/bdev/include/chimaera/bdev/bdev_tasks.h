@@ -92,7 +92,7 @@ struct PerfMetrics {
   double write_latency_us_;      // Average write latency in microseconds
   double iops_;                  // I/O operations per second
 
-  PerfMetrics()
+  HSHM_CROSS_FUN PerfMetrics()
       : read_bandwidth_mbps_(0.0),
         write_bandwidth_mbps_(0.0),
         read_latency_us_(0.0),
@@ -101,7 +101,7 @@ struct PerfMetrics {
 
   // Cereal serialization
   template <class Archive>
-  void serialize(Archive &ar) {
+  HSHM_CROSS_FUN void serialize(Archive &ar) {
     ar(read_bandwidth_mbps_, write_bandwidth_mbps_, read_latency_us_,
        write_latency_us_, iops_);
   }
@@ -300,16 +300,10 @@ struct AllocateBlocksTask : public chi::Task {
   HSHM_CROSS_FUN AllocateBlocksTask() : chi::Task(), size_(0), blocks_(CHI_PRIV_ALLOC) {}
 
   /** Emplace constructor */
-  explicit AllocateBlocksTask(const chi::TaskId &task_node,
+  HSHM_CROSS_FUN explicit AllocateBlocksTask(const chi::TaskId &task_node,
                               const chi::PoolId &pool_id,
                               const chi::PoolQuery &pool_query, chi::u64 size)
-      : chi::Task(task_node, pool_id, pool_query, 10), size_(size), blocks_(CHI_PRIV_ALLOC) {
-    // Initialize task
-    task_id_ = task_node;
-    pool_id_ = pool_id;
-    method_ = Method::kAllocateBlocks;
-    task_flags_.Clear();
-    pool_query_ = pool_query;
+      : chi::Task(task_node, pool_id, pool_query, Method::kAllocateBlocks), size_(size), blocks_(CHI_PRIV_ALLOC) {
   }
 
   /** Serialize IN and INOUT parameters */
@@ -421,31 +415,27 @@ struct WriteTask : public chi::Task {
   HSHM_CROSS_FUN WriteTask() : chi::Task(), blocks_(CHI_PRIV_ALLOC), length_(0), bytes_written_(0) {}
 
   /** Emplace constructor */
-  explicit WriteTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  HSHM_CROSS_FUN explicit WriteTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                      const chi::PoolQuery &pool_query,
                      const chi::priv::vector<Block> &blocks, hipc::ShmPtr<> data,
                      size_t length)
-      : chi::Task(task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, Method::kWrite),
         blocks_(blocks),
         data_(data),
         length_(length),
         bytes_written_(0) {
-    // Initialize task
-    task_id_ = task_node;
-    pool_id_ = pool_id;
-    method_ = Method::kWrite;
-    task_flags_.Clear();
-    pool_query_ = pool_query;
   }
 
   /** Destructor - free buffer if TASK_DATA_OWNER is set */
-  ~WriteTask() {
+  HSHM_CROSS_FUN ~WriteTask() {
+#if HSHM_IS_HOST
     if (task_flags_.Any(TASK_DATA_OWNER) && !data_.IsNull()) {
       auto *ipc_manager = CHI_IPC;
       if (ipc_manager) {
         ipc_manager->FreeBuffer(data_.Cast<char>());
       }
     }
+#endif
   }
 
   /** Serialize IN and INOUT parameters */
@@ -501,31 +491,27 @@ struct ReadTask : public chi::Task {
   HSHM_CROSS_FUN ReadTask() : chi::Task(), blocks_(CHI_PRIV_ALLOC), length_(0), bytes_read_(0) {}
 
   /** Emplace constructor */
-  explicit ReadTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  HSHM_CROSS_FUN explicit ReadTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
                     const chi::priv::vector<Block> &blocks, hipc::ShmPtr<> data,
                     size_t length)
-      : chi::Task(task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, Method::kRead),
         blocks_(blocks),
         data_(data),
         length_(length),
         bytes_read_(0) {
-    // Initialize task
-    task_id_ = task_node;
-    pool_id_ = pool_id;
-    method_ = Method::kRead;
-    task_flags_.Clear();
-    pool_query_ = pool_query;
   }
 
   /** Destructor - free buffer if TASK_DATA_OWNER is set */
-  ~ReadTask() {
+  HSHM_CROSS_FUN ~ReadTask() {
+#if HSHM_IS_HOST
     if (task_flags_.Any(TASK_DATA_OWNER) && !data_.IsNull()) {
       auto *ipc_manager = CHI_IPC;
       if (ipc_manager) {
         ipc_manager->FreeBuffer(data_.Cast<char>());
       }
     }
+#endif
   }
 
   /** Serialize IN and INOUT parameters */

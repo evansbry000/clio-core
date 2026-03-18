@@ -49,7 +49,7 @@ namespace chimaera::bdev {
 
 class Client : public chi::ContainerClient {
  public:
-  Client() = default;
+  HSHM_CROSS_FUN Client() = default;
   explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
 
   /**
@@ -92,8 +92,11 @@ class Client : public chi::ContainerClient {
 
   /**
    * Allocate data blocks - asynchronous
+   * @param pool_query Pool query for routing
+   * @param size Requested total size to allocate
+   * @return Future for the allocation task
    */
-  chi::Future<AllocateBlocksTask> AsyncAllocateBlocks(
+  HSHM_CROSS_FUN chi::Future<AllocateBlocksTask> AsyncAllocateBlocks(
       const chi::PoolQuery& pool_query,
       chi::u64 size) {
     auto* ipc_manager = CHI_IPC;
@@ -121,8 +124,13 @@ class Client : public chi::ContainerClient {
 
   /**
    * Write data to blocks - asynchronous
+   * @param pool_query Pool query for routing
+   * @param blocks Blocks to write to
+   * @param data ShmPtr to data buffer
+   * @param length Size of data to write
+   * @return Future for the write task
    */
-  chi::Future<chimaera::bdev::WriteTask> AsyncWrite(
+  HSHM_CROSS_FUN chi::Future<chimaera::bdev::WriteTask> AsyncWrite(
       const chi::PoolQuery& pool_query,
       const chi::priv::vector<Block>& blocks, hipc::ShmPtr<> data, size_t length) {
     auto* ipc_manager = CHI_IPC;
@@ -135,8 +143,13 @@ class Client : public chi::ContainerClient {
 
   /**
    * Read data from blocks - asynchronous
+   * @param pool_query Pool query for routing
+   * @param blocks Blocks to read from
+   * @param data ShmPtr to output data buffer
+   * @param buffer_size Size of the output buffer
+   * @return Future for the read task
    */
-  chi::Future<chimaera::bdev::ReadTask> AsyncRead(
+  HSHM_CROSS_FUN chi::Future<chimaera::bdev::ReadTask> AsyncRead(
       const chi::PoolQuery& pool_query,
       const chi::priv::vector<Block>& blocks, hipc::ShmPtr<> data,
       size_t buffer_size) {

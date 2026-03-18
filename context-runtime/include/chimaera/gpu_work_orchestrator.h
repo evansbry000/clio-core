@@ -54,6 +54,24 @@ namespace gpu {
 struct WorkOrchestratorControl {
   volatile int exit_flag;
   volatile int running_flag;
+
+  /** Debug state written by GPU workers, readable from CPU (pinned memory) */
+  static constexpr int kMaxDebugWorkers = 32;
+  volatile unsigned long long dbg_poll_count[kMaxDebugWorkers];
+  volatile unsigned int dbg_num_suspended[kMaxDebugWorkers];
+  volatile unsigned int dbg_last_method[kMaxDebugWorkers];
+  /** Last state: 0=idle, 1=popped_task, 2=dispatched, 3=suspended, 4=resumed, 5=completed */
+  volatile unsigned int dbg_last_state[kMaxDebugWorkers];
+  volatile unsigned long long dbg_resume_checks[kMaxDebugWorkers];
+  /** Debug: total_written_ after SerializeAndComplete for last task */
+  volatile unsigned long long dbg_ser_total_written[kMaxDebugWorkers];
+  /** Debug: method_id of last serialized task */
+  volatile unsigned int dbg_ser_method[kMaxDebugWorkers];
+  /** Debug: step within DispatchTask (10=enter, 11=lbm_ctx, 12=pre_recv, ...) */
+  volatile unsigned int dbg_dispatch_step[kMaxDebugWorkers];
+  /** Debug: input ring buffer values */
+  volatile unsigned long long dbg_input_tw[kMaxDebugWorkers];
+  volatile unsigned long long dbg_input_cs[kMaxDebugWorkers];
 };
 
 /**

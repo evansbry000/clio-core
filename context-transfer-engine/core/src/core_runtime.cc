@@ -198,6 +198,10 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
       chimaera::bdev::BdevType bdev_type = chimaera::bdev::BdevType::kFile;
       if (device.bdev_type_ == "ram") {
         bdev_type = chimaera::bdev::BdevType::kRam;
+      } else if (device.bdev_type_ == "hbm") {
+        bdev_type = chimaera::bdev::BdevType::kHbm;
+      } else if (device.bdev_type_ == "pinned") {
+        bdev_type = chimaera::bdev::BdevType::kPinned;
       }
 
       // Iterate over neighborhood nodes (container hashes from 0 to
@@ -490,12 +494,9 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     remaining_size = stats_task->remaining_size_;
 
     // Create target info with bdev client and performance stats
-    // Use default constructor (allocator not used in struct)
-    TargetInfo target_info;
+    TargetInfo target_info(target_name, bdev_pool_name);
     HLOG(kDebug, "RegisterTarget: Before move, bdev_client.pool_id_=({},{})",
          bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
-    target_info.target_name_ = target_name;
-    target_info.bdev_pool_name_ = bdev_pool_name;
     target_info.bdev_client_ = std::move(bdev_client);
     HLOG(
         kDebug,
@@ -603,7 +604,7 @@ chi::TaskResume Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
     task->target_names_.reserve(registered_targets_.size());
     registered_targets_.for_each(
         [&task](const chi::PoolId &target_id, const TargetInfo &target_info) {
-          task->target_names_.push_back(target_info.target_name_);
+          task->target_names_.push_back(target_info.target_name_.str());
         });
 
     task->return_code_ = 0;  // Success
@@ -660,7 +661,7 @@ chi::TaskResume Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
           target_info->remaining_space_ = remaining_size;
 
           float manual_score =
-              GetManualScoreForTarget(target_info->target_name_);
+              GetManualScoreForTarget(target_info->target_name_.str());
           if (manual_score >= 0.0f) {
             target_info->target_score_ = manual_score;
           } else {
@@ -888,11 +889,13 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
       co_return;
     }
 
+#ifdef WRP_CTE_ENABLE_COMPRESSION
     // Update compression metadata
     Context &context = task->context_;
     blob_info_ptr->compress_lib_ = context.compress_lib_;
     blob_info_ptr->compress_preset_ = context.compress_preset_;
     blob_info_ptr->trace_key_ = context.trace_key_;
+#endif
 
     // Update tag size
     chi::u64 new_blob_size = blob_info_ptr->GetTotalSize();
@@ -2542,7 +2545,7 @@ chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
   HLOG(kDebug,
        "AllocateFromTarget: ENTER - target_name={}, "
        "bdev_client_.pool_id_=({},{}), size={}, remaining_space={}",
-       target_info.target_name_, target_info.bdev_client_.pool_id_.major_,
+       target_info.target_name_.data(), target_info.bdev_client_.pool_id_.major_,
        target_info.bdev_client_.pool_id_.minor_, size,
        target_info.remaining_space_);
 

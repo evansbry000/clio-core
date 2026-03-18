@@ -711,15 +711,12 @@ TEST_CASE("Vector: large capacity growth", "[priv_vector][stress]") {
 }
 
 // ============================================================================
-// Serialization Tests (Cereal)
+// Serialization Tests (GlobalSerialize)
 // ============================================================================
 
-#ifdef HSHM_ENABLE_CEREAL
-#include <cereal/archives/binary.hpp>
-#include <cereal/types/string.hpp>
-#include <sstream>
+#include "hermes_shm/data_structures/serialization/global_serialize.h"
 
-// Define a simple struct with cereal serialization for testing
+// Define a simple struct with serialization for testing
 struct Point {
   int x;
   int y;
@@ -738,19 +735,17 @@ TEST_CASE("Vector: serialize POD type (int)", "[priv_vector][serialization]") {
   vector<int, SimpleHeapAllocator> original({1, 2, 3, 4, 5}, &g_allocator);
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<int, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == original.size());
@@ -767,19 +762,17 @@ TEST_CASE("Vector: serialize POD type (double)", "[priv_vector][serialization]")
   }
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<double, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == original.size());
@@ -792,19 +785,17 @@ TEST_CASE("Vector: serialize empty vector", "[priv_vector][serialization]") {
   vector<int, SimpleHeapAllocator> original(&g_allocator);
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<int, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == 0);
@@ -818,19 +809,17 @@ TEST_CASE("Vector: serialize complex type (std::string)", "[priv_vector][seriali
   original.push_back("test");
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<std::string, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == original.size());
@@ -847,19 +836,17 @@ TEST_CASE("Vector: serialize large vector", "[priv_vector][serialization]") {
   }
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<int, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == original.size());
@@ -874,19 +861,17 @@ TEST_CASE("Vector: serialize single element", "[priv_vector][serialization]") {
   original.push_back(42);
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<int, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == 1);
@@ -900,19 +885,17 @@ TEST_CASE("Vector: serialize struct type", "[priv_vector][serialization]") {
   original.push_back({5, 6});
 
   // Serialize
-  std::ostringstream os(std::ios::binary);
-  {
-    cereal::BinaryOutputArchive oarchive(os);
-    oarchive(original);
-  }
+  std::vector<char> buf;
+  hshm::ipc::GlobalSerialize<std::vector<char>> oarchive(buf);
+  oarchive(original);
+  oarchive.Finalize();
+  std::string result(buf.begin(), buf.end());
 
   // Deserialize
   vector<Point, SimpleHeapAllocator> restored(&g_allocator);
-  std::istringstream is(os.str(), std::ios::binary);
-  {
-    cereal::BinaryInputArchive iarchive(is);
-    iarchive(restored);
-  }
+  std::vector<char> ibuf(result.begin(), result.end());
+  hshm::ipc::GlobalDeserialize<std::vector<char>> iarchive(ibuf);
+  iarchive(restored);
 
   // Verify
   REQUIRE(restored.size() == original.size());
@@ -921,8 +904,6 @@ TEST_CASE("Vector: serialize struct type", "[priv_vector][serialization]") {
     REQUIRE(restored[i] == original[i]);
   }
 }
-
-#endif  // HSHM_ENABLE_CEREAL
 
 // ============================================================================
 // LocalSerialize Tests

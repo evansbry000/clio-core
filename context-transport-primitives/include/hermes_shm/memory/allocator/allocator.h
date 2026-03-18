@@ -59,6 +59,9 @@ using AllocatorId = MemoryBackendId;
 
 class Allocator;
 
+/** Memory mode: shared (offset-based) or private (raw-pointer, cached base) */
+enum class MemMode { kShared, kPrivate };
+
 /** ShmPtr type base */
 class ShmPointer {};
 
@@ -1067,6 +1070,66 @@ struct FullPtr : public ShmPointer {
 };
 
 /**
+ * Arena state for bump-allocation within an allocator-owned block.
+ * Stored inside the allocator; pushed/popped as a stack.
+ */
+struct ArenaState {
+  size_t arena_off_ = 0;   /**< Offset of arena block (relative to backend base) */
+  size_t arena_cur_ = 0;   /**< Current bump position within arena */
+  size_t arena_end_ = 0;   /**< End of arena block */
+
+  HSHM_INLINE_CROSS_FUN bool IsActive() const { return arena_off_ != 0; }
+};
+
+/**
+ * RAII arena handle. Calls PopArena on destruction.
+ *
+ * @tparam AllocT Allocator type (e.g. BuddyAllocator)
+ */
+template <typename AllocT>
+struct Arena {
+  AllocT *alloc_;
+  ArenaState prior_;       /**< Previous arena state to restore on pop */
+  OffsetPtr<> alloc_off_;  /**< Offset of the block to free on pop */
+
+  HSHM_CROSS_FUN Arena() : alloc_(nullptr) {}
+  HSHM_CROSS_FUN Arena(AllocT *alloc, ArenaState prior, OffsetPtr<> alloc_off)
+      : alloc_(alloc), prior_(prior), alloc_off_(alloc_off) {}
+
+  // Move-only
+  HSHM_CROSS_FUN Arena(Arena &&o) noexcept
+      : alloc_(o.alloc_), prior_(o.prior_), alloc_off_(o.alloc_off_) {
+    o.alloc_ = nullptr;
+  }
+  HSHM_CROSS_FUN Arena &operator=(Arena &&o) noexcept {
+    if (this != &o) {
+      if (alloc_) alloc_->PopArena(*this);
+      alloc_ = o.alloc_;
+      prior_ = o.prior_;
+      alloc_off_ = o.alloc_off_;
+      o.alloc_ = nullptr;
+    }
+    return *this;
+  }
+  Arena(const Arena &) = delete;
+  Arena &operator=(const Arena &) = delete;
+
+  /** Explicitly pop the arena and disarm the RAII destructor. */
+  HSHM_CROSS_FUN void Release() {
+    if (alloc_) {
+      alloc_->PopArena(*this);
+      alloc_ = nullptr;
+    }
+  }
+
+  HSHM_CROSS_FUN ~Arena() {
+    if (alloc_) {
+      alloc_->PopArena(*this);
+    }
+  }
+};
+
+/**
  * The allocator base class.
  * */
 template <typename CoreAllocT>
@@ -1138,6 +1201,25 @@ class BaseAllocator : public CoreAllocT {
    * */
   HSHM_CROSS_FUN
   void FreeTls() { CoreAllocT::FreeTls(); }
+
+  using SelfT = BaseAllocator<CoreAllocT>;
+
+  /** Push a bump arena for fast allocation */
+  HSHM_CROSS_FUN
+  Arena<SelfT> PushArena(size_t size) {
+    ArenaState prior;
+    OffsetPtr<> block;
+    if (!CoreAllocT::PushArenaState(prior, block, size)) {
+      return Arena<SelfT>();
+    }
+    return Arena<SelfT>(this, prior, block);
+  }
+
+  /** Pop a bump arena, freeing its block */
+  HSHM_CROSS_FUN
+  void PopArena(Arena<SelfT> &arena) {
+    CoreAllocT::PopArenaState(arena.prior_, arena.alloc_off_);
+  }
 
   /** Get the allocator identifier */
   HSHM_INLINE_CROSS_FUN

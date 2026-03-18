@@ -63,6 +63,7 @@ add_executable(test_reorganize_blob
 if(WRP_CORE_ENABLE_CUDA)
   add_cuda_library(test_gpu_initiated_kernels STATIC TRUE
       test_gpu_initiated_gpu.cc
+      test_gpu_coroutine_gpu.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-runtime/include
@@ -72,6 +73,10 @@ if(WRP_CORE_ENABLE_CUDA)
   )
   target_link_libraries(test_gpu_initiated_kernels PUBLIC hshm::cuda_cxx)
 endif()
+
+add_executable(test_cte_gpu_coroutine
+    test_gpu_coroutine.cc
+)
 
 add_executable(test_gpu_core
     test_gpu_core.cc
@@ -142,6 +147,10 @@ target_include_directories(test_tiered_storage_stress PRIVATE
 
 target_include_directories(test_reorganize_blob PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_cte_gpu_coroutine PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-runtime/test  # For simple_test.h with g_test_finalize
 )
 
 target_include_directories(test_gpu_core PRIVATE
@@ -259,6 +268,24 @@ target_link_libraries(test_reorganize_blob
     hshm::cxx                    # HermesShm library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
+
+# Link test_cte_gpu_coroutine
+target_link_libraries(test_cte_gpu_coroutine
+    wrp_cte_core_runtime
+    wrp_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    hshm::cxx
+    $<$<BOOL:${HSHM_ENABLE_CUDA}>:hermes_shm_cuda>
+    $<$<BOOL:${WRP_CORE_ENABLE_CUDA}>:test_gpu_initiated_kernels>
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+  set_property(TARGET test_cte_gpu_coroutine APPEND PROPERTY
+    LINK_LIBRARIES "-L${WRP_CORE_CLANG_CUDA_PATH}/lib64;-lcudart")
+endif()
 
 # Link test_gpu_core - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_gpu_core
@@ -731,6 +758,10 @@ set_tests_properties(
 add_test(NAME cte_reorganize_all
     COMMAND test_reorganize_blob)
 
+# GPU coroutine subtask tests (gpu2gpu dispatch + coroutine suspend/resume)
+add_test(NAME cte_gpu_coroutine
+    COMMAND test_cte_gpu_coroutine)
+
 # GPU core tests run together in one process so Put and Get share the same
 # initialized fixture and the stored blob persists between test cases.
 add_test(NAME cte_gpu_core_all
@@ -745,6 +776,14 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "unit;reorganize;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+)
+
+set_tests_properties(
+    cte_gpu_coroutine
+    PROPERTIES
+        TIMEOUT 120
+        LABELS "gpu;cte;coroutine;msan_skip"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
 
@@ -859,6 +898,7 @@ set_tests_properties(
     cte_runtime_stat_targets
     cte_tiered_storage_all
     cte_reorganize_all
+    cte_gpu_coroutine
     cte_gpu_core_all
     cte_gpu_create
     PROPERTIES LABELS "msan_skip"
@@ -886,7 +926,7 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob test_gpu_core test_gpu_create
+install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob test_cte_gpu_coroutine test_gpu_core test_gpu_create
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin

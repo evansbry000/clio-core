@@ -776,4 +776,32 @@ HSHM_GPU_FUN void GpuRuntime::LocalSaveTask(
   }
 }
 
+HSHM_GPU_FUN void GpuRuntime::LocalLoadTaskOutput(
+    chi::u32 method, chi::LocalLoadTaskArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) {
+  switch (method) {
+    case Method::kPutBlob: {
+      auto typed = task.template Cast<PutBlobTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kGetBlob: {
+      auto typed = task.template Cast<GetBlobTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto typed = task.template Cast<GetOrCreateTagTask<CreateParams>>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kRegisterTarget: {
+      auto typed = task.template Cast<RegisterTargetTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    default: break;
+  }
+}
+
 }  // namespace wrp_cte::core

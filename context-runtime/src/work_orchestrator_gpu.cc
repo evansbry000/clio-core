@@ -87,14 +87,12 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
               gpu_info.cpu2gpu_queue,
               gpu_info.gpu2gpu_queue,
               pool_mgr,
-              gpu_info.cpu2gpu_queue_base);
+              gpu_info.cpu2gpu_queue_base,
+              control);
 
   // Poll until exit signal; yield when idle so client warps can be scheduled
   while (!control->exit_flag) {
-    bool did_work = worker.PollOnce();
-    if (!did_work) {
-      __nanosleep(100);
-    }
+    worker.PollOnce();
   }
 
   worker.Finalize();
@@ -121,8 +119,7 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
     HLOG(kError, "gpu::WorkOrchestrator: Failed to allocate control structure");
     return false;
   }
-  control_->exit_flag = 0;
-  control_->running_flag = 0;
+  memset(control_, 0, sizeof(gpu::WorkOrchestratorControl));
 
   // Allocate gpu::PoolManager on device
   gpu::PoolManager *d_pm = hshm::GpuApi::Malloc<gpu::PoolManager>(

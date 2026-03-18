@@ -120,17 +120,13 @@ struct CustomTask : public chi::Task {
    * This includes: data_, operation_id_
    */
   template<typename Archive>
-  HSHM_CROSS_FUN void SerializeIn(Archive& ar) {
+  void SerializeIn(Archive& ar) {
     Task::SerializeIn(ar);
     ar(data_, operation_id_);
   }
 
-  /**
-   * Serialize OUT and INOUT parameters for network transfer
-   * This includes: data_
-   */
   template<typename Archive>
-  HSHM_CROSS_FUN void SerializeOut(Archive& ar) {
+  void SerializeOut(Archive& ar) {
     Task::SerializeOut(ar);
     ar(data_);
   }
@@ -380,15 +376,14 @@ struct TestLargeOutputTask : public chi::Task {
   }
 
   template<typename Archive>
-  HSHM_CROSS_FUN void SerializeIn(Archive& ar) {
+  void SerializeIn(Archive& ar) {
     Task::SerializeIn(ar);
-    // No input parameters for this task
   }
 
   template<typename Archive>
-  HSHM_CROSS_FUN void SerializeOut(Archive& ar) {
+  void SerializeOut(Archive& ar) {
     Task::SerializeOut(ar);
-    ar(data_);  // Return the 1MB output data
+    ar(data_);
   }
 
   /**
@@ -474,6 +469,55 @@ struct GpuSubmitTask : public chi::Task {
   HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
     Task::Aggregate(other_base);
     Copy(other_base.template Cast<GpuSubmitTask>());
+  }
+};
+
+/**
+ * SubtaskTestTask - GPU coroutine subtask spawning test.
+ * The GPU implementation co_awaits GpuSubmit on itself.
+ */
+struct SubtaskTestTask : public chi::Task {
+  IN chi::u32 test_value_;
+  OUT chi::u32 result_value_;
+
+  HSHM_CROSS_FUN SubtaskTestTask()
+      : chi::Task(), test_value_(0), result_value_(0) {}
+
+  HSHM_CROSS_FUN explicit SubtaskTestTask(
+      const chi::TaskId &task_node,
+      const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query,
+      chi::u32 test_value)
+      : chi::Task(task_node, pool_id, pool_query, 10),
+        test_value_(test_value), result_value_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSubtaskTest;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(test_value_);
+  }
+
+  template <typename Archive>
+  HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(result_value_);
+  }
+
+  void Copy(const hipc::FullPtr<SubtaskTestTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    test_value_ = other->test_value_;
+    result_value_ = other->result_value_;
+  }
+
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<SubtaskTestTask>());
   }
 };
 

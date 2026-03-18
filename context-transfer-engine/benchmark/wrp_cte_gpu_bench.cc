@@ -55,6 +55,7 @@
 
 #include <chimaera/chimaera.h>
 #include <wrp_cte/core/core_client.h>
+#include <chimaera/bdev/bdev_client.h>
 #include <hermes_shm/util/logging.h>
 #include <hermes_shm/util/gpu_api.h>
 
@@ -82,6 +83,7 @@ extern "C" int run_gpu_bench(
     chi::PoolId pool_id,
     wrp_cte::core::TagId tag_id,
     chi::u64 io_size,
+    chi::u64 preallocate,
     int io_count,
     int mode,
     int num_blocks,
@@ -142,10 +144,11 @@ int ModeFromString(const std::string &s) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 8) {
+  if (argc != 9) {
     HLOG(kError,
          "Usage: {} <test_case> <client_blocks> <client_threads>"
-         " <runtime_blocks> <runtime_threads> <io_size> <io_count>",
+         " <runtime_blocks> <runtime_threads> <io_size> <io_count>"
+         " <preallocate>",
          argv[0]);
     HLOG(kError, "  test_case:       Put, Get, or PutGet");
     HLOG(kError, "  client_blocks:   GPU blocks for client kernels");
@@ -154,6 +157,7 @@ int main(int argc, char **argv) {
     HLOG(kError, "  runtime_threads: Threads/block for orchestrator");
     HLOG(kError, "  io_size:         I/O size (e.g., 4k, 1m)");
     HLOG(kError, "  io_count:        I/Os per client block");
+    HLOG(kError, "  preallocate:     Preallocation hint per blob (e.g., 128k, 0)");
     return 1;
   }
 
@@ -164,6 +168,7 @@ int main(int argc, char **argv) {
   int runtime_threads = std::atoi(argv[5]);
   chi::u64 io_size = ParseSize(argv[6]);
   int io_count = std::atoi(argv[7]);
+  chi::u64 preallocate = ParseSize(argv[8]);
 
   int mode = ModeFromString(test_case);
   if (mode < 0 || client_blocks <= 0 || client_threads <= 0 ||
@@ -178,6 +183,16 @@ int main(int argc, char **argv) {
   if (num_gpus == 0) {
     HLOG(kError, "No GPUs available");
     return 1;
+  }
+
+  // Load GPU config if CHI_SERVER_CONF is not already set
+  if (!std::getenv("CHI_SERVER_CONF")) {
+    // Use the GPU benchmark config bundled with the benchmark
+    std::string config_dir = std::string(__FILE__);
+    config_dir = config_dir.substr(0, config_dir.rfind('/'));
+    std::string gpu_config = config_dir + "/cte_config_gpu.yaml";
+    setenv("CHI_SERVER_CONF", gpu_config.c_str(), 1);
+    HLOG(kInfo, "Using GPU benchmark config: {}", gpu_config);
   }
 
   // Initialize Chimaera with embedded runtime (fork mode)
@@ -207,7 +222,37 @@ int main(int argc, char **argv) {
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-  // Create tag via CPU-path Local() (matching test fixture pattern)
+  // Register a pinned-memory bdev target (GPU-accessible)
+  chi::PoolId bdev_pool_id(800, 0);
+  auto reg_task = cte_client_obj.AsyncRegisterTarget(
+      "pinned::cte_gpu_bench_target",
+      chimaera::bdev::BdevType::kPinned,
+      256ULL * 1024 * 1024,
+      chi::PoolQuery::Local(),
+      bdev_pool_id);
+  reg_task.Wait();
+  if (reg_task->GetReturnCode() != 0) {
+    HLOG(kError, "Failed to register target (CPU): {}", reg_task->GetReturnCode());
+    return 1;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Register the same target on the GPU side
+  auto gpu_reg_task = cte_client_obj.AsyncRegisterTarget(
+      "pinned::cte_gpu_bench_target",
+      chimaera::bdev::BdevType::kPinned,
+      256ULL * 1024 * 1024,
+      chi::PoolQuery::Local(),
+      bdev_pool_id,
+      chi::PoolQuery::LocalGpuBcast());
+  gpu_reg_task.Wait();
+  if (gpu_reg_task->GetReturnCode() != 0) {
+    HLOG(kError, "Failed to register target (GPU): {}", gpu_reg_task->GetReturnCode());
+    return 1;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Create tag via CPU-path Local()
   auto *cte_client = &cte_client_obj;
   auto tag_task = cte_client->AsyncGetOrCreateTag(
       "gpu_bench_tag", wrp_cte::core::TagId::GetNull(),
@@ -218,6 +263,17 @@ int main(int argc, char **argv) {
     return 1;
   }
   wrp_cte::core::TagId tag_id = tag_task->tag_id_;
+
+  // Create the same tag on the GPU side so GpuRuntime::PutBlob can find it
+  auto gpu_tag_task = cte_client->AsyncGetOrCreateTag(
+      "gpu_bench_tag", tag_id, chi::PoolQuery::LocalGpuBcast());
+  gpu_tag_task.Wait();
+  if (gpu_tag_task->GetReturnCode() != 0) {
+    HLOG(kError, "Failed to create tag on GPU: {}", gpu_tag_task->GetReturnCode());
+    return 1;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
   HLOG(kInfo, "Pool ID: {}.{}", gpu_pool_id.major_, gpu_pool_id.minor_);
   HLOG(kInfo, "Tag created: {}.{}", tag_id.major_, tag_id.minor_);
 
@@ -232,6 +288,7 @@ int main(int argc, char **argv) {
   HLOG(kInfo, "Runtime: {} blocks x {} threads", runtime_blocks, runtime_threads);
   HLOG(kInfo, "I/O size: {}", FormatSize(io_size));
   HLOG(kInfo, "I/O count per block: {}", io_count);
+  HLOG(kInfo, "Preallocate per blob: {}", preallocate > 0 ? FormatSize(preallocate) : "disabled");
   HLOG(kInfo, "Total I/Os: {} ({} ops)", total_ios,
        total_ios * ops_multiplier);
   HLOG(kInfo, "Total data: {}", FormatSize(total_bytes));
@@ -251,7 +308,7 @@ int main(int argc, char **argv) {
 
   int rc = run_gpu_bench(
       cte_client->pool_id_, tag_id,
-      io_size, io_count, mode,
+      io_size, preallocate, io_count, mode,
       client_blocks, client_threads,
       results);
 

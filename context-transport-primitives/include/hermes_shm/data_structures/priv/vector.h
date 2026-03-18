@@ -677,13 +677,13 @@ class vector {
   explicit vector(size_type count, AllocT* alloc)
       : data_(hipc::FullPtr<T>::GetNull()), size_(0), capacity_(0), alloc_(alloc) {
     reserve(count);
-    for (size_type i = 0; i < count; ++i) {
-      if constexpr (kIsPod) {
-        data_.ptr_[size_] = T();
-      } else {
+    if constexpr (!kIsPod) {
+      for (size_type i = 0; i < count; ++i) {
         new (&data_.ptr_[size_]) T();
+        ++size_;
       }
-      ++size_;
+    } else {
+      size_ = count;
     }
   }
 
@@ -1384,10 +1384,8 @@ class vector {
       if (new_size > capacity_) {
         reserve(new_size);
       }
-      for (size_type i = size_; i < new_size; ++i) {
-        if constexpr (kIsPod) {
-          data_.ptr_[i] = T();
-        } else {
+      if constexpr (!kIsPod) {
+        for (size_type i = size_; i < new_size; ++i) {
           new (&data_.ptr_[i]) T();
         }
       }

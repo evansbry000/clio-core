@@ -608,6 +608,16 @@ class _MultiProcessAllocator : public Allocator {
     // No explicit cleanup needed here
   }
 
+  /** MultiProcessAllocator delegates arena to the underlying BuddyAllocator */
+  bool PushArenaState(ArenaState &prior, OffsetPtr<> &block, size_t size) {
+    (void)prior; (void)block; (void)size;
+    return false;  // Not yet supported
+  }
+
+  void PopArenaState(const ArenaState &prior, OffsetPtr<> block) {
+    (void)prior; (void)block;
+  }
+
   /**
    * Tier 1: Allocate from thread-local ThreadBlock allocator (lock-free fast path)
    *
@@ -649,7 +659,7 @@ class _MultiProcessAllocator : public Allocator {
 
     // Calculate expansion size: use larger of thread_unit_ or size + metadata overhead
     // Add 25% overhead for BuddyAllocator metadata (page headers, alignment)
-    size_t required_size = size + (size / 4) + sizeof(BuddyPage);
+    size_t required_size = size + (size / 4) + sizeof(BuddyPage<>);
     size_t expand_size = (required_size > thread_unit_) ? required_size : thread_unit_;
 
     ScopedMutex scoped_lock(pblock->lock_, 0);
@@ -685,8 +695,8 @@ class _MultiProcessAllocator : public Allocator {
 
     // Calculate expansion size: use larger of process_unit_ or size + metadata overhead
     // Add 25% overhead for BuddyAllocator metadata (page headers, alignment)
-    // Use 3 * sizeof(BuddyPage) to account for headers at each expansion level
-    size_t required_size = size + (size / 4) + 3 * sizeof(BuddyPage);
+    // Use 3 * sizeof(BuddyPage<>) to account for headers at each expansion level
+    size_t required_size = size + (size / 4) + 3 * sizeof(BuddyPage<>);
     size_t expand_size = (required_size > process_unit_) ? required_size : process_unit_;
 
     // Acquire global lock to allocate expansion memory
@@ -736,8 +746,8 @@ class _MultiProcessAllocator : public Allocator {
 
     // Get old allocation size by reading the BuddyPage header
     // The page header is located just before the user data
-    size_t page_offset = offset.load() - sizeof(BuddyPage);
-    BuddyPage *page = reinterpret_cast<BuddyPage*>(GetBackendData() + page_offset);
+    size_t page_offset = offset.load() - sizeof(BuddyPage<>);
+    BuddyPage<> *page = reinterpret_cast<BuddyPage<>*>(GetBackendData() + page_offset);
     size_t old_size = page->size_;
 
     // Copy old data to new location (copy the minimum of old and new sizes)

@@ -48,12 +48,10 @@
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
 #include <hermes_shm/serialize/msgpack_wrapper.h>
 
-#include <cereal/archives/binary.hpp>
-#include <cereal/types/vector.hpp>
+#include "hermes_shm/data_structures/serialization/global_serialize.h"
 #include <chrono>
 #include <filesystem>
 #include <memory>
-#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1980,12 +1978,12 @@ chi::TaskResume Runtime::MigrateContainers(
   task->num_migrated_ = 0;
   task->error_message_ = "";
 
-  // Deserialize migrations from cereal binary
+  // Deserialize migrations from binary
   std::string data = task->migrations_json_.str();
   std::vector<chi::MigrateInfo> migrations;
   {
-    std::istringstream is(data);
-    cereal::BinaryInputArchive ar(is);
+    std::vector<char> buf(data.begin(), data.end());
+    hshm::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
     ar(migrations);
   }
 
@@ -2627,8 +2625,9 @@ chi::TaskResume Runtime::RecoverContainers(
   // Deserialize assignments
   std::vector<chi::RecoveryAssignment> assignments;
   {
-    std::istringstream is(task->assignments_data_.str());
-    cereal::BinaryInputArchive ar(is);
+    std::string data = task->assignments_data_.str();
+    std::vector<char> buf(data.begin(), data.end());
+    hshm::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
     ar(assignments);
   }
 

@@ -35,8 +35,7 @@
 #define CHIMAERA_INCLUDE_CHIMAERA_CONTAINER_H_
 
 #include <cmath>
-#include <cereal/archives/binary.hpp>
-#include <cereal/cereal.hpp>
+#include <hermes_shm/data_structures/serialization/global_serialize.h>
 #include <iostream>
 #include <memory>
 #include <sstream>

@@ -24,7 +24,9 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
   target_include_directories(${BENCH_TARGET}_gpu_kernels PRIVATE
     ${CHIMAERA_ROOT}/include
     ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/bdev/include
     ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
   )
   target_link_libraries(${BENCH_TARGET}_gpu_kernels PRIVATE hshm::cuda_cxx)
   set_target_properties(${BENCH_TARGET}_gpu_kernels PROPERTIES
@@ -51,7 +53,9 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
   target_include_directories(${BENCH_TARGET} PRIVATE
     ${CHIMAERA_ROOT}/include
     ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/bdev/include
     ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
@@ -67,6 +71,12 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
     ${CMAKE_THREAD_LIBS_INIT}
   )
 
+  # Ensure the executable prefers in-tree shared libraries in ${CMAKE_BINARY_DIR}/bin.
+  # Some CUDA link flows drop CMake's BUILD_RPATH; force an explicit $ORIGIN rpath.
+  if(UNIX AND NOT APPLE)
+    target_link_options(${BENCH_TARGET} PRIVATE "-Wl,-rpath,\\$ORIGIN")
+  endif()
+
   set_target_properties(${BENCH_TARGET} PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
@@ -76,6 +86,7 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
     CUDA_SEPARABLE_COMPILATION ON
     LINKER_LANGUAGE CUDA
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    BUILD_RPATH "$ORIGIN"
   )
 
   message(STATUS "Building ${BENCH_TARGET} with CUDA support")

@@ -31,43 +31,45 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifndef HSHM_DATA_STRUCTURES_PRIV_ARRAY_H_
+#define HSHM_DATA_STRUCTURES_PRIV_ARRAY_H_
+
+#include "hermes_shm/constants/macros.h"
+#include <cstring>
+
+namespace hshm::ipc {
+
 /**
- * GPU implementation of MOD_NAME ChiMod methods.
+ * Fixed-size stack-allocated array.
  *
- * GpuSubmit computes a simple polynomial on the GPU to verify end-to-end
- * GPU task submission and execution.
+ * No allocator, no heap. Compatible with LocalSerialize/LocalDeserialize
+ * as a drop-in replacement for vector<T, AllocT> when the maximum size
+ * is known at compile time.
+ *
+ * @tparam T Element type
+ * @tparam N Maximum number of elements
  */
+template <typename T, size_t N>
+class array {
+ private:
+  T data_[N];
+  size_t size_;
 
-#include "chimaera/MOD_NAME/MOD_NAME_gpu_runtime.h"
-#include "chimaera/singletons.h"
-#include "chimaera/gpu_container.h"
+ public:
+  HSHM_INLINE_CROSS_FUN array() : size_(0) {}
 
-namespace chimaera::MOD_NAME {
+  HSHM_INLINE_CROSS_FUN T *data() { return data_; }
+  HSHM_INLINE_CROSS_FUN const T *data() const { return data_; }
+  HSHM_INLINE_CROSS_FUN size_t size() const { return size_; }
+  HSHM_INLINE_CROSS_FUN static constexpr size_t capacity() { return N; }
 
-HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::SubtaskTest(
-    hipc::FullPtr<SubtaskTestTask> task,
-    chi::gpu::RunContext &rctx) {
-  // Spawn a child GpuSubmit task on ourselves via gpu2gpu queue
-  auto *ipc = CHI_IPC;
-  auto sub = ipc->NewTask<GpuSubmitTask>(
-      chi::CreateTaskId(), pool_id_, chi::PoolQuery::Local(),
-      /*gpu_id=*/chi::u32(0), task->test_value_);
-  auto future = ipc->SendGpuDirect(sub);
+  HSHM_INLINE_CROSS_FUN void resize(size_t new_size) { size_ = new_size; }
+  HSHM_INLINE_CROSS_FUN void reserve(size_t) {}
 
-  co_await future;
+  HSHM_INLINE_CROSS_FUN T &operator[](size_t i) { return data_[i]; }
+  HSHM_INLINE_CROSS_FUN const T &operator[](size_t i) const { return data_[i]; }
+};
 
-  auto *result = future.get();
-  if (result && result->return_code_ == 0) {
-    // GpuSubmit computes: result = test_value * 3 + gpu_id
-    // We add 1 to distinguish from the leaf path
-    task->result_value_ = result->result_value_ + 1;
-    task->return_code_ = 0;
-  } else {
-    task->result_value_ = 0;
-    task->return_code_ = 1;
-  }
-  (void)rctx;
-  co_return;
-}
+}  // namespace hshm::ipc
 
-}  // namespace chimaera::MOD_NAME
+#endif  // HSHM_DATA_STRUCTURES_PRIV_ARRAY_H_

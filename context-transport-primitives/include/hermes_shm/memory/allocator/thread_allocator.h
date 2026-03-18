@@ -51,7 +51,7 @@ typedef BaseAllocator<_ThreadAllocator> ThreadAllocator;
  */
 struct TaThreadBlock {
   hipc::atomic<int> initialized_;  /**< 0=uninitialized, 1=ready */
-  BuddyAllocator alloc_;          /**< Private buddy allocator (MUST BE LAST) */
+  PrivateBuddyAllocator alloc_;   /**< Private buddy allocator (MUST BE LAST) */
 
   HSHM_CROSS_FUN
   TaThreadBlock() : initialized_(0) {}
@@ -93,11 +93,12 @@ class _ThreadAllocator : public Allocator {
   hipc::atomic<int> heap_ready_;  /**< 0=not ready, 1=ready (grid-level sync) */
   int max_threads_;               /**< Fixed thread count (set at init) */
   size_t thread_unit_;            /**< Bytes per thread partition */
+  char * __restrict__ base_;                    /**< Cached base pointer */
 
  public:
   HSHM_CROSS_FUN
   _ThreadAllocator()
-      : heap_ready_(0), max_threads_(0), thread_unit_(0) {}
+      : heap_ready_(0), max_threads_(0), thread_unit_(0), base_(nullptr) {}
 
   /**
    * Initialize the thread allocator.
@@ -125,6 +126,7 @@ class _ThreadAllocator : public Allocator {
     SetBackend(backend);
     this_ = reinterpret_cast<char *>(this) -
             reinterpret_cast<char *>(backend.data_);
+    base_ = reinterpret_cast<char *>(backend.data_);
     alloc_header_size_ = sizeof(_ThreadAllocator);
     data_start_ = sizeof(_ThreadAllocator);
     region_size_ = region_size;
@@ -134,7 +136,7 @@ class _ThreadAllocator : public Allocator {
     thread_unit_ = thread_unit & ~(size_t)15;
 
     // Zero-init all partition headers so initialized_ starts at 0
-    char *base = GetBackendData();
+    char *base = base_;
     for (int i = 0; i < max_threads_; ++i) {
       char *part = base + sizeof(_ThreadAllocator) +
                    static_cast<size_t>(i) * thread_unit_;
@@ -151,8 +153,7 @@ class _ThreadAllocator : public Allocator {
    */
   HSHM_INLINE_CROSS_FUN
   TaThreadBlock* GetThreadBlock(int tid) {
-    char *base = GetBackendData();
-    char *part = base + sizeof(_ThreadAllocator) +
+    char *part = base_ + sizeof(_ThreadAllocator) +
                  static_cast<size_t>(tid) * thread_unit_;
     return reinterpret_cast<TaThreadBlock *>(part);
   }
@@ -226,13 +227,12 @@ class _ThreadAllocator : public Allocator {
    * Free memory.
    *
    * Computes the owning thread partition in O(1) by address arithmetic,
-   * then frees to that partition's BuddyAllocator.
+   * then frees to that partition's SlabAllocator.
    */
   HSHM_CROSS_FUN
   void FreeOffsetNoNullCheck(OffsetPtr<> p) {
-    char *base = GetBackendData();
-    char *ptr_addr = base + p.load();
-    char *partitions_base = base + sizeof(_ThreadAllocator);
+    char *ptr_addr = base_ + p.load();
+    char *partitions_base = base_ + sizeof(_ThreadAllocator);
     size_t offset_in_partitions =
         static_cast<size_t>(ptr_addr - partitions_base);
     int owner = static_cast<int>(offset_in_partitions / thread_unit_);
@@ -248,6 +248,26 @@ class _ThreadAllocator : public Allocator {
   void FreeOffset(OffsetPtr<> p) {
     if (p.IsNull()) return;
     FreeOffsetNoNullCheck(p);
+  }
+
+  /** Push arena on the current thread's BuddyAllocator */
+  HSHM_CROSS_FUN bool PushArenaState(ArenaState &prior, OffsetPtr<> &block, size_t size) {
+    int tid = GetAutoTid();
+    if (!LazyInitThread(tid)) return false;
+    return GetThreadBlock(tid)->alloc_.PushArenaState(prior, block, size);
+  }
+
+  /** Pop arena on the owning thread's BuddyAllocator */
+  HSHM_CROSS_FUN void PopArenaState(const ArenaState &prior, OffsetPtr<> block) {
+    if (block.IsNull()) return;
+    char *ptr_addr = base_ + block.load();
+    char *partitions_base = base_ + sizeof(_ThreadAllocator);
+    size_t offset_in_partitions =
+        static_cast<size_t>(ptr_addr - partitions_base);
+    int owner = static_cast<int>(offset_in_partitions / thread_unit_);
+    if (owner >= 0 && owner < max_threads_) {
+      GetThreadBlock(owner)->alloc_.PopArenaState(prior, block);
+    }
   }
 
   /** No-op TLS management (thread IDs are caller-provided) */

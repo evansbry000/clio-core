@@ -215,6 +215,15 @@ class _MallocAllocator : public Allocator {
   HSHM_CROSS_FUN void CreateTls() {}
   HSHM_CROSS_FUN void FreeTls() {}
 
+  /** Not supported for malloc allocator */
+  HSHM_CROSS_FUN bool PushArenaState(ArenaState &prior, OffsetPtr<> &block, size_t size) {
+    (void)prior; (void)block; (void)size;
+    return false;
+  }
+  HSHM_CROSS_FUN void PopArenaState(const ArenaState &prior, OffsetPtr<> block) {
+    (void)prior; (void)block;
+  }
+
   /**
    * Reset: no-op for malloc allocator (individual frees handle reclamation)
    */

@@ -54,9 +54,8 @@ using pid_t = int;
 #include "hermes_shm/memory/allocator/allocator.h"
 #include "hermes_shm/util/logging.h"
 
-// Include cereal for serialization
-#include <cereal/archives/binary.hpp>
-#include <cereal/cereal.hpp>
+// Include GlobalSerialize for architecture-portable serialization
+#include <hermes_shm/data_structures/serialization/global_serialize.h>
 
 // Forward declare chi::priv::string for cereal support
 namespace hshm::priv {
@@ -140,15 +139,16 @@ class Task {
   IN MethodId method_;      /**< Method identifier for task type */
   IN ibitfield task_flags_; /**< Task properties and flags */
   IN double period_ns_;     /**< Period in nanoseconds for periodic tasks */
-#if HSHM_IS_HOST
-  IN std::unique_ptr<RunContext>
-      run_ctx_; /**< Runtime context owned by task (RAII) - Host only */
-#endif
+  IN TaskGroup
+      task_group_; /**< Scheduling affinity group (null = no affinity) */
   OUT hipc::atomic<u32>
       return_code_; /**< Task return code (0=success, non-zero=error) */
   OUT hipc::atomic<ContainerId>
-      completer_;        /**< Container ID that completed this task */
-  TaskGroup task_group_; /**< Scheduling affinity group (null = no affinity) */
+      completer_; /**< Container ID that completed this task */
+#if HSHM_IS_HOST
+  TEMP std::unique_ptr<RunContext>
+      run_ctx_; /**< Runtime context owned by task (RAII) - Host only */
+#endif
 
   /**
    * Non-virtual destructor - tasks are deleted via Container::DelTask
@@ -281,7 +281,7 @@ class Task {
   HSHM_CROSS_FUN void ClearFlags(u32 flags) { task_flags_.UnsetBits(flags); }
 
   /**
-   * Serialize data structures to chi::priv::string using cereal
+   * Serialize data structures to chi::priv::string using GlobalSerialize
    * @param alloc Allocator for memory management (CHI_PRIV_ALLOC_T)
    * @param output_str The string to store serialized data
    * @param args The arguments to serialize
@@ -289,27 +289,26 @@ class Task {
   template <typename... Args>
   static void Serialize(CHI_PRIV_ALLOC_T* alloc,
                         chi::priv::string& output_str, const Args&... args) {
-    std::ostringstream os;
-    cereal::BinaryOutputArchive archive(os);
-    archive(args...);
-
-    std::string serialized = os.str();
+    std::vector<char> buffer;
+    hshm::ipc::GlobalSerialize<std::vector<char>> ar(buffer);
+    ar(args...);
+    ar.Finalize();
+    std::string serialized(buffer.begin(), buffer.end());
     output_str = chi::priv::string(alloc, serialized);
   }
 
   /**
-   * Deserialize data structure from chi::ipc::string using cereal
+   * Deserialize data structure from chi::ipc::string using GlobalDeserialize
    * @param input_str The string containing serialized data
    * @return The deserialized object
    */
   template <typename OutT>
   static OutT Deserialize(const chi::priv::string& input_str) {
-    std::string data = input_str.str();
-    std::istringstream is(data);
-    cereal::BinaryInputArchive archive(is);
-
+    std::vector<char> data(input_str.data(),
+                           input_str.data() + input_str.size());
+    hshm::ipc::GlobalDeserialize<std::vector<char>> ar(data);
     OutT result;
-    archive(result);
+    ar(result);
     return result;
   }
 
@@ -325,9 +324,8 @@ class Task {
    */
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeIn(Archive& ar) {
-    // Serialize base Task fields (IN and INOUT parameters)
-    ar(pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_,
-       return_code_);
+    ar.range(pool_id_, task_id_, pool_query_, method_, task_flags_,
+             period_ns_, task_group_, return_code_, completer_);
   }
 
   /**
@@ -342,12 +340,7 @@ class Task {
    */
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeOut(Archive& ar) {
-    // Serialize base Task OUT fields only
-    // Only serialize OUT fields - do NOT re-serialize IN fields
-    // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are
-    // all IN) Only return_code_ and completer_ are OUT fields that need to be
-    // sent back
-    ar(return_code_, completer_);
+    ar.range(return_code_, completer_);
   }
 
   /**
@@ -500,6 +493,15 @@ struct FutureShm {
   /** Atomic bitfield for completion and data availability flags */
   hshm::abitfield32_t flags_;
 
+  /**
+   * Opaque pointer to the parent's GPU RunContext (chi::gpu::RunContext*).
+   * Set by Future::await_suspend on GPU so that the worker completing
+   * this sub-task can directly resume the parent coroutine (same thread,
+   * no event queue needed). Null for top-level (client-originated) tasks.
+   * Typed as void* to avoid circular dependency with gpu_coroutine.h.
+   */
+  void *parent_gpu_rctx_;
+
   /** Copy space for serialized task data (flexible array member) */
   char copy_space[];
 
@@ -516,6 +518,7 @@ struct FutureShm {
     response_transport_ = nullptr;
     response_fd_ = -1;
     response_identity_len_ = 0;
+    parent_gpu_rctx_ = nullptr;
     flags_.Clear();
   }
 };
@@ -709,7 +712,7 @@ class Future {
    * Check if the task is complete
    * @return True if task has completed, false otherwise
    */
-  bool IsComplete() const {
+  HSHM_CROSS_FUN bool IsComplete() const {
     if (future_shm_.IsNull()) {
       return false;
     }
@@ -729,6 +732,7 @@ class Future {
    */
   HSHM_CROSS_FUN bool Wait(float max_sec = 0);
 
+  /**
   /**
    * Mark the task as complete
    */
@@ -845,7 +849,7 @@ class Future {
    * If the task is already complete, the coroutine won't suspend.
    * @return True if task is complete, false if coroutine should suspend
    */
-  bool await_ready() const noexcept {
+  HSHM_CROSS_FUN bool await_ready() const noexcept {
     if (IsComplete()) return true;
     if (!task_ptr_.IsNull() &&
         task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
@@ -857,32 +861,53 @@ class Future {
   /**
    * Suspend the coroutine and register for resumption (coroutine await_suspend)
    *
-   * This is called when await_ready returns false. It stores the coroutine
-   * handle in the RunContext so the worker can resume it when the task
-   * completes. Also marks this Future as the owner of the task.
-   *
-   * Uses type-erased coroutine handle and gets RunContext from thread-local
-   * Worker storage rather than from the promise to ensure proper template
-   * instantiation.
+   * CPU: stores the coroutine handle in RunContext for the worker to resume
+   * when the task completes.
+   * GPU: stores coroutine handle + FutureShm pointer in RunContext so the
+   * Worker can check FUTURE_COMPLETE and resume without spin-waiting.
    *
    * @param handle The coroutine handle to resume when task completes
    * @return True to suspend, false to continue without suspending
    */
-  bool await_suspend(std::coroutine_handle<> handle) noexcept {
+  template <typename PromiseT>
+  HSHM_CROSS_FUN bool await_suspend(
+      std::coroutine_handle<PromiseT> handle) noexcept {
+#if HSHM_IS_HOST
     // Get RunContext via helper function (defined in worker.cc)
     // This avoids needing RunContext to be complete at this point
     return await_suspend_impl(handle);
+#else
+    // GPU: genuinely suspend — store handle and FutureShm in RunContext.
+    // Also store parent RunContext on FutureShm so the worker completing
+    // the sub-task can directly resume the parent (same thread, no polling).
+    if constexpr (requires { handle.promise().get_run_context(); }) {
+      auto *ctx = handle.promise().get_run_context();
+      if (ctx) {
+        ctx->coro_handle_ = handle;
+        ctx->is_yielded_ = true;
+        // Store FutureShm pointer so Worker checks FUTURE_COMPLETE before resume
+        auto fshm_full = GetFutureShm();
+        ctx->awaited_fshm_ = fshm_full.IsNull() ? nullptr : fshm_full.ptr_;
+        // Store sub-task pointer so Worker can deserialize output before resume
+        ctx->awaited_task_ = task_ptr_.IsNull() ? nullptr : task_ptr_.ptr_;
+        // Store parent RunContext on FutureShm for direct parent resumption
+        if (!fshm_full.IsNull()) {
+          fshm_full.ptr_->parent_gpu_rctx_ = ctx;
+        }
+        return true;  // Genuinely suspend
+      }
+    }
+    return false;  // Fallback: no RunContext, can't suspend
+#endif
   }
 
   /**
    * Get the result after resumption (coroutine await_resume)
    *
-   * Returns void to avoid GCC 11 "statement has no effect" warning
-   * which causes the compiler to skip the await machinery entirely.
-   * Marks this Future as the owner if not already set (for await_ready=true
-   * case). Calls PostWait() on the task for post-completion actions.
+   * CPU: calls Destroy(true) to clean up after worker-driven resumption.
+   * GPU: Worker already confirmed FUTURE_COMPLETE; deserialize output and cleanup.
    */
-  void await_resume() noexcept {
+  HSHM_CROSS_FUN void await_resume() noexcept {
     if (!task_ptr_.IsNull() &&
         task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
       // Fire-and-forget: detach without destroying. The task is still
@@ -891,7 +916,13 @@ class Future {
       future_shm_.SetNull();
       return;
     }
+#if HSHM_IS_HOST
     Destroy(true);
+#else
+    // GPU: Worker already deserialized output before resuming this coroutine.
+    // Just mark consumed.
+    Destroy(true);
+#endif
   }
 };
 

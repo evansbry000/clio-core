@@ -31,43 +31,46 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-/**
- * GPU implementation of MOD_NAME ChiMod methods.
- *
- * GpuSubmit computes a simple polynomial on the GPU to verify end-to-end
- * GPU task submission and execution.
- */
+#ifndef HSHM_UTIL_GPU_LINKER_H
+#define HSHM_UTIL_GPU_LINKER_H
 
-#include "chimaera/MOD_NAME/MOD_NAME_gpu_runtime.h"
-#include "chimaera/singletons.h"
-#include "chimaera/gpu_container.h"
+#include <string>
+#include <vector>
+#include "hermes_shm/constants/macros.h"
 
-namespace chimaera::MOD_NAME {
+namespace hshm {
 
-HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::SubtaskTest(
-    hipc::FullPtr<SubtaskTestTask> task,
-    chi::gpu::RunContext &rctx) {
-  // Spawn a child GpuSubmit task on ourselves via gpu2gpu queue
-  auto *ipc = CHI_IPC;
-  auto sub = ipc->NewTask<GpuSubmitTask>(
-      chi::CreateTaskId(), pool_id_, chi::PoolQuery::Local(),
-      /*gpu_id=*/chi::u32(0), task->test_value_);
-  auto future = ipc->SendGpuDirect(sub);
+struct GpuDeviceCode {
+  std::string name;
+  const void *data;
+  size_t size;
+};
 
-  co_await future;
+class GpuLinker {
+ public:
+  HSHM_DLL GpuLinker();
+  HSHM_DLL ~GpuLinker();
 
-  auto *result = future.get();
-  if (result && result->return_code_ == 0) {
-    // GpuSubmit computes: result = test_value * 3 + gpu_id
-    // We add 1 to distinguish from the leaf path
-    task->result_value_ = result->result_value_ + 1;
-    task->return_code_ = 0;
-  } else {
-    task->result_value_ = 0;
-    task->return_code_ = 1;
-  }
-  (void)rctx;
-  co_return;
-}
+  GpuLinker(const GpuLinker &) = delete;
+  GpuLinker &operator=(const GpuLinker &) = delete;
 
-}  // namespace chimaera::MOD_NAME
+  HSHM_DLL void AddModule(const std::string &name, const void *fatbin,
+                           size_t size);
+  HSHM_DLL bool Link();
+  HSHM_DLL void *GetFunction(const char *kernel_name);
+  HSHM_DLL bool LaunchKernel(void *func, unsigned gridX, unsigned gridY,
+                              unsigned gridZ, unsigned blockX, unsigned blockY,
+                              unsigned blockZ, unsigned sharedMem,
+                              void *stream, void **params);
+  HSHM_DLL void Unload();
+  HSHM_DLL bool IsLinked() const;
+
+ private:
+  std::vector<GpuDeviceCode> modules_;
+  void *cu_module_ = nullptr;
+  bool linked_ = false;
+};
+
+}  // namespace hshm
+
+#endif  // HSHM_UTIL_GPU_LINKER_H

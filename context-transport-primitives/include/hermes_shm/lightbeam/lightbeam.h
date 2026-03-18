@@ -42,11 +42,7 @@
 #include <vector>
 #include <sstream>
 
-#if HSHM_ENABLE_CEREAL
-#include <cereal/archives/binary.hpp>
-#include <cereal/types/string.hpp>
-#include <cereal/types/vector.hpp>
-#endif
+#include "hermes_shm/data_structures/serialization/global_serialize.h"
 
 #include "hermes_shm/data_structures/priv/vector.h"
 #include "hermes_shm/lightbeam/event_manager.h"

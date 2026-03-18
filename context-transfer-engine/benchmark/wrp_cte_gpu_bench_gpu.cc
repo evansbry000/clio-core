@@ -51,6 +51,7 @@
 #include <chimaera/singletons.h>
 #include <hermes_shm/util/gpu_api.h>
 #include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/ipc_manager.h>
 #include <thread>
 #include <chrono>
 
@@ -61,6 +62,7 @@ struct GpuBenchParams {
   chi::PoolId pool_id;
   wrp_cte::core::TagId tag_id;
   chi::u64 io_size;
+  chi::u64 preallocate;  // Preallocation hint per blob (0 = disabled)
   int io_count;      // Per-block I/O count
   int mode;          // 0=Put, 1=Get, 2=PutGet
 };
@@ -93,9 +95,29 @@ __global__ void gpu_bench_kernel(
 
   wrp_cte::core::Client client(params.pool_id);
 
+  // Debug: check allocator state
+  auto *alloc = CHI_IPC->gpu_alloc_;
+  if (!CHI_IPC->gpu_backend_initialized_ || !alloc) {
+    my_result->status = -50 - block_id;
+    return;
+  }
+  int tid = alloc->GetAutoTid();
+  int max_t = alloc->max_threads_;
+  int ready = *reinterpret_cast<volatile int *>(&alloc->heap_ready_);
+  bool lazy_ok = alloc->LazyInitThread(tid);
+  if (!lazy_ok) {
+    // Encode: -(10000 + block_id*1000 + tid*100 + max_t*10 + ready)
+    my_result->status = -(10000 + block_id * 1000 + tid * 100 + max_t * 10 + ready);
+    return;
+  }
+
   // Allocate put/get buffers from GPU device memory
   auto put_full = CHI_IPC->AllocateDeviceData(params.io_size);
-  if (put_full.IsNull()) { my_result->status = -10; return; }
+  if (put_full.IsNull()) {
+    // Encode tid and max_threads in error: -(80 + block_id*100 + tid*10 + max_threads)
+    my_result->status = -(1000 + block_id * 100 + tid * 10 + alloc->max_threads_);
+    return;
+  }
   auto get_full = CHI_IPC->AllocateDeviceData(params.io_size);
   if (get_full.IsNull()) { my_result->status = -11; return; }
 
@@ -105,9 +127,10 @@ __global__ void gpu_bench_kernel(
   memset(put_buf, 0xAB, params.io_size);
   memset(get_buf, 0x00, params.io_size);
 
-  // Build ShmPtr from the FullPtr (carries allocator ID + offset)
-  hipc::ShmPtr<> put_shm(put_full.shm_);
-  hipc::ShmPtr<> get_shm(get_full.shm_);
+  // Use raw UVA pointers so the orchestrator can resolve them without
+  // needing the client kernel's allocator (which it doesn't know about).
+  hipc::ShmPtr<> put_shm = hipc::ShmPtr<>::FromRaw(put_buf);
+  hipc::ShmPtr<> get_shm = hipc::ShmPtr<>::FromRaw(get_buf);
 
   // Build per-block blob name: "blob_0", "blob_1", etc.
   char blob_name[32];
@@ -130,12 +153,19 @@ __global__ void gpu_bench_kernel(
   if (params.mode == 0 || params.mode == 2) {
     // Put phase
     for (int i = 0; i < params.io_count; ++i) {
+      // Debug: encode block_id and io iteration in status
+      // -100 - block_id*10 - i = "sending io #i from block block_id"
+      my_result->status = -100 - block_id * 10 - i;
       long long t0 = clock64();
+      wrp_cte::core::Context ctx;
+      if (params.preallocate > 0) {
+        ctx.preallocate_ = params.preallocate;
+      }
       auto future = client.AsyncPutBlob(
           params.tag_id, blob_name,
           chi::u64(0), params.io_size,
           put_shm, 0.5f,
-          wrp_cte::core::Context(),
+          ctx,
           chi::u32(0),
           chi::PoolQuery::Local());
       long long t1 = clock64();
@@ -144,6 +174,8 @@ __global__ void gpu_bench_kernel(
         my_result->status = -2;
         return;
       }
+      // Debug: encode "waiting" state
+      my_result->status = -200 - block_id * 10 - i;
       future.Wait();
       long long t2 = clock64();
       total_wait += (t2 - t1);
@@ -197,6 +229,7 @@ extern "C" int run_gpu_bench(
     chi::PoolId pool_id,
     wrp_cte::core::TagId tag_id,
     chi::u64 io_size,
+    chi::u64 preallocate,
     int io_count,
     int mode,
     int num_blocks,
@@ -230,6 +263,12 @@ extern "C" int run_gpu_bench(
   if (!gpu_heap.shm_init(heap_id, heap_size, "", 0))
     return -102;
 
+  // Zero ThreadAllocator headers so WaitReady() doesn't see stale data.
+  // Block 0 initializes each allocator; other blocks spin on heap_ready_.
+  // Without zeroing, heap_ready_ may contain garbage that looks "ready".
+  cudaMemset(gpu_backend.data_, 0, sizeof(hipc::_ThreadAllocator));
+  cudaMemset(gpu_heap.data_, 0, sizeof(hipc::_ThreadAllocator));
+
   chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
   gpu_info.gpu_heap_backend = gpu_heap;
@@ -244,6 +283,7 @@ extern "C" int run_gpu_bench(
   params.pool_id = pool_id;
   params.tag_id = tag_id;
   params.io_size = io_size;
+  params.preallocate = preallocate;
   params.io_count = io_count;
   params.mode = mode;
 
@@ -268,9 +308,27 @@ extern "C" int run_gpu_bench(
 
   CHI_IPC->ResumeGpuOrchestrator();
 
+  // Wait for the orchestrator to signal it's running
+  {
+    auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(
+        CHI_IPC->gpu_orchestrator_);
+    if (orch && orch->control_) {
+      int wait_ms = 0;
+      while (orch->control_->running_flag == 0 && wait_ms < 5000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ++wait_ms;
+      }
+      fprintf(stderr, "[DEBUG] Orchestrator running_flag=%d after %d ms\n",
+              orch->control_->running_flag, wait_ms);
+    } else {
+      fprintf(stderr, "[DEBUG] No orchestrator or control struct!\n");
+    }
+  }
+
   // Poll pinned memory for all blocks to complete
-  int timeout_us = 30000000;  // 30 seconds
+  int timeout_us = 10000000;  // 10 seconds
   int elapsed_us = 0;
+  int last_print_us = 0;
   while (elapsed_us < timeout_us) {
     bool all_done = true;
     for (int i = 0; i < num_blocks; ++i) {
@@ -280,6 +338,15 @@ extern "C" int run_gpu_bench(
       }
     }
     if (all_done) break;
+    // Print debug status every 2 seconds
+    if (elapsed_us - last_print_us >= 2000000) {
+      fprintf(stderr, "[DEBUG %ds] Block statuses:", elapsed_us / 1000000);
+      for (int i = 0; i < num_blocks; ++i) {
+        fprintf(stderr, " b%d=%d", i, results[i].status);
+      }
+      fprintf(stderr, "\n");
+      last_print_us = elapsed_us;
+    }
     std::this_thread::sleep_for(std::chrono::microseconds(100));
     elapsed_us += 100;
   }

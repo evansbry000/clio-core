@@ -56,6 +56,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/bdev/bdev_tasks.h>
+#include <chimaera/gpu_work_orchestrator.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_tasks.h>
 
@@ -236,9 +237,86 @@ class GpuCoreGpuFixture {
       return;
     }
 
+    // Register a pinned-memory bdev target (GPU-accessible)
+    chi::PoolId bdev_pool_id(800, 0);
+    auto reg_task = core_client_->AsyncRegisterTarget(
+        "pinned::cte_gpu_test_target",
+        chimaera::bdev::BdevType::kPinned,
+        /*total_size=*/chi::u64{16 * 1024 * 1024},  // 16MB
+        chi::PoolQuery::Local(),
+        bdev_pool_id);
+    reg_task.Wait();
+    if (reg_task->GetReturnCode() != 0) {
+      INFO("GPU fixture: RegisterTarget (CPU) failed: " << reg_task->GetReturnCode());
+      return;
+    }
+
+    // Brief delay: allow GPU orchestrator to register bdev GPU container
+    std::this_thread::sleep_for(200ms);
+
+    // Wait for bdev UpdateTask to complete on GPU before sending more tasks.
+    bool bdev_update_done = false;
+    {
+      auto start = std::chrono::steady_clock::now();
+      int print_counter = 0;
+      while (!bdev_update_done) {
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+        auto *orch = reinterpret_cast<chi::gpu::WorkOrchestrator*>(
+            CHI_IPC->gpu_orchestrator_);
+        auto *ctrl = (orch && orch->control_) ? orch->control_ : nullptr;
+
+        // Print debug every second
+        if (ctrl && (++print_counter % 10 == 0)) {
+          fprintf(stderr, "[FIXTURE t=%llds] W0: polls=%llu state=%u method=%u "
+                  "step=%u tw=%llu cs=%llu susp=%u\n",
+                  (long long)secs,
+                  (unsigned long long)ctrl->dbg_poll_count[0],
+                  (unsigned)ctrl->dbg_last_state[0],
+                  (unsigned)ctrl->dbg_last_method[0],
+                  (unsigned)ctrl->dbg_dispatch_step[0],
+                  (unsigned long long)ctrl->dbg_input_tw[0],
+                  (unsigned long long)ctrl->dbg_input_cs[0],
+                  (unsigned)ctrl->dbg_num_suspended[0]);
+          fflush(stderr);
+        }
+
+        if (secs >= 10) {
+          fprintf(stderr, "[FIXTURE] Aborting - bdev UpdateTask never completed\n");
+          fflush(stderr);
+          break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        if (ctrl && ctrl->dbg_last_state[0] >= 5) {
+          // State 5 = completed
+          bdev_update_done = true;
+        }
+      }
+    }
+
+    if (!bdev_update_done) {
+      INFO("GPU fixture: Skipping GPU RegisterTarget - bdev UpdateTask didn't complete");
+      return;
+    }
+
+    // Register the same target on the GPU side so GpuRuntime can find it
+    auto gpu_reg_task = core_client_->AsyncRegisterTarget(
+        "pinned::cte_gpu_test_target",
+        chimaera::bdev::BdevType::kPinned,
+        /*total_size=*/chi::u64{16 * 1024 * 1024},
+        chi::PoolQuery::Local(),
+        bdev_pool_id,
+        chi::PoolQuery::LocalGpuBcast());
+    gpu_reg_task.Wait();
+    if (gpu_reg_task->GetReturnCode() != 0) {
+      INFO("GPU fixture: RegisterTarget (GPU) failed: " << gpu_reg_task->GetReturnCode());
+      return;
+    }
+
     // GetOrCreateTag via CPU Local() — tag metadata must be in CPU runtime
-    // (the GPU GpuRuntime::GetOrCreateTag also supports this, but the CPU
-    // path is simpler for initial tag setup)
     auto tag_task = core_client_->AsyncGetOrCreateTag(
         "gpu_path_tag", wrp_cte::core::TagId::GetNull(), chi::PoolQuery::Local());
     tag_task.Wait();
@@ -247,6 +325,11 @@ class GpuCoreGpuFixture {
       return;
     }
     tag_id_ = tag_task->tag_id_;
+
+    // Also create the tag on the GPU side
+    auto gpu_tag_task = core_client_->AsyncGetOrCreateTag(
+        "gpu_path_tag", tag_id_, chi::PoolQuery::LocalGpuBcast());
+    gpu_tag_task.Wait();
 
     // Brief delay: allow GPU orchestrator to register the new pool's container
     std::this_thread::sleep_for(200ms);
@@ -293,10 +376,66 @@ TEST_CASE("GpuCore - GPU PutBlob via LocalGpuBcast", "[gpu][cte][core]") {
       /*flags=*/0,
       chi::PoolQuery::LocalGpuBcast());
   REQUIRE(!task.IsNull());
-  task.Wait();
-  REQUIRE(task->GetReturnCode() == 0);
 
-  INFO("GPU PutBlob succeeded (return_code=0)");
+  // Poll with timeout instead of blocking Wait()
+  {
+    auto start = std::chrono::steady_clock::now();
+    bool completed = false;
+    while (!completed) {
+      if (task.IsComplete()) {
+        completed = true;
+        break;
+      }
+      auto elapsed = std::chrono::steady_clock::now() - start;
+      if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 10) {
+        // Dump GPU worker debug state
+        auto *orch = reinterpret_cast<chi::gpu::WorkOrchestrator*>(
+            CHI_IPC->gpu_orchestrator_);
+        if (orch && orch->control_) {
+          auto *ctrl = orch->control_;
+          for (int w = 0; w < 2; ++w) {
+            INFO("Worker " << w
+                 << ": polls=" << ctrl->dbg_poll_count[w]
+                 << " suspended=" << ctrl->dbg_num_suspended[w]
+                 << " last_method=" << ctrl->dbg_last_method[w]
+                 << " last_state=" << ctrl->dbg_last_state[w]
+                 << " resume_checks=" << ctrl->dbg_resume_checks[w]
+                 << " ser_total_written=" << ctrl->dbg_ser_total_written[w]
+                 << " ser_method=" << ctrl->dbg_ser_method[w]
+                 << " dispatch_step=" << ctrl->dbg_dispatch_step[w]
+                 << " input_tw=" << ctrl->dbg_input_tw[w]
+                 << " input_cs=" << ctrl->dbg_input_cs[w]);
+          }
+        }
+        FAIL("PutBlob timed out after 10s");
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (completed) {
+      task.Wait();  // Finalize
+    }
+  }
+  // Always dump debug info on completion
+  {
+    auto *orch = reinterpret_cast<chi::gpu::WorkOrchestrator*>(
+        CHI_IPC->gpu_orchestrator_);
+    if (orch && orch->control_) {
+      auto *ctrl = orch->control_;
+      for (int w = 0; w < 2; ++w) {
+        INFO("Worker " << w
+             << ": polls=" << ctrl->dbg_poll_count[w]
+             << " suspended=" << ctrl->dbg_num_suspended[w]
+             << " last_method=" << ctrl->dbg_last_method[w]
+             << " last_state=" << ctrl->dbg_last_state[w]
+             << " resume_checks=" << ctrl->dbg_resume_checks[w]
+             << " ser_total_written=" << ctrl->dbg_ser_total_written[w]
+             << " ser_method=" << ctrl->dbg_ser_method[w]);
+      }
+    }
+  }
+  INFO("GPU PutBlob return_code=" << task->GetReturnCode());
+  REQUIRE(task->GetReturnCode() == 0);
   // src kept alive; FreePinned is a no-op (safe leak until process exit)
 }
 

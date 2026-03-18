@@ -10,6 +10,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> 
       co_await GpuSubmit(typed, rctx);
       break;
     }
+    case Method::kSubtaskTest: {
+      auto typed = task_ptr.template Cast<SubtaskTestTask>();
+      co_await SubtaskTest(typed, rctx);
+      break;
+    }
     default: break;
   }
   co_return;
@@ -27,6 +32,15 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
       task.ptr_->SerializeIn(archive);
       return task.template Cast<chi::Task>();
     }
+    case Method::kSubtaskTest: {
+      auto *alloc = gpu_alloc_;
+      auto task = alloc->template AllocateObjs<SubtaskTestTask>(1);
+      if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
+      new (task.ptr_) SubtaskTestTask();
+      archive.SetMsgType(chi::LocalMsgType::kSerializeIn);
+      task.ptr_->SerializeIn(archive);
+      return task.template Cast<chi::Task>();
+    }
     default: return hipc::FullPtr<chi::Task>::GetNull();
   }
 }
@@ -37,6 +51,11 @@ HSHM_GPU_FUN void LocalSaveTask(
   switch (method) {
     case Method::kGpuSubmit: {
       auto typed = task.template Cast<GpuSubmitTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kSubtaskTest: {
+      auto typed = task.template Cast<SubtaskTestTask>();
       typed->SerializeOut(archive);
       break;
     }

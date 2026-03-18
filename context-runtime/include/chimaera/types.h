@@ -205,7 +205,7 @@ struct UniqueId {
   // Serialization support
   template <typename Ar>
   HSHM_CROSS_FUN void serialize(Ar &ar) {
-    ar(major_, minor_);
+    ar.range(major_, minor_);
   }
 };
 
@@ -275,7 +275,7 @@ struct TaskId {
   // Serialization support
   template <typename Ar>
   HSHM_CROSS_FUN void serialize(Ar &ar) {
-    ar(pid_, tid_, major_, replica_id_, unique_, node_id_, net_key_);
+    ar.range(pid_, tid_, major_, replica_id_, unique_, node_id_, net_key_);
   }
 };
 

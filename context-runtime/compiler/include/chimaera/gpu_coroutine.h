@@ -89,6 +89,22 @@ using GpuAllocFn = void *(*)(size_t size, void *alloc_ctx);
 using GpuFreeFn = void (*)(void *ptr, void *alloc_ctx);
 
 // ============================================================================
+// Coroutine compiler fence
+// ============================================================================
+
+/**
+ * Device-side volatile write that prevents Clang-CUDA from miscompiling
+ * coroutine state machines across suspension/resume boundaries.
+ *
+ * Without this, the compiler may generate incorrect code when a coroutine
+ * resumes via symmetric transfer and enters a new nested coroutine.
+ * A volatile write to device global memory acts as a full compiler + HW
+ * memory barrier that forces correct code generation.
+ *
+ * This works around a Clang-CUDA codegen bug (as of Clang 19/20) where
+ * coroutine frames get corrupted during symmetric transfer chains.
+ */
+// ============================================================================
 // RunContext -- execution context for coroutines (GPU-side)
 // ============================================================================
 
@@ -117,6 +133,21 @@ struct RunContext {
   u32 thread_id_;
 
   /**
+   * Opaque pointer to the FutureShm being awaited (set by Future::await_suspend).
+   * Non-null when suspended on co_await future. The Worker checks
+   * FUTURE_COMPLETE on this FutureShm before resuming the coroutine.
+   * Typed as void* to avoid circular dependency with task.h.
+   */
+  void *awaited_fshm_;
+
+  /**
+   * Opaque pointer to the Task* being awaited (set by Future::await_suspend).
+   * Used by Worker to deserialize output before resuming the coroutine,
+   * avoiding allocation issues inside resumed coroutine frames.
+   */
+  void *awaited_task_;
+
+  /**
    * Memory allocator interface.
    * Default: device malloc/free.
    * Runtime sets these to CHI_IPC->AllocateBuffer / FreeBuffer wrappers.
@@ -133,6 +164,8 @@ struct RunContext {
         spins_remaining_(0),
         block_id_(0),
         thread_id_(0),
+        awaited_fshm_(nullptr),
+        awaited_task_(nullptr),
         alloc_fn_(nullptr),
         free_fn_(nullptr),
         alloc_ctx_(nullptr) {}
@@ -144,6 +177,8 @@ struct RunContext {
         spins_remaining_(0),
         block_id_(block_id),
         thread_id_(thread_id),
+        awaited_fshm_(nullptr),
+        awaited_task_(nullptr),
         alloc_fn_(nullptr),
         free_fn_(nullptr),
         alloc_ctx_(nullptr) {}
@@ -240,20 +275,30 @@ class TaskResume {
     __device__ std::suspend_always initial_suspend() noexcept { return {}; }
 
     struct FinalAwaiter {
-      std::coroutine_handle<> caller_;
-
       __device__ bool await_ready() noexcept { return false; }
 
+      /**
+       * On GPU, symmetric transfer is NOT a tail call — .resume() returns
+       * normally through the call stack. If we returned the caller's handle
+       * here, the caller's await_resume would destroy our frame while our
+       * .resume() is still on the stack (use-after-free).
+       *
+       * Instead, always return noop_coroutine(). The Worker detects that the
+       * inner coroutine is done and chain-resumes callers explicitly, with
+       * the stack fully unwound between each step.
+       */
       __device__ std::coroutine_handle<>
-      await_suspend(std::coroutine_handle<>) noexcept {
-        return caller_ ? caller_ : std::noop_coroutine();
+      await_suspend(std::coroutine_handle<> h) noexcept {
+        printf("[FinalAwaiter] coroutine %p reached final_suspend, returning noop\n",
+               h.address());
+        return std::noop_coroutine();
       }
 
       __device__ void await_resume() noexcept {}
     };
 
     __device__ FinalAwaiter final_suspend() noexcept {
-      return FinalAwaiter{caller_handle_};
+      return FinalAwaiter{};
     }
 
     __device__ void return_void() {}
@@ -271,21 +316,26 @@ class TaskResume {
 
  private:
   handle_type handle_;
+  std::coroutine_handle<> caller_handle_;  /**< Stored by await_suspend for await_resume */
 
  public:
-  __device__ explicit TaskResume(handle_type h) : handle_(h) {}
-  __device__ TaskResume() : handle_(nullptr) {}
+  __device__ explicit TaskResume(handle_type h)
+      : handle_(h), caller_handle_(nullptr) {}
+  __device__ TaskResume() : handle_(nullptr), caller_handle_(nullptr) {}
 
   __device__ TaskResume(TaskResume &&other) noexcept
-      : handle_(other.handle_) {
+      : handle_(other.handle_), caller_handle_(other.caller_handle_) {
     other.handle_ = nullptr;
+    other.caller_handle_ = nullptr;
   }
 
   __device__ TaskResume &operator=(TaskResume &&other) noexcept {
     if (this != &other) {
       if (handle_) handle_.destroy();
       handle_ = other.handle_;
+      caller_handle_ = other.caller_handle_;
       other.handle_ = nullptr;
+      other.caller_handle_ = nullptr;
     }
     return *this;
   }
@@ -320,12 +370,25 @@ class TaskResume {
   // Awaiter interface -- co_await TaskResume for nested coroutines
   // ==========================================================================
 
-  __device__ bool await_ready() const noexcept { return false; }
+  __device__ bool await_ready() const noexcept {
+    return handle_ && handle_.done();
+  }
 
+  /**
+   * Suspend the calling coroutine and run the inner to completion or suspension.
+   *
+   * Matches the CPU pattern (task.h): manually resumes the inner coroutine
+   * and returns bool. This avoids symmetric transfer, which on GPU is NOT
+   * a tail call and would cause use-after-free when await_resume destroys
+   * the inner frame while inner's .resume() is still on the stack.
+   */
   template <typename PromiseT>
-  __device__ std::coroutine_handle<>
+  __device__ bool
   await_suspend(std::coroutine_handle<PromiseT> caller_handle) noexcept {
-    handle_.promise().set_caller(caller_handle);
+    if (!handle_) return false;
+
+    // Store caller handle for await_resume to use
+    caller_handle_ = caller_handle;
 
     // Propagate RunContext from caller to inner
     if constexpr (requires { caller_handle.promise().get_run_context(); }) {
@@ -333,11 +396,56 @@ class TaskResume {
       if (ctx) handle_.promise().set_run_context(ctx);
     }
 
-    return handle_;  // symmetric transfer
+    // NOTE: Do NOT set caller on inner's promise yet. If inner completes
+    // synchronously, FinalAwaiter would try to access a stale caller.
+    // We set it only after confirming inner suspended.
+
+    // Manually resume the inner coroutine
+    printf("[TaskResume::await_suspend] resuming inner %p\n", handle_.address());
+    handle_.resume();
+    printf("[TaskResume::await_suspend] inner resumed, done=%d\n",
+           (int)handle_.done());
+
+    // Check if inner completed synchronously
+    if (handle_.done()) {
+      handle_.destroy();
+      handle_ = nullptr;
+      return false;  // Don't suspend caller — inner already done
+    }
+
+    // Inner suspended (on co_await Future or yield).
+    // NOW safe to set caller — inner will complete asynchronously.
+    handle_.promise().set_caller(caller_handle);
+    printf("[TaskResume::await_suspend] set caller=%p on inner, returning true\n",
+           caller_handle.address());
+    return true;  // Suspend caller
   }
 
+  /**
+   * Resume after inner coroutine completes.
+   *
+   * Safe to destroy inner here because FinalAwaiter returns noop_coroutine()
+   * on GPU — inner's .resume() call has fully unwound before we get here.
+   * The Worker chain-resumes callers explicitly.
+   */
   __device__ void await_resume() noexcept {
-    if (handle_) { handle_.destroy(); handle_ = nullptr; }
+    printf("[TaskResume::await_resume] handle_=%p caller_handle_=%p\n",
+           handle_ ? handle_.address() : nullptr,
+           caller_handle_ ? caller_handle_.address() : nullptr);
+    if (handle_) {
+      auto *ctx = handle_.promise().get_run_context();
+      printf("[TaskResume::await_resume] destroying inner %p\n", handle_.address());
+      handle_.destroy();
+      handle_ = nullptr;
+
+      // Update coro_handle_ to this coroutine (the caller) so that
+      // subsequent yields or co_awaits are tracked correctly.
+      if (ctx && caller_handle_) {
+        ctx->coro_handle_ = caller_handle_;
+        printf("[TaskResume::await_resume] updated coro_handle_ to caller %p\n",
+               caller_handle_.address());
+      }
+    }
   }
 };
 

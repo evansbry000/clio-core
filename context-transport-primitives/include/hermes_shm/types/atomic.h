@@ -442,19 +442,15 @@ struct rocm_atomic {
   }
 
   /** System-scope atomic store: fence first so prior writes are globally
-   *  visible before the signal value is updated. Uses system-scope exchange
-   *  so CPU can observe the new value without going through GPU L2. */
+   *  visible before the signal value is updated. Uses volatile write +
+   *  threadfence_system for cross-device visibility. atomicExch_system
+   *  can hang on pinned host memory in persistent kernels. */
   template <typename U>
   HSHM_INLINE_CROSS_FUN void store_system(U count) {
 #if HSHM_IS_GPU
     __threadfence_system();
-    if constexpr (sizeof(T) == 8) {
-      atomicExch_system(reinterpret_cast<unsigned long long*>(&x),
-                        static_cast<unsigned long long>(static_cast<T>(count)));
-    } else {
-      atomicExch_system(reinterpret_cast<unsigned int*>(&x),
-                        static_cast<unsigned int>(static_cast<T>(count)));
-    }
+    *reinterpret_cast<volatile T*>(&x) = static_cast<T>(count);
+    __threadfence_system();
 #else
     x = static_cast<T>(count);
 #endif
@@ -462,21 +458,11 @@ struct rocm_atomic {
 
   /** System-scope atomic load: bypasses GPU L2 cache so GPU can observe
    *  CPU-written values in pinned host memory without stale L2 reads.
-   *  Uses atomicAdd_system(&x, 0) as the standard CUDA trick for this. */
+   *  Uses volatile read which bypasses L2 cache on NVIDIA GPUs for
+   *  pinned host memory accessed via UVA. atomicAdd_system(&x, 0) can
+   *  hang on pinned host memory in persistent kernels. */
   HSHM_INLINE_CROSS_FUN T load_system() const {
-#if HSHM_IS_GPU
-    if constexpr (sizeof(T) == 8) {
-      return (T)atomicAdd_system(
-          reinterpret_cast<unsigned long long*>(const_cast<T*>(&x)),
-          (unsigned long long)0);
-    } else {
-      return (T)atomicAdd_system(
-          reinterpret_cast<unsigned int*>(const_cast<T*>(&x)),
-          (unsigned int)0);
-    }
-#else
     return *reinterpret_cast<const volatile T*>(&x);
-#endif
   }
 
   /** Atomic compare exchange weak wrapper */
@@ -667,13 +653,15 @@ struct rocm_atomic {
   }
 
   /** System-scope bitwise or assign: fence first (prior GPU writes globally
-   *  visible), then system-scope OR so CPU can observe the flag update. */
+   *  visible), then volatile RMW so CPU can observe the flag update.
+   *  atomicOr_system can hang on pinned host memory in persistent kernels. */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &or_system(U other) {
 #if HSHM_IS_GPU
     __threadfence_system();
-    atomicOr_system(reinterpret_cast<unsigned int*>(&x),
-                    static_cast<unsigned int>(other));
+    volatile T *vptr = reinterpret_cast<volatile T*>(&x);
+    *vptr = *vptr | static_cast<T>(other);
+    __threadfence_system();
 #else
     x |= static_cast<T>(other);
 #endif

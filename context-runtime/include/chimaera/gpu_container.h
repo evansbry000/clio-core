@@ -113,6 +113,22 @@ class Container {
   }
 
   /**
+   * Virtual dispatch for deserializing task output onto an existing task.
+   * Called by Worker before resuming a suspended coroutine, so the
+   * deserialization runs outside the coroutine frame (avoids GPU allocator
+   * issues in resumed coroutines).
+   *
+   * @param method Method ID identifying the task type
+   * @param archive LocalLoadTaskArchive containing serialized output
+   * @param task FullPtr to the task to populate output fields on
+   */
+  HSHM_GPU_FUN virtual void LocalLoadTaskOutput(
+      u32 method, LocalLoadTaskArchive &archive,
+      const hipc::FullPtr<Task> &task) {
+    (void)method; (void)archive; (void)task;
+  }
+
+  /**
    * Get remaining work for load balancing
    * @return Amount of work remaining (0 = idle)
    */

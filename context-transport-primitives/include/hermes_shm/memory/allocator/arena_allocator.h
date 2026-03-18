@@ -213,6 +213,17 @@ class _ArenaAllocator : public Allocator {
     // No TLS needed for arena allocator
   }
 
+  /** Arena allocator is already a bump allocator — PushArena is a no-op */
+  HSHM_CROSS_FUN bool PushArenaState(ArenaState &prior, OffsetPtr<> &block, size_t size) {
+    (void)prior; (void)block; (void)size;
+    return false;
+  }
+
+  /** No-op */
+  HSHM_CROSS_FUN void PopArenaState(const ArenaState &prior, OffsetPtr<> block) {
+    (void)prior; (void)block;
+  }
+
   /**
    * Reset the arena to empty state
    *

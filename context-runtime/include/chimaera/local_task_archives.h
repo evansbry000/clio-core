@@ -142,6 +142,113 @@ using LocalLbmBase = hshm::lbm::LbmMeta<CHI_PRIV_ALLOC_T>;
 using LocalTaskInfoVec = chi::priv::vector<LocalTaskInfo>;
 
 /**
+ * Dry-run archive that computes serialized size for a task without copying.
+ * Implements the same API surface as LocalSaveTaskArchive so that
+ * SerializeIn / SerializeOut code paths work unchanged.
+ * Used by LocalSaveTaskArchive to pre-size the buffer before serialization.
+ */
+class CalculateSizeTaskArchive {
+ public:
+  using is_saving = std::true_type;
+  using is_loading = std::false_type;
+  using supports_range_ops = std::true_type;
+
+ private:
+  hshm::ipc::CalculateSizeArchive calc_;
+  LocalMsgType msg_type_;
+
+ public:
+  HSHM_CROSS_FUN explicit CalculateSizeTaskArchive(LocalMsgType msg_type)
+      : msg_type_(msg_type) {}
+
+  /** Get the total computed size */
+  HSHM_INLINE_CROSS_FUN size_t size() const { return calc_.size(); }
+
+  /** Serialize operator — for non-Task types, delegates to CalculateSizeArchive */
+  template <typename T>
+  HSHM_CROSS_FUN CalculateSizeTaskArchive &operator<<(const T &obj) {
+    calc_ << obj;
+    return *this;
+  }
+
+  /** & operator */
+  template <typename T>
+  HSHM_CROSS_FUN CalculateSizeTaskArchive &operator&(const T &obj) {
+    calc_ << obj;
+    return *this;
+  }
+
+  /** Call operator */
+  template <typename... Args>
+  HSHM_CROSS_FUN void operator()(Args &...args) {
+    (calc_.base(args), ...);
+  }
+
+  /** Write raw binary data — just accumulate size */
+  HSHM_CROSS_FUN void write_binary(const char *data, size_t size) {
+    calc_.write_binary(data, size);
+  }
+
+  /** write_range — compute span size */
+  template <typename FirstT, typename LastT>
+  HSHM_INLINE_CROSS_FUN void write_range(const FirstT *first,
+                                          const LastT *last) {
+    calc_.write_range(first, last);
+  }
+
+  /** range() — compute span size of contiguous POD fields */
+  template <typename... Args>
+  HSHM_INLINE_CROSS_FUN void range(Args &...args) {
+    calc_.range(args...);
+  }
+
+  /** Fused string save — just accumulate size */
+  HSHM_CROSS_FUN void save_string_fused(const char *str_data, size_t len) {
+    calc_.save_string_fused(str_data, len);
+  }
+
+  /** Bulk transfer size for ShmPtr */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(hipc::ShmPtr<T> ptr, size_t size, uint32_t flags) {
+    if (!ptr.alloc_id_.IsNull()) {
+      // mode=0: uint8_t + size_t + u32 + u32
+      calc_.cur_off_ += sizeof(uint8_t) + sizeof(size_t) +
+                         sizeof(uint32_t) + sizeof(uint32_t);
+    } else if (ptr.off_.load() != 0) {
+      // mode=3: uint8_t + size_t
+      calc_.cur_off_ += sizeof(uint8_t) + sizeof(size_t);
+    } else if (flags & BULK_XFER) {
+      // mode=1: uint8_t + data bytes
+      calc_.cur_off_ += sizeof(uint8_t) + size;
+    } else {
+      // mode=2: uint8_t
+      calc_.cur_off_ += sizeof(uint8_t);
+    }
+  }
+
+  /** Bulk transfer size for FullPtr */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(const hipc::FullPtr<T> &ptr, size_t size,
+                           uint32_t flags) {
+    if (!ptr.shm_.alloc_id_.IsNull()) {
+      calc_.cur_off_ += sizeof(uint8_t) + sizeof(size_t) +
+                         sizeof(uint32_t) + sizeof(uint32_t);
+    } else if (flags & BULK_XFER) {
+      calc_.cur_off_ += sizeof(uint8_t) + size;
+    } else {
+      calc_.cur_off_ += sizeof(uint8_t);
+    }
+  }
+
+  /** Bulk transfer size for raw pointer */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(T *ptr, size_t size, uint32_t flags) {
+    (void)ptr; (void)flags;
+    calc_.cur_off_ += size;
+  }
+};
+
+/**
  * Archive for saving tasks (inputs or outputs) using LocalSerialize
  * Local version that uses hshm::ipc::LocalSerialize instead of cereal
  * GPU version uses priv::vector with GPU allocator
@@ -153,6 +260,7 @@ class LocalSaveTaskArchive : public LocalLbmBase {
  public:
   using is_saving = std::true_type;
   using is_loading = std::false_type;
+  using supports_range_ops = std::true_type;
   LocalTaskInfoVec task_infos_;
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
 
@@ -168,6 +276,9 @@ class LocalSaveTaskArchive : public LocalLbmBase {
    */
   template <typename Ar>
   HSHM_CROSS_FUN void serialize(Ar &ar) {
+    if constexpr (Ar::is_saving::value) {
+      serializer_.Finalize();
+    }
     ar(this->send, this->recv, this->send_bulks, this->recv_bulks);
     ar(task_infos_, msg_type_);
     ar(buffer_);
@@ -293,6 +404,24 @@ class LocalSaveTaskArchive : public LocalLbmBase {
     serializer_.write_binary(data, size);
   }
 
+  /** Fused string save — delegates to serializer */
+  HSHM_CROSS_FUN void save_string_fused(const char *str_data, size_t len) {
+    serializer_.save_string_fused(str_data, len);
+  }
+
+  /** Batch-serialize a contiguous range of POD fields in one memcpy */
+  template <typename FirstT, typename LastT>
+  HSHM_INLINE_CROSS_FUN void write_range(const FirstT *first,
+                                          const LastT *last) {
+    serializer_.write_range(first, last);
+  }
+
+  /** range() — batch-serialize contiguous POD fields */
+  template <typename... Args>
+  HSHM_INLINE_CROSS_FUN void range(Args &...args) {
+    serializer_.range(args...);
+  }
+
   /**
    * Bulk transfer support for ShmPtr - just serialize the pointer value
    *
@@ -390,20 +519,29 @@ class LocalSaveTaskArchive : public LocalLbmBase {
    *
    * @return Size of serialized data
    */
-  HSHM_CROSS_FUN size_t GetSize() const { return buffer_.size(); }
+  HSHM_CROSS_FUN size_t GetSize() {
+    serializer_.Finalize();
+    return buffer_.size();
+  }
   /**
    * Get serialized data
    *
    * @return Reference to buffer containing serialized data
    */
-  HSHM_CROSS_FUN const chi::priv::vector<char> &GetData() const { return buffer_; }
+  HSHM_CROSS_FUN const chi::priv::vector<char> &GetData() {
+    serializer_.Finalize();
+    return buffer_;
+  }
 
   /**
    * Move serialized data out of the archive
    *
    * @return Moved buffer containing serialized data
    */
-  chi::priv::vector<char> MoveData() { return std::move(buffer_); }
+  chi::priv::vector<char> MoveData() {
+    serializer_.Finalize();
+    return std::move(buffer_);
+  }
 };
 
 /**
@@ -418,6 +556,7 @@ class LocalLoadTaskArchive : public LocalLbmBase {
  public:
   using is_saving = std::false_type;
   using is_loading = std::true_type;
+  using supports_range_ops = std::true_type;
   LocalTaskInfoVec task_infos_;
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
 
@@ -621,6 +760,18 @@ class LocalLoadTaskArchive : public LocalLbmBase {
   /** Read raw binary data from the deserializer */
   HSHM_CROSS_FUN void read_binary(char *data, size_t size) {
     deserializer_.read_binary(data, size);
+  }
+
+  /** Batch-deserialize a contiguous range of POD fields in one memcpy */
+  template <typename FirstT, typename LastT>
+  HSHM_INLINE_CROSS_FUN void read_range(FirstT *first, LastT *last) {
+    deserializer_.read_range(first, last);
+  }
+
+  /** range() — batch-deserialize contiguous POD fields */
+  template <typename... Args>
+  HSHM_INLINE_CROSS_FUN void range(Args &...args) {
+    deserializer_.range(args...);
   }
 
   /**
