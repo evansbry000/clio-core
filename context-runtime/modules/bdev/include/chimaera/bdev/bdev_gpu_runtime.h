@@ -65,7 +65,9 @@ class GpuRuntime : public chi::gpu::Container {
                           chi::gpu::RunContext &rctx);
 
   HSHM_GPU_FUN chi::u32 GetGpuParallelism(chi::u32 method_id) const override {
-    if (method_id == Method::kWrite || method_id == Method::kRead) return 32;
+    // TODO(opt): multi-lane (32) once GPU coroutine dispatch supports it.
+    // Currently only lane 0 executes per coroutine, so use sequential copy.
+    (void)method_id;
     return 1;
   }
 

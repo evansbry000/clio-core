@@ -325,7 +325,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::RegisterTarget(
 
   // Push to targets vector
   meta_->targets_.push_back(info);
-
   task->return_code_ = 0;
   co_return;
 }
@@ -888,6 +887,12 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> GpuRuntime::LocalAllocLoadTask(
       task_ptr = new_task.template Cast<chi::Task>();
       break;
     }
+    case Method::kRegisterTarget: {
+      auto new_task = ipc->template NewTask<RegisterTargetTask>();
+      archive >> *new_task.ptr_;
+      task_ptr = new_task.template Cast<chi::Task>();
+      break;
+    }
     default:
       task_ptr = hipc::FullPtr<chi::Task>::GetNull();
       break;
@@ -911,6 +916,11 @@ HSHM_GPU_FUN void GpuRuntime::LocalSaveTask(
     }
     case Method::kGetOrCreateTag: {
       auto typed = task.template Cast<GetOrCreateTagTask<CreateParams>>();
+      archive << *typed.ptr_;
+      break;
+    }
+    case Method::kRegisterTarget: {
+      auto typed = task.template Cast<RegisterTargetTask>();
       archive << *typed.ptr_;
       break;
     }

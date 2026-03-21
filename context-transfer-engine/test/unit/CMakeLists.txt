@@ -370,29 +370,10 @@ add_test(NAME cte_config_tests
 add_test(NAME cte_dpe_tests
     COMMAND test_cte_config_dpe "[cte][dpe]")
 
-# Add test_core_functionality tests
-add_test(NAME cte_functional_pool_creation
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_target_registration
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_putblob
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_getblob
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_putget_integration
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_putget_comprehensive
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_reorganize
-    COMMAND test_core_functionality)
-
-add_test(NAME cte_functional_e2e_workflow
+# Add test_core_functionality as a single test (the binary runs all 9 internal
+# test cases in one invocation; duplicating CTest entries causes parallel runs
+# that fight over shared memory and ports).
+add_test(NAME cte_functional_all
     COMMAND test_core_functionality)
 
 # Add test_query tests - use test names for filtering (simple_test.h filters by name, not tags)
@@ -627,16 +608,9 @@ set_tests_properties(
 )
 
 set_tests_properties(
-    cte_functional_pool_creation
-    cte_functional_target_registration
-    cte_functional_putblob
-    cte_functional_getblob
-    cte_functional_putget_integration
-    cte_functional_putget_comprehensive
-    cte_functional_reorganize
-    cte_functional_e2e_workflow
+    cte_functional_all
     PROPERTIES
-        TIMEOUT 300  # 5 minute timeout for each test
+        TIMEOUT 300  # 5 minute timeout
         LABELS "functional;core;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
@@ -821,14 +795,7 @@ set_tests_properties(
     cte_core_performance
     cte_config_tests
     cte_dpe_tests
-    cte_functional_pool_creation
-    cte_functional_target_registration
-    cte_functional_putblob
-    cte_functional_getblob
-    cte_functional_putget_integration
-    cte_functional_putget_comprehensive
-    cte_functional_reorganize
-    cte_functional_e2e_workflow
+    cte_functional_all
     cte_query_tag_exact
     cte_query_tag_wildcard
     cte_query_tag_alternation
@@ -904,6 +871,27 @@ set_tests_properties(
     PROPERTIES LABELS "msan_skip"
 )
 
+# Tests that start a full Chimaera runtime share /tmp/chimaera_iowarp SHM
+# segments and TCP/IPC ports, so they must NOT run in parallel.
+set_tests_properties(
+    cte_tag_construction
+    cte_tag_putblob
+    cte_tag_getblob
+    cte_tag_errors
+    cte_tag_metadata
+    cte_tag_reorganize
+    cte_tag_async
+    cte_tag_large
+    cte_tag_edge
+    cte_functional_all
+    cte_tiered_storage_all
+    cte_reorganize_all
+    cte_gpu_coroutine
+    cte_gpu_core_all
+    cte_gpu_create
+    PROPERTIES RESOURCE_LOCK "chimaera_runtime"
+)
+
 # All cte_functional_* tests run test_core_functionality (9 test cases, each
 # initializing and finalizing the full chimaera runtime).  After multiple
 # runtime init/finalize cycles, ZMQ background threads fire callbacks on
@@ -911,14 +899,7 @@ set_tests_properties(
 # defects under ASan.  The same uninstrumented-runtime category caused all CTE
 # tests to be msan_skip'd.  Skip the whole functional group under ASan.
 set_tests_properties(
-    cte_functional_pool_creation
-    cte_functional_target_registration
-    cte_functional_putblob
-    cte_functional_getblob
-    cte_functional_putget_integration
-    cte_functional_putget_comprehensive
-    cte_functional_reorganize
-    cte_functional_e2e_workflow
+    cte_functional_all
     PROPERTIES LABELS "msan_skip;asan_skip"
 )
 

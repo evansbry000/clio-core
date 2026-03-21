@@ -936,12 +936,15 @@ void *IpcManager::AllocGpuContainer(const PoolId &pool_id, u32 container_id,
 
 #endif
 
-void IpcManager::PauseGpuOrchestrator() {
+bool IpcManager::PauseGpuOrchestrator() {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
-    return;
+    return false;
   }
   auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
+  if (!orchestrator->is_launched_) {
+    return false;  // Already paused by someone else
+  }
   orchestrator->Pause();
 
   // After the kernel is stopped, check if the lane count changed.
@@ -952,6 +955,9 @@ void IpcManager::PauseGpuOrchestrator() {
   if (new_lanes != gpu2gpu_num_lanes_ && !gpu2gpu_queue_backends_.empty()) {
     RebuildGpu2GpuQueue(0, new_lanes);
   }
+  return true;
+#else
+  return false;
 #endif
 }
 
@@ -1036,11 +1042,20 @@ TaskQueue *IpcManager::GetGpuToGpuQueue(size_t gpu_id) {
 
 void IpcManager::RegisterGpuAllocator(const hipc::MemoryBackendId &id,
                                        char *data, size_t capacity) {
+  // Host-side map for ToFullPtr resolution on CPU
   u64 key = (static_cast<u64>(id.major_) << 32) |
             static_cast<u64>(id.minor_);
   allocator_map_lock_.WriteLock();
   gpu_alloc_map_[key] = GpuAllocInfo{data, capacity};
   allocator_map_lock_.WriteUnlock();
+
+  // GPU-side table in orchestrator info for ToFullPtr resolution on GPU
+  auto &info = gpu_orchestrator_info_;
+  if (info.num_gpu_allocs < IpcManagerGpuInfo::kMaxGpuAllocs) {
+    info.gpu_allocs[info.num_gpu_allocs].alloc_id = id;
+    info.gpu_allocs[info.num_gpu_allocs].base = data;
+    ++info.num_gpu_allocs;
+  }
 }
 
 bool IpcManager::ClientInitQueues() {
@@ -1631,6 +1646,15 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
   auto it = alloc_map_.find(alloc_key);
   if (it != alloc_map_.end()) {
     it->second->Free(buffer_ptr);
+    return;
+  }
+
+  // Check GPU backend registrations (e.g., data backends from benchmarks).
+  // These are raw memory regions without a proper allocator — the GPU-side
+  // allocator manages them. On the host we silently skip the free since the
+  // memory is owned by the GPU backend and freed when it's destroyed.
+  auto git = gpu_alloc_map_.find(alloc_key);
+  if (git != gpu_alloc_map_.end()) {
     return;
   }
 
@@ -3257,6 +3281,12 @@ IpcManagerGpuInfo IpcManager::GetClientGpuInfo(u32 gpu_id) {
   if (gpu_id < gpu2cpu_copy_backends_.size()) {
     info.gpu2cpu_backend =
         static_cast<hipc::MemoryBackend &>(*gpu2cpu_copy_backends_[gpu_id]);
+  }
+
+  // Copy registered GPU allocators for GPU-side ShmPtr resolution
+  info.num_gpu_allocs = gpu_orchestrator_info_.num_gpu_allocs;
+  for (u32 i = 0; i < info.num_gpu_allocs; ++i) {
+    info.gpu_allocs[i] = gpu_orchestrator_info_.gpu_allocs[i];
   }
 
   return info;

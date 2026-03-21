@@ -141,11 +141,11 @@ class GlobalSerialize {
   HSHM_INLINE
   GlobalSerialize &write_binary(const char *data, size_t size) {
     size_t new_off = cur_off_ + size;
-    if (new_off > data_.capacity()) {
-      size_t new_cap = data_.capacity();
+    if (new_off > data_.size()) {
+      size_t new_cap = data_.size();
       if (new_cap == 0) new_cap = 64;
       while (new_cap < new_off) new_cap *= 2;
-      data_.reserve(new_cap);
+      data_.resize(new_cap);
     }
     if (size > 0) {
       memcpy(data_.data() + cur_off_, data, size);
@@ -160,11 +160,11 @@ class GlobalSerialize {
   void save_string_fused(const char *str_data, size_t len) {
     size_t total = sizeof(size_t) + len;
     size_t new_off = cur_off_ + total;
-    if (new_off > data_.capacity()) {
-      size_t new_cap = data_.capacity();
+    if (new_off > data_.size()) {
+      size_t new_cap = data_.size();
       if (new_cap == 0) new_cap = 64;
       while (new_cap < new_off) new_cap *= 2;
-      data_.reserve(new_cap);
+      data_.resize(new_cap);
     }
     char *dst = data_.data() + cur_off_;
     memcpy(dst, &len, sizeof(size_t));

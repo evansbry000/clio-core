@@ -153,7 +153,9 @@ __global__ void gpu_putblob_kernel(
       if (chi::IpcManager::IsWarpScheduler()) {
         wrp_cte::core::Client cte_client(cte_pool_id);
 
-        // Build ShmPtr referencing the data allocator backend
+        // Build ShmPtr using the data backend's allocator ID and offset.
+        // The orchestrator resolves this via the GPU alloc table populated
+        // by RegisterGpuAllocator().
         hipc::ShmPtr<> blob_shm;
         blob_shm.alloc_id_ = data_alloc_id;
         size_t base_off = array_ptr.shm_.off_.load();
@@ -834,6 +836,33 @@ int main(int argc, char **argv) {
   if (num_gpus == 0) {
     HLOG(kError, "No GPUs available");
     return 1;
+  }
+
+  // gpu_putblob_kernel uses ~145 registers/thread.  With 65536 regs/block
+  // on most GPUs, max threads/block ≈ 448 → cap at 256 (8 warps) and
+  // redistribute excess warps across multiple blocks.
+  {
+    constexpr chi::u32 kMaxClientThreads = 256;
+    chi::u32 total_client_threads = cfg.client_blocks * cfg.client_threads;
+    if (cfg.client_threads > kMaxClientThreads && total_client_threads > kMaxClientThreads) {
+      cfg.client_blocks = (total_client_threads + kMaxClientThreads - 1) / kMaxClientThreads;
+      cfg.client_threads = kMaxClientThreads;
+    }
+  }
+
+  // Auto-scale orchestrator warp count to match client warps for GPU-path
+  // benchmarks. The GPU→GPU queue is partitioned by orchestrator warp count;
+  // if the orchestrator has fewer warps than the client, all client warps
+  // funnel into one lane, which saturates at queue_depth and deadlocks.
+  if (cfg.test_case == TestCase::kPutBlobGpu) {
+    chi::u32 client_warps = (cfg.client_blocks * cfg.client_threads) / 32;
+    chi::u32 rt_warps = (cfg.rt_blocks * cfg.rt_threads) / 32;
+    if (rt_warps < client_warps) {
+      // Spread warps across blocks to avoid exceeding per-block limits.
+      // Use 32 threads/block (1 warp per block) × N blocks = N warps.
+      cfg.rt_threads = 32;
+      cfg.rt_blocks = client_warps;
+    }
   }
 
   // Load GPU config if CHI_SERVER_CONF is not already set

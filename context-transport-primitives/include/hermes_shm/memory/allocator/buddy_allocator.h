@@ -200,20 +200,18 @@ class _BuddyAllocator : public Allocator {
 
   ArenaState cur_arena_;  /**< Current bump arena (if active) */
 
-  char * __restrict__ base_;  /**< Cached base pointer (always valid, avoids GetBackendData() on GPU) */
-
   // _MultiProcessAllocator needs access to reconstruct pointers when attaching
   friend class _MultiProcessAllocator;
 
  public:
-  /** Convert offset to raw pointer using cached base */
+  /** Convert offset to raw pointer (position-independent, safe for multi-process) */
   HSHM_INLINE_CROSS_FUN PageT *OffsetToPage(size_t offset) {
-    return reinterpret_cast<PageT *>(base_ + offset);
+    return reinterpret_cast<PageT *>(GetBackendData() + offset);
   }
 
-  /** Convert raw pointer back to offset */
+  /** Convert raw pointer back to offset (position-independent, safe for multi-process) */
   HSHM_INLINE_CROSS_FUN size_t PageToOffset(PageT *ptr) {
-    return reinterpret_cast<char *>(ptr) - base_;
+    return reinterpret_cast<char *>(ptr) - GetBackendData();
   }
 
   /**
@@ -224,7 +222,6 @@ class _BuddyAllocator : public Allocator {
     alloc_header_size_ = sizeof(_BuddyAllocator);
     this_ = reinterpret_cast<char *>(this) -
             reinterpret_cast<char *>(backend.data_);
-    base_ = reinterpret_cast<char *>(backend.data_);
 
     if (region_size == 0) {
       region_size = backend.data_capacity_ - this_;
@@ -264,11 +261,29 @@ class _BuddyAllocator : public Allocator {
     // Fast path: bump-allocate from active arena
     if (cur_arena_.IsActive()) {
       constexpr size_t kAlign = 16;
+#if HSHM_IS_GPU
+      // GPU: multiple threads in a warp may share this allocator partition.
+      // Use atomicCAS loop for thread-safe bump allocation.
+      while (true) {
+        size_t cur = *(volatile size_t *)&cur_arena_.arena_cur_;
+        size_t aligned_cur = (cur + kAlign - 1) & ~(kAlign - 1);
+        size_t new_cur = aligned_cur + requested_size;
+        if (new_cur > cur_arena_.arena_end_) break;
+        size_t old = atomicCAS(
+            reinterpret_cast<unsigned long long *>(&cur_arena_.arena_cur_),
+            static_cast<unsigned long long>(cur),
+            static_cast<unsigned long long>(new_cur));
+        if (old == cur) {
+          return OffsetPtr<>(aligned_cur);
+        }
+      }
+#else
       size_t aligned_cur = (cur_arena_.arena_cur_ + kAlign - 1) & ~(kAlign - 1);
       if (aligned_cur + requested_size <= cur_arena_.arena_end_) {
         cur_arena_.arena_cur_ = aligned_cur + requested_size;
         return OffsetPtr<>(aligned_cur);
       }
+#endif
     }
 
     // Slow path: regular BuddyAllocator
@@ -305,7 +320,8 @@ class _BuddyAllocator : public Allocator {
       return new_offset;
     }
 
-    memcpy(base_ + new_offset.load(), base_ + offset.load(), old_size);
+    char *base = GetBackendData();
+    memcpy(base + new_offset.load(), base + offset.load(), old_size);
     FreeOffset(offset);
     return new_offset;
   }
@@ -393,7 +409,7 @@ class _BuddyAllocator : public Allocator {
    * Compact the heap (host-only, shared mode only)
    */
   ForwardingTable Compact() {
-    char *base = base_;
+    char *base = GetBackendData();
     size_t scan_start = GetAllocatorDataOff() + sizeof(PageT);
     size_t scan_end = big_heap_.GetOffset();
     size_t arena_tail_start = small_arena_.GetOffset();

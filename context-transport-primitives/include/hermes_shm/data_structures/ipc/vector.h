@@ -1709,7 +1709,6 @@ HSHM_CROSS_FUN void vector<T, AllocT>::resize(size_t new_size) {
       reserve(new_size);
     }
 
-    // Skip initialization for POD types
     if constexpr (!std::is_trivially_constructible<T>::value) {
       auto fp = FullPtr(alloc, data_);
       if (fp.ptr_) {
@@ -1720,6 +1719,11 @@ HSHM_CROSS_FUN void vector<T, AllocT>::resize(size_t new_size) {
             new (fp.ptr_ + i) T();
           }
         }
+      }
+    } else {
+      auto fp = FullPtr(alloc, data_);
+      if (fp.ptr_) {
+        memset(fp.ptr_ + size_, 0, (new_size - size_) * sizeof(T));
       }
     }
     size_ = new_size;

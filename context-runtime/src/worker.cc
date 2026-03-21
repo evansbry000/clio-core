@@ -777,8 +777,11 @@ void Worker::EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
   // Send via SHM transport (blocking)
   shm_send_transport_->Send(archive, ctx);
 
-  // Set FUTURE_COMPLETE and clean up task
-  future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+  // Set FUTURE_COMPLETE and clean up task.
+  // Use SetBitsSystem for CPU→GPU visibility: on discrete GPUs the GPU's
+  // system-scope atomic read may not observe a plain CPU store without
+  // a system-scope fence/atomic on the CPU side.
+  future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
   // Clear TASK_DATA_OWNER before deletion so the destructor
   // doesn't try to FreeBuffer on transport-allocated data
   task_ptr->ClearFlags(TASK_DATA_OWNER);
@@ -889,8 +892,9 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     }
   } else {
     // Runtime task without parent (top-level client task) - set FUTURE_COMPLETE
-    // directly so the client's Wait() can see it
-    future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+    // directly so the client's Wait() can see it.
+    // Use SetBitsSystem for CPU→GPU visibility in UVM.
+    future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
   }
 }
 

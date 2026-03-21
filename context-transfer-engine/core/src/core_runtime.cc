@@ -2514,6 +2514,11 @@ chi::TaskResume Runtime::ReadData(const chi::priv::vector<BlobBlock> &blocks,
       HLOG(kError,
            "ReadData: READ FAILED - task[{}] read {} bytes, expected {}",
            task_idx, task->bytes_read_, expected_size);
+      // Wait for all remaining in-flight tasks before returning to avoid
+      // use-after-free when buffers are freed by the caller.
+      for (size_t j = task_idx + 1; j < read_tasks.size(); ++j) {
+        co_await read_tasks[j];
+      }
       error_code = 1;
       co_return;
     }

@@ -175,36 +175,46 @@ __global__ void test_gpu_allocate_buffer_kernel(
 {
   CHIMAERA_GPU_INIT(gpu_info);
 
-  // Each thread allocates a small buffer (64 bytes)
-  size_t alloc_size = 64;
+  // Warp-level allocation: only lane 0 allocates, all lanes verify.
+  // Each warp allocates (warp_size * per_lane_size) bytes, then each lane
+  // writes/verifies its own slice.
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  size_t per_lane_size = 64;
+  size_t alloc_size = 32 * per_lane_size;  // One allocation per warp
 
-  // Allocate buffer using GPU path
-  hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(alloc_size);
+  // Lane 0 allocates for the entire warp
+  __shared__ char *s_warp_buffer;
+  if (lane_id == 0) {
+    hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(alloc_size);
+    s_warp_buffer = buffer.IsNull() ? nullptr : buffer.ptr_;
+  }
+  __syncwarp();
 
-  // Store results
-  if (buffer.IsNull()) {
+  char *warp_buffer = s_warp_buffer;
+  if (warp_buffer == nullptr) {
     results[thread_id] = 1;  // Allocation failed
     allocated_sizes[thread_id] = 0;
     allocated_ptrs[thread_id] = nullptr;
   } else {
-    // Write pattern to buffer
+    // Each lane writes its own slice
+    char *my_slice = warp_buffer + lane_id * per_lane_size;
     char pattern = (char)(thread_id + 1);
-    for (size_t i = 0; i < alloc_size; ++i) {
-      buffer.ptr_[i] = pattern;
+    for (size_t i = 0; i < per_lane_size; ++i) {
+      my_slice[i] = pattern;
     }
 
     // Verify pattern
     bool pattern_ok = true;
-    for (size_t i = 0; i < alloc_size; ++i) {
-      if (buffer.ptr_[i] != pattern) {
+    for (size_t i = 0; i < per_lane_size; ++i) {
+      if (my_slice[i] != pattern) {
         pattern_ok = false;
         break;
       }
     }
 
     results[thread_id] = pattern_ok ? 0 : 2;  // 2=verification failed
-    allocated_sizes[thread_id] = alloc_size;
-    allocated_ptrs[thread_id] = buffer.ptr_;
+    allocated_sizes[thread_id] = per_lane_size;
+    allocated_ptrs[thread_id] = my_slice;
   }
 
   __syncthreads();
@@ -220,42 +230,53 @@ __global__ void test_gpu_to_full_ptr_kernel(
 {
   CHIMAERA_GPU_INIT(gpu_info);
 
-  // Allocate a buffer
-  size_t alloc_size = 512;
-  hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(alloc_size);
+  // Warp-level: only lane 0 allocates and tests ToFullPtr.
+  // Other lanes just pass.
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
 
-  if (buffer.IsNull()) {
-    results[thread_id] = 1;  // Allocation failed
-    return;
-  }
+  if (lane_id == 0) {
+    // Allocate a buffer
+    size_t alloc_size = 512;
+    hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(alloc_size);
 
-  // Write test data
-  char test_value = (char)(thread_id + 42);
-  for (size_t i = 0; i < alloc_size; ++i) {
-    buffer.ptr_[i] = test_value;
-  }
-
-  // Get a ShmPtr and convert back to FullPtr
-  hipc::ShmPtr<char> shm_ptr = buffer.shm_;
-
-  // Convert back using ToFullPtr
-  hipc::FullPtr<char> recovered = CHI_IPC->ToFullPtr(shm_ptr);
-
-  if (recovered.IsNull()) {
-    results[thread_id] = 3;  // ToFullPtr failed
-    return;
-  }
-
-  // Verify the recovered pointer works
-  bool data_ok = true;
-  for (size_t i = 0; i < alloc_size; ++i) {
-    if (recovered.ptr_[i] != test_value) {
-      data_ok = false;
-      break;
+    if (buffer.IsNull()) {
+      results[thread_id] = 1;  // Allocation failed
+      __syncwarp();
+      return;
     }
-  }
 
-  results[thread_id] = data_ok ? 0 : 4;  // 4=recovered data mismatch
+    // Write test data
+    char test_value = (char)(thread_id + 42);
+    for (size_t i = 0; i < alloc_size; ++i) {
+      buffer.ptr_[i] = test_value;
+    }
+
+    // Get a ShmPtr and convert back to FullPtr
+    hipc::ShmPtr<char> shm_ptr = buffer.shm_;
+
+    // Convert back using ToFullPtr
+    hipc::FullPtr<char> recovered = CHI_IPC->ToFullPtr(shm_ptr);
+
+    if (recovered.IsNull()) {
+      results[thread_id] = 3;  // ToFullPtr failed
+      __syncwarp();
+      return;
+    }
+
+    // Verify the recovered pointer works
+    bool data_ok = true;
+    for (size_t i = 0; i < alloc_size; ++i) {
+      if (recovered.ptr_[i] != test_value) {
+        data_ok = false;
+        break;
+      }
+    }
+
+    results[thread_id] = data_ok ? 0 : 4;  // 4=recovered data mismatch
+  } else {
+    results[thread_id] = 0;  // Non-lane-0 threads pass
+  }
+  __syncwarp();
 }
 
 /**
@@ -268,38 +289,43 @@ __global__ void test_gpu_multiple_allocs_kernel(
 {
   CHIMAERA_GPU_INIT(gpu_info);
 
-  const int num_allocs = 4;
-  size_t alloc_sizes[] = {256, 512, 1024, 2048};
+  // Warp-level: only lane 0 allocates and verifies multiple buffers.
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
 
-  // Use local array for thread-local pointers
-  char *local_ptrs[4];
+  if (lane_id == 0) {
+    const int num_allocs = 4;
+    size_t alloc_sizes[] = {256, 512, 1024, 2048};
 
-  // Allocate multiple buffers
-  for (int i = 0; i < num_allocs; ++i) {
-    hipc::FullPtr<char> buffer =
-        CHI_IPC->AllocateBuffer(alloc_sizes[i]);
+    // Use local array for thread-local pointers
+    char *local_ptrs[4];
 
-    if (buffer.IsNull()) {
-      results[thread_id] = 10 + i;  // Allocation i failed
-      return;
-    }
+    // Allocate multiple buffers
+    for (int i = 0; i < num_allocs; ++i) {
+      hipc::FullPtr<char> buffer =
+          CHI_IPC->AllocateBuffer(alloc_sizes[i]);
 
-    local_ptrs[i] = buffer.ptr_;
-
-    // Initialize with unique pattern
-    char pattern = (char)(thread_id * num_allocs + i);
-    for (size_t j = 0; j < alloc_sizes[i]; ++j) {
-      local_ptrs[i][j] = pattern;
-    }
-  }
-
-  // Verify all allocations
-  for (int i = 0; i < num_allocs; ++i) {
-    char expected = (char)(thread_id * num_allocs + i);
-    for (size_t j = 0; j < alloc_sizes[i]; ++j) {
-      if (local_ptrs[i][j] != expected) {
-        results[thread_id] = 20 + i;  // Verification i failed
+      if (buffer.IsNull()) {
+        results[thread_id] = 10 + i;  // Allocation i failed
         return;
+      }
+
+      local_ptrs[i] = buffer.ptr_;
+
+      // Initialize with unique pattern
+      char pattern = (char)(thread_id * num_allocs + i);
+      for (size_t j = 0; j < alloc_sizes[i]; ++j) {
+        local_ptrs[i][j] = pattern;
+      }
+    }
+
+    // Verify all allocations
+    for (int i = 0; i < num_allocs; ++i) {
+      char expected = (char)(thread_id * num_allocs + i);
+      for (size_t j = 0; j < alloc_sizes[i]; ++j) {
+        if (local_ptrs[i][j] != expected) {
+          results[thread_id] = 20 + i;  // Verification i failed
+          return;
+        }
       }
     }
   }
@@ -490,28 +516,41 @@ __global__ void test_gpu_send_queue_wait_kernel(
 }
 
 /**
- * Test 1: AllocateBuffer + NewTask with IpcManagerGpu per-thread allocators
- * Each thread allocates a buffer and creates a task
+ * Test 1: AllocateBuffer + NewTask with IpcManagerGpu per-warp allocators
+ * Lane 0 allocates a buffer, all lanes write/verify their own slice,
+ * then lane 0 also creates a task.
  */
 __global__ void test_gpu_ipc_manager_gpu_alloc_kernel(
     chi::IpcManagerGpu gpu_info, int *results) {
   CHIMAERA_GPU_INIT(gpu_info);
 
-  // Each thread allocates a buffer
-  hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(64);
-  if (buffer.IsNull()) {
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  size_t per_lane_size = 64;
+
+  // Lane 0 allocates for the entire warp
+  __shared__ char *s_warp_buffer;
+  if (lane_id == 0) {
+    hipc::FullPtr<char> buffer =
+        CHI_IPC->AllocateBuffer(num_threads * per_lane_size);
+    s_warp_buffer = buffer.IsNull() ? nullptr : buffer.ptr_;
+  }
+  __syncthreads();
+
+  char *warp_buffer = s_warp_buffer;
+  if (warp_buffer == nullptr) {
     results[thread_id] = 1;  // Allocation failed
     __syncthreads();
     return;
   }
 
-  // Write and verify
+  // Each lane writes/verifies its own slice
+  char *my_slice = warp_buffer + thread_id * per_lane_size;
   char pattern = (char)(thread_id + 1);
-  for (int i = 0; i < 64; ++i) {
-    buffer.ptr_[i] = pattern;
+  for (int i = 0; i < (int)per_lane_size; ++i) {
+    my_slice[i] = pattern;
   }
-  for (int i = 0; i < 64; ++i) {
-    if (buffer.ptr_[i] != pattern) {
+  for (int i = 0; i < (int)per_lane_size; ++i) {
+    if (my_slice[i] != pattern) {
       results[thread_id] = 2;
       __syncthreads();
       return;

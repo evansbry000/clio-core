@@ -683,6 +683,7 @@ class vector {
         ++size_;
       }
     } else {
+      memset(data_.ptr_, 0, count * sizeof(T));
       size_ = count;
     }
   }
@@ -1388,6 +1389,8 @@ class vector {
         for (size_type i = size_; i < new_size; ++i) {
           new (&data_.ptr_[i]) T();
         }
+      } else {
+        memset(data_.ptr_ + size_, 0, (new_size - size_) * sizeof(T));
       }
       size_ = new_size;
     } else if (new_size < size_) {

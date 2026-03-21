@@ -218,6 +218,19 @@ struct IpcManagerGpuInfo {
    *  re-partitioned for the new warp count. */
   bool skip_scratch_init = false;
 
+  /** GPU-accessible allocator table for resolving ShmPtrs on the GPU.
+   *  Each entry maps an AllocatorId to a base pointer.
+   *  Populated by RegisterGpuAllocator on the host side.
+   *  Used by ToFullPtr on the GPU side when FindGpuAlloc doesn't match. */
+  static constexpr u32 kMaxGpuAllocs = 8;
+  struct GpuAllocEntry {
+    hipc::AllocatorId alloc_id;
+    char *base = nullptr;
+    HSHM_CROSS_FUN GpuAllocEntry() = default;
+  };
+  GpuAllocEntry gpu_allocs[kMaxGpuAllocs];
+  u32 num_gpu_allocs = 0;
+
   HSHM_CROSS_FUN IpcManagerGpuInfo() = default;
 
   /** Convenience constructor: backend + gpu2gpu queue */
@@ -327,6 +340,12 @@ class IpcManager {
         if (partitions < 1) partitions = 1;
         InitHeapAllocator(gpu_heap_backend_, partitions, &gpu_heap_alloc_);
       }
+    }
+
+    // Copy GPU allocator registrations (for ShmPtr resolution via ToFullPtr)
+    gpu_num_allocs_ = gpu_info.num_gpu_allocs;
+    for (u32 i = 0; i < gpu_info.num_gpu_allocs; ++i) {
+      gpu_allocs_[i] = gpu_info.gpu_allocs[i];
     }
   }
 
@@ -1715,6 +1734,14 @@ class IpcManager {
       T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
       return hipc::FullPtr<T>(raw_ptr);
     }
+    // Check registered GPU allocators (data backends, etc.)
+    for (u32 i = 0; i < gpu_num_allocs_; ++i) {
+      if (gpu_allocs_[i].alloc_id == shm_ptr.alloc_id_) {
+        T *ptr = reinterpret_cast<T *>(
+            gpu_allocs_[i].base + shm_ptr.off_.load());
+        return hipc::FullPtr<T>(ptr);
+      }
+    }
     auto *alloc = FindGpuAlloc(shm_ptr.alloc_id_);
     if (!alloc) return hipc::FullPtr<T>();
     return hipc::FullPtr<T>(alloc, shm_ptr);
@@ -2398,6 +2425,10 @@ class IpcManager {
   /** Single ThreadAllocator managing per-block BuddyAllocator partitions */
   CHI_GPU_HEAP_T *gpu_heap_alloc_ = nullptr;
 
+  // --- GPU allocator table for GPU-side ShmPtr resolution ---
+  IpcManagerGpuInfo::GpuAllocEntry gpu_allocs_[IpcManagerGpuInfo::kMaxGpuAllocs];
+  u32 gpu_num_allocs_ = 0;
+
   // --- Queue pointers (filled by ClientInitGpu from IpcManagerGpuInfo) ---
   /** GPU→GPU task queue (device memory, orchestrator polls) */
   TaskQueue *gpu2gpu_queue_ = nullptr;
@@ -2518,8 +2549,9 @@ class IpcManager {
   IpcManagerGpuInfo GetClientGpuInfo(u32 gpu_id = 0);
 #endif
 
-  /** Pause the GPU orchestrator to free SMs for other GPU kernels */
-  void PauseGpuOrchestrator();
+  /** Pause the GPU orchestrator to free SMs for other GPU kernels.
+   *  Returns true if actually paused, false if already paused. */
+  bool PauseGpuOrchestrator();
 
   /** Resume the GPU orchestrator after other GPU kernels complete */
   void ResumeGpuOrchestrator();

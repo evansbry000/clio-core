@@ -12,6 +12,11 @@ runtime:
   first_busy_wait: 10000     # Busy wait before sleeping when idle (10ms)
   max_sleep: 50000           # Maximum sleep duration (50ms)
 
+gpu:
+  blocks: 1
+  threads_per_block: 32
+  queue_depth: 256            # Must be >= max concurrent client warps
+
 compose:
   # RAM bdev (required by runtime)
   - mod_name: chimaera_bdev
