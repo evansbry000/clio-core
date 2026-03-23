@@ -282,8 +282,8 @@ class GpuRuntime : public chi::gpu::Container {
   /** Find TagInfo by TagId. Returns nullptr if not found. */
   HSHM_GPU_FUN TagInfo *FindTagById(const TagId &tag_id);
 
-  /** Find TagId by name. Returns nullptr if not found. */
-  HSHM_GPU_FUN TagId *FindTagIdByName(const chi::priv::string &name);
+  /** Find TagId (as u64) by name. Returns nullptr if not found. */
+  HSHM_GPU_FUN chi::u64 *FindTagIdByName(const chi::priv::string &name);
 
   /** Insert or update tag in metadata */
   HSHM_GPU_FUN TagInfo *UpsertTag(const chi::priv::string &tag_name, const TagId &tag_id);

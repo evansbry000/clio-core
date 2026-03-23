@@ -457,8 +457,8 @@ __global__ void gpu_managed_write_kernel(
 #include <cereal/types/vector.hpp>
 #include <cereal/types/string.hpp>
 
-static bool PollDone(int *d_done, int total_warps, int timeout_us) {
-  int elapsed_us = 0;
+static bool PollDone(int *d_done, int total_warps, int64_t timeout_us) {
+  int64_t elapsed_us = 0;
   int cur = __atomic_load_n(d_done, __ATOMIC_ACQUIRE);
   while (cur < total_warps && elapsed_us < timeout_us) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -482,6 +482,7 @@ static int run_cte_gpu_bench_putblob(
     chi::u64 warp_bytes,
     chi::u32 iterations,
     bool to_cpu,
+    int timeout_sec,
     float *out_elapsed_ms) {
   CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
@@ -617,12 +618,9 @@ static int run_cte_gpu_bench_putblob(
     }
   }
 
-  // Scale timeout with iteration count: ~3 PutBlobs/sec/warp at high warp
-  // counts, plus 30s baseline for init/teardown.
-  int timeout_sec = std::max(60, static_cast<int>(iterations) / 3 + 30);
-  int timeout_us = timeout_sec * 1000000;
-  fprintf(stderr, "PollDone: waiting up to %d seconds (%d us) for %u warps...\n",
-          timeout_sec, timeout_us, total_warps);
+  int64_t timeout_us = static_cast<int64_t>(timeout_sec) * 1000000;
+  fprintf(stderr, "PollDone: waiting up to %d seconds for %u warps...\n",
+          timeout_sec, total_warps);
   fflush(stderr);
   auto wall_start = std::chrono::high_resolution_clock::now();
   bool completed = PollDone(d_done, static_cast<int>(total_warps), timeout_us);
@@ -715,6 +713,7 @@ static int run_cte_gpu_bench_putget(
     chi::u64 warp_bytes,
     chi::u32 iterations,
     bool to_cpu,
+    int timeout_sec,
     float *out_elapsed_ms) {
   CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
   CHI_IPC->PauseGpuOrchestrator();
@@ -857,9 +856,7 @@ static int run_cte_gpu_bench_putget(
     }
   }
 
-  // PutGet does 2x the work per iteration, so double the timeout
-  int timeout_sec = std::max(60, static_cast<int>(iterations) * 2 / 3 + 30);
-  int timeout_us = timeout_sec * 1000000;
+  int64_t timeout_us = static_cast<int64_t>(timeout_sec) * 1000000;
   fprintf(stderr, "PollDone: waiting up to %d seconds for %u warps...\n",
           timeout_sec, total_warps);
   fflush(stderr);
@@ -1100,6 +1097,7 @@ struct BenchConfig {
   chi::u64 warp_bytes = 128 * 1024;  // per-warp I/O size
   chi::u32 iterations = 16;          // iterations per warp
   std::string bdev_type = "pinned";  // storage backend: pinned, hbm, ram
+  int timeout_sec = 60;              // PollDone timeout in seconds
 };
 
 namespace {
@@ -1135,6 +1133,7 @@ void PrintUsage(const char *prog) {
   HIPRINT("  --io-size <bytes>      Per-warp I/O size (default: 128K, supports k/m/g suffixes)");
   HIPRINT("  --iterations <N>       Iterations per warp (default: 16)");
   HIPRINT("  --bdev-type <type>     Storage backend: pinned, hbm, or ram (default: pinned)");
+  HIPRINT("  --timeout <seconds>    PollDone timeout in seconds (default: 60)");
   HIPRINT("  --help, -h             Show this help");
 }
 
@@ -1175,6 +1174,8 @@ bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
         HLOG(kError, "Unknown bdev type '{}'; use pinned, hbm, or ram", cfg.bdev_type);
         return false;
       }
+    } else if (arg == "--timeout" && i + 1 < argc) {
+      cfg.timeout_sec = static_cast<int>(std::stol(argv[++i]));
     } else {
       HLOG(kError, "Unknown option: {}", arg);
       PrintUsage(argv[0]);
@@ -1205,22 +1206,6 @@ int main(int argc, char **argv) {
     if (cfg.client_threads > kMaxClientThreads && total_client_threads > kMaxClientThreads) {
       cfg.client_blocks = (total_client_threads + kMaxClientThreads - 1) / kMaxClientThreads;
       cfg.client_threads = kMaxClientThreads;
-    }
-  }
-
-  // Auto-scale orchestrator warp count to match client warps for GPU-path
-  // benchmarks. The GPU→GPU queue is partitioned by orchestrator warp count;
-  // if the orchestrator has fewer warps than the client, all client warps
-  // funnel into one lane, which saturates at queue_depth and deadlocks.
-  if (cfg.test_case == TestCase::kPutBlobGpu ||
-      cfg.test_case == TestCase::kPutGetGpu) {
-    chi::u32 client_warps = (cfg.client_blocks * cfg.client_threads) / 32;
-    chi::u32 rt_warps = (cfg.rt_blocks * cfg.rt_threads) / 32;
-    if (rt_warps < client_warps) {
-      // Spread warps across blocks to avoid exceeding per-block limits.
-      // Use 32 threads/block (1 warp per block) × N blocks = N warps.
-      cfg.rt_threads = 32;
-      cfg.rt_blocks = client_warps;
     }
   }
 
@@ -1263,6 +1248,7 @@ int main(int argc, char **argv) {
   HIPRINT("Per-warp I/O size:   {} bytes ({} KB)", cfg.warp_bytes,
           cfg.warp_bytes / 1024);
   HIPRINT("Iterations:          {}", cfg.iterations);
+  HIPRINT("Timeout:             {} seconds", cfg.timeout_sec);
 
   // Compute total I/O: per-warp size x warps x iterations
   chi::u32 client_warps = (cfg.client_blocks * cfg.client_threads) / 32;
@@ -1453,13 +1439,15 @@ int main(int argc, char **argv) {
           cte_client.pool_id_, tag_id,
           cfg.rt_blocks, cfg.rt_threads,
           cfg.client_blocks, cfg.client_threads,
-          cfg.warp_bytes, cfg.iterations, to_cpu, &elapsed_ms);
+          cfg.warp_bytes, cfg.iterations, to_cpu,
+          cfg.timeout_sec, &elapsed_ms);
     } else {
       rc = run_cte_gpu_bench_putblob(
           cte_client.pool_id_, tag_id,
           cfg.rt_blocks, cfg.rt_threads,
           cfg.client_blocks, cfg.client_threads,
-          cfg.warp_bytes, cfg.iterations, to_cpu, &elapsed_ms);
+          cfg.warp_bytes, cfg.iterations, to_cpu,
+          cfg.timeout_sec, &elapsed_ms);
     }
   }
 

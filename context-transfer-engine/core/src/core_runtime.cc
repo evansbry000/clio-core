@@ -2163,7 +2163,7 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
     // Store blob info directly in tag_blob_name_to_info_
     auto insert_result =
         tag_blob_name_to_info_.insert_or_assign(composite_key, new_blob_info);
-    blob_info_ptr = insert_result.second;
+    blob_info_ptr = insert_result.value;
   }  // Release lock immediately after insertion
 
   // WAL: log blob creation

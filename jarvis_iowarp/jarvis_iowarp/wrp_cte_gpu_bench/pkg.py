@@ -101,6 +101,12 @@ class WrpCteGpuBench(Application):
                 'default': 'pinned',
             },
             {
+                'name': 'timeout',
+                'msg': 'PollDone timeout in seconds',
+                'type': int,
+                'default': 60,
+            },
+            {
                 'name': 'output_dir',
                 'msg': 'Output directory for benchmark results',
                 'type': str,
@@ -122,6 +128,7 @@ class WrpCteGpuBench(Application):
         self.log(f"  IO/warp:        {self.config['io_size']}")
         self.log(f"  Iterations:     {self.config['iterations']}")
         self.log(f"  Bdev type:      {self.config['bdev_type']}")
+        self.log(f"  Timeout:        {self.config['timeout']}s")
 
     def _kill_stale_processes(self):
         """Kill any leftover wrp_cte_gpu_bench or chimaera processes and
@@ -169,6 +176,7 @@ class WrpCteGpuBench(Application):
             f'--io-size {self.config["io_size"]}',
             f'--iterations {self.config["iterations"]}',
             f'--bdev-type {self.config["bdev_type"]}',
+            f'--timeout {self.config["timeout"]}',
         ])
 
         self.log(f"Running: {cmd}")

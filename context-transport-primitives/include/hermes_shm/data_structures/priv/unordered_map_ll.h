@@ -37,6 +37,7 @@
 #include "hermes_shm/data_structures/priv/vector.h"
 #include "hermes_shm/types/hash.h"
 #include "hermes_shm/memory/allocator/malloc_allocator.h"
+#include "hermes_shm/thread/lock/mutex.h"
 
 namespace hshm::priv {
 
@@ -51,10 +52,9 @@ struct InsertResult {
  * GPU-compatible unordered map using open addressing with linear probing.
  *
  * Backed by a single priv::vector of slots. Each slot is either empty,
- * occupied, or a tombstone. The map does not auto-rehash; callers must
- * ensure the capacity is sufficient for their workload.
- *
- * External locking is required for thread safety.
+ * occupied, or a tombstone. Uses fine-grained stripe locking: the slot
+ * space is divided into num_locks stripes, each protected by its own
+ * Mutex. Operations on different stripes proceed in parallel.
  *
  * @tparam Key      Key type (must support copy/move and operator==)
  * @tparam T        Mapped value type
@@ -78,6 +78,7 @@ class unordered_map_ll {
   static constexpr uint32_t kEmpty = 0;
   static constexpr uint32_t kOccupied = 1;
   static constexpr uint32_t kTombstone = 2;
+  static constexpr size_type kDefaultNumLocks = 64;
 
   struct Slot {
     uint32_t state_;
@@ -98,12 +99,49 @@ class unordered_map_ll {
   };
 
   vector<Slot, AllocT> slots_;
-  size_type size_;
+  hshm::ipc::atomic<size_type> size_;
   AllocT *alloc_;
   Hash hash_fn_;
   KeyEqual key_eq_;
+  vector<hshm::Mutex, AllocT> locks_;
+  size_type num_locks_;
 
-  /** Find the slot index for a key (returns capacity if not found) */
+  /** Get the stripe index for a hash value */
+  HSHM_INLINE_CROSS_FUN
+  size_type stripe_of(size_type h) const {
+    return h % num_locks_;
+  }
+
+  /** Lock a stripe */
+  HSHM_INLINE_CROSS_FUN
+  void lock_stripe(size_type stripe) {
+    locks_[stripe].Lock(0);
+  }
+
+  /** Unlock a stripe */
+  HSHM_INLINE_CROSS_FUN
+  void unlock_stripe(size_type stripe) {
+    locks_[stripe].Unlock();
+  }
+
+  /** Lock all stripes (for rehash/clear/for_each) */
+  HSHM_INLINE_CROSS_FUN
+  void lock_all() {
+    for (size_type i = 0; i < num_locks_; ++i) {
+      locks_[i].Lock(0);
+    }
+  }
+
+  /** Unlock all stripes */
+  HSHM_INLINE_CROSS_FUN
+  void unlock_all() {
+    for (size_type i = 0; i < num_locks_; ++i) {
+      locks_[i].Unlock();
+    }
+  }
+
+  /** Find the slot index for a key (returns capacity if not found).
+   *  Caller must hold the appropriate stripe lock. */
   HSHM_INLINE_CROSS_FUN
   size_type find_slot(const Key &key) const {
     size_type cap = slots_.size();
@@ -120,7 +158,7 @@ class unordered_map_ll {
   }
 
   /** Find the first available slot (empty or tombstone) for insertion.
-   *  Also checks for existing key. Returns {found_idx, is_existing}. */
+   *  Caller must hold the appropriate stripe lock. */
   HSHM_INLINE_CROSS_FUN
   void find_insert_slot(const Key &key, size_type &out_idx,
                         bool &out_existing) const {
@@ -146,15 +184,29 @@ class unordered_map_ll {
     out_idx = first_avail;
   }
 
+  /** Initialize stripe locks */
+  HSHM_CROSS_FUN
+  void init_locks(size_type num_locks) {
+    num_locks_ = num_locks;
+    locks_.resize(num_locks_);
+    for (size_type i = 0; i < num_locks_; ++i) {
+      locks_[i].Init();
+    }
+  }
+
  public:
   /**
    * Constructor (host-only, uses global MallocAllocator)
    * @param capacity Initial number of slots (hash table size)
+   * @param num_locks Number of stripe locks (default: 64)
    */
 #if HSHM_IS_HOST
-  explicit unordered_map_ll(size_type capacity = 16)
-      : slots_(HSHM_MALLOC), size_(0), alloc_(HSHM_MALLOC), hash_fn_(), key_eq_() {
+  explicit unordered_map_ll(size_type capacity = 16,
+                            size_type num_locks = kDefaultNumLocks)
+      : slots_(HSHM_MALLOC), size_(0), alloc_(HSHM_MALLOC),
+        hash_fn_(), key_eq_(), locks_(HSHM_MALLOC), num_locks_(0) {
     slots_.resize(capacity);
+    init_locks(num_locks < capacity ? num_locks : capacity);
   }
 #endif
 
@@ -162,19 +214,33 @@ class unordered_map_ll {
    * Constructor with explicit allocator
    * @param alloc Allocator for the backing vector
    * @param capacity Initial number of slots (hash table size)
+   * @param num_locks Number of stripe locks (default: 64)
    */
   HSHM_CROSS_FUN
-  explicit unordered_map_ll(AllocT *alloc, size_type capacity = 16)
-      : slots_(alloc), size_(0), alloc_(alloc), hash_fn_(), key_eq_() {
+  explicit unordered_map_ll(AllocT *alloc, size_type capacity = 16,
+                            size_type num_locks = kDefaultNumLocks)
+      : slots_(alloc), size_(0), alloc_(alloc),
+        hash_fn_(), key_eq_(), locks_(alloc), num_locks_(0) {
     slots_.resize(capacity);
+    init_locks(num_locks < capacity ? num_locks : capacity);
   }
 
   HSHM_CROSS_FUN ~unordered_map_ll() = default;
 
   /** Rehash the map to a new capacity, re-inserting all occupied entries.
-   *  Returns false if allocation fails; the map is left unchanged. */
+   *  Acquires all stripe locks. Returns false if allocation fails. */
   HSHM_CROSS_FUN
   bool rehash(size_type new_cap) {
+    lock_all();
+    bool result = rehash_no_lock(new_cap);
+    unlock_all();
+    return result;
+  }
+
+ private:
+  /** Rehash without locking (caller must hold all locks) */
+  HSHM_CROSS_FUN
+  bool rehash_no_lock(size_type new_cap) {
     // Try to allocate new slots first (before destroying old)
     vector<Slot, AllocT> new_slots(alloc_);
     if (!new_slots.resize(new_cap)) {
@@ -195,14 +261,13 @@ class unordered_map_ll {
     return true;
   }
 
- private:
   /** Check load factor and rehash if needed (>75% full).
-   *  Silently skips rehash if allocation fails. */
+   *  Caller must hold all locks. */
   HSHM_INLINE_CROSS_FUN
-  void maybe_rehash() {
-    // Rehash when load factor > 75%: size * 4 > capacity * 3
-    if (size_ * 4 > slots_.size() * 3) {
-      rehash(slots_.size() * 2);  // Best-effort; map degrades on failure
+  void maybe_rehash_locked() {
+    size_type cur_size = size_.load();
+    if (cur_size * 4 > slots_.size() * 3) {
+      rehash_no_lock(slots_.size() * 2);
     }
   }
 
@@ -221,124 +286,144 @@ class unordered_map_ll {
     slots_[idx].state_ = kOccupied;
     slots_[idx].key_ = key;
     slots_[idx].value_ = value;
-    ++size_;
+    size_.fetch_add(1);
     return {true, &slots_[idx].value_};
   }
 
  public:
-  /** Insert or update a key-value pair */
+  /** Insert or update a key-value pair (thread-safe) */
   HSHM_CROSS_FUN
   InsertResult<T> insert_or_assign(const Key &key, const T &value) {
-    size_type idx;
-    bool existing;
-    find_insert_slot(key, idx, existing);
-    if (existing) {
-      slots_[idx].value_ = value;
-      return {false, &slots_[idx].value_};
-    }
-    if (idx >= slots_.size()) {
-      if (!rehash(slots_.size() * 2)) return {false, nullptr};
-      return insert_or_assign(key, value);
-    }
-    slots_[idx].state_ = kOccupied;
-    slots_[idx].key_ = key;
-    slots_[idx].value_ = value;
-    ++size_;
-    maybe_rehash();
-    return {true, &slots_[idx].value_};
+    size_type h = hash_fn_(key);
+    size_type stripe = stripe_of(h);
+    lock_stripe(stripe);
+    InsertResult<T> result = insert_or_assign_no_lock(key, value);
+    unlock_stripe(stripe);
+    return result;
   }
 
-  /** Insert a key-value pair (only if key doesn't exist) */
+  /** Insert a key-value pair, only if key doesn't exist (thread-safe) */
   HSHM_CROSS_FUN
   InsertResult<T> insert(const Key &key, const T &value) {
-    size_type idx;
-    bool existing;
-    find_insert_slot(key, idx, existing);
-    if (existing) {
-      return {false, &slots_[idx].value_};
-    }
-    if (idx >= slots_.size()) {
-      if (!rehash(slots_.size() * 2)) return {false, nullptr};
-      return insert(key, value);
-    }
-    slots_[idx].state_ = kOccupied;
-    slots_[idx].key_ = key;
-    slots_[idx].value_ = value;
-    ++size_;
-    maybe_rehash();
-    return {true, &slots_[idx].value_};
+    size_type h = hash_fn_(key);
+    size_type stripe = stripe_of(h);
+    lock_stripe(stripe);
+    InsertResult<T> result = insert_no_lock(key, value);
+    unlock_stripe(stripe);
+    return result;
   }
 
-  /** Access element (creates with default value if absent) */
+  /** Access element, creates with default value if absent (thread-safe) */
   HSHM_CROSS_FUN
   T &operator[](const Key &key) {
-    size_type idx;
-    bool existing;
-    find_insert_slot(key, idx, existing);
-    if (existing) {
-      return slots_[idx].value_;
-    }
-    if (idx >= slots_.size()) {
-      rehash(slots_.size() * 2);
-      return operator[](key);
-    }
-    slots_[idx].state_ = kOccupied;
-    slots_[idx].key_ = key;
-    slots_[idx].value_ = T();
-    ++size_;
-    maybe_rehash();
-    return slots_[idx].value_;
+    size_type h = hash_fn_(key);
+    size_type stripe = stripe_of(h);
+    lock_stripe(stripe);
+    T &ref = subscript_no_lock(key);
+    unlock_stripe(stripe);
+    return ref;
   }
 
-  /** Find an element */
+  /** Lock the stripe for a key. Must call unlock_key() when done. */
+  HSHM_CROSS_FUN
+  void lock_key(const Key &key) {
+    size_type h = hash_fn_(key);
+    lock_stripe(stripe_of(h));
+  }
+
+  /** Unlock the stripe for a key. */
+  HSHM_CROSS_FUN
+  void unlock_key(const Key &key) {
+    size_type h = hash_fn_(key);
+    unlock_stripe(stripe_of(h));
+  }
+
+  /** Find an element (thread-safe, returns pointer valid while map lives) */
   HSHM_CROSS_FUN
   T *find(const Key &key) {
+    size_type h = hash_fn_(key);
+    size_type stripe = stripe_of(h);
+    lock_stripe(stripe);
     size_type idx = find_slot(key);
-    if (idx < slots_.size()) {
-      return &slots_[idx].value_;
-    }
-    return nullptr;
+    T *result = (idx < slots_.size()) ? &slots_[idx].value_ : nullptr;
+    unlock_stripe(stripe);
+    return result;
   }
 
-  /** Find an element (const) */
+  /** Find while holding the stripe lock. Caller must have called lock_key(). */
   HSHM_CROSS_FUN
-  const T *find(const Key &key) const {
+  T *find_locked(const Key &key) {
     size_type idx = find_slot(key);
-    if (idx < slots_.size()) {
-      return &slots_[idx].value_;
-    }
-    return nullptr;
+    return (idx < slots_.size()) ? &slots_[idx].value_ : nullptr;
   }
 
-  /** Check if key exists */
+  /** Insert while holding the stripe lock. Caller must have called lock_key(). */
   HSHM_CROSS_FUN
-  bool contains(const Key &key) const {
-    return find(key) != nullptr;
+  InsertResult<T> insert_locked(const Key &key, const T &value) {
+    return insert_no_lock(key, value);
   }
 
-  /** Count occurrences (0 or 1) */
+  /** Erase while holding the stripe lock. Caller must have called lock_key(). */
   HSHM_CROSS_FUN
-  size_type count(const Key &key) const {
-    return contains(key) ? 1 : 0;
-  }
-
-  /** Erase element by key */
-  HSHM_CROSS_FUN
-  size_type erase(const Key &key) {
+  size_type erase_locked(const Key &key) {
     size_type idx = find_slot(key);
     if (idx < slots_.size()) {
       slots_[idx].state_ = kTombstone;
       slots_[idx].key_ = Key();
       slots_[idx].value_ = T();
-      --size_;
+      size_.fetch_sub(1);
       return 1;
     }
     return 0;
   }
 
-  /** Clear all elements */
+  /** Find an element (const, thread-safe) */
+  HSHM_CROSS_FUN
+  const T *find(const Key &key) const {
+    size_type h = hash_fn_(key);
+    size_type stripe = stripe_of(h);
+    const_cast<unordered_map_ll*>(this)->lock_stripe(stripe);
+    size_type idx = find_slot(key);
+    const T *result = (idx < slots_.size()) ? &slots_[idx].value_ : nullptr;
+    const_cast<unordered_map_ll*>(this)->unlock_stripe(stripe);
+    return result;
+  }
+
+  /** Check if key exists (thread-safe) */
+  HSHM_CROSS_FUN
+  bool contains(const Key &key) {
+    return find(key) != nullptr;
+  }
+
+  /** Count occurrences, 0 or 1 (thread-safe) */
+  HSHM_CROSS_FUN
+  size_type count(const Key &key) {
+    return contains(key) ? 1 : 0;
+  }
+
+  /** Erase element by key (thread-safe) */
+  HSHM_CROSS_FUN
+  size_type erase(const Key &key) {
+    size_type h = hash_fn_(key);
+    size_type stripe = stripe_of(h);
+    lock_stripe(stripe);
+    size_type idx = find_slot(key);
+    size_type result = 0;
+    if (idx < slots_.size()) {
+      slots_[idx].state_ = kTombstone;
+      slots_[idx].key_ = Key();
+      slots_[idx].value_ = T();
+      size_.fetch_sub(1);
+      result = 1;
+    }
+    unlock_stripe(stripe);
+    return result;
+  }
+
+  /** Clear all elements (thread-safe, acquires all locks) */
   HSHM_CROSS_FUN
   void clear() {
+    lock_all();
     for (size_type i = 0; i < slots_.size(); ++i) {
       if (slots_[i].state_ == kOccupied) {
         slots_[i].key_ = Key();
@@ -347,38 +432,180 @@ class unordered_map_ll {
       slots_[i].state_ = kEmpty;
     }
     size_ = 0;
+    unlock_all();
   }
 
   /** Total number of elements */
   HSHM_INLINE_CROSS_FUN
-  size_type size() const { return size_; }
+  size_type size() const { return size_.load(); }
 
   /** Check if empty */
   HSHM_INLINE_CROSS_FUN
-  bool empty() const { return size_ == 0; }
+  bool empty() const { return size() == 0; }
 
   /** Number of slots */
   HSHM_INLINE_CROSS_FUN
   size_type bucket_count() const { return slots_.size(); }
 
-  /** Apply function to each occupied entry */
+  /** Apply function to each occupied entry (thread-safe, acquires all locks) */
   template <typename Func>
   HSHM_CROSS_FUN void for_each(Func fn) {
+    lock_all();
     for (size_type i = 0; i < slots_.size(); ++i) {
       if (slots_[i].state_ == kOccupied) {
         fn(slots_[i].key_, slots_[i].value_);
       }
     }
+    unlock_all();
   }
 
-  /** Apply function to each occupied entry (const) */
+  /** Apply function to each occupied entry (const, thread-safe) */
   template <typename Func>
   HSHM_CROSS_FUN void for_each(Func fn) const {
+    const_cast<unordered_map_ll*>(this)->lock_all();
     for (size_type i = 0; i < slots_.size(); ++i) {
       if (slots_[i].state_ == kOccupied) {
         fn(slots_[i].key_, slots_[i].value_);
       }
     }
+    const_cast<unordered_map_ll*>(this)->unlock_all();
+  }
+
+ private:
+  /** Insert or assign without locking (caller holds stripe lock) */
+  HSHM_CROSS_FUN
+  InsertResult<T> insert_or_assign_no_lock(const Key &key, const T &value) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (existing) {
+      slots_[idx].value_ = value;
+      return {false, &slots_[idx].value_};
+    }
+    if (idx >= slots_.size()) {
+      // Need rehash — must acquire all locks
+      // Release our stripe lock first to avoid deadlock
+      size_type h = hash_fn_(key);
+      size_type stripe = stripe_of(h);
+      unlock_stripe(stripe);
+      lock_all();
+      if (!rehash_no_lock(slots_.size() * 2)) {
+        unlock_all();
+        lock_stripe(stripe);
+        return {false, nullptr};
+      }
+      // Re-do insert under all locks
+      InsertResult<T> result = insert_no_rehash(key, value);
+      unlock_all();
+      lock_stripe(stripe);
+      return result;
+    }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = value;
+    size_.fetch_add(1);
+    // Check if rehash needed
+    size_type cur_size = size_.load();
+    if (cur_size * 4 > slots_.size() * 3) {
+      size_type h = hash_fn_(key);
+      size_type stripe = stripe_of(h);
+      unlock_stripe(stripe);
+      lock_all();
+      maybe_rehash_locked();
+      unlock_all();
+      lock_stripe(stripe);
+    }
+    return {true, &slots_[idx].value_};
+  }
+
+  /** Insert without locking (caller holds stripe lock) */
+  HSHM_CROSS_FUN
+  InsertResult<T> insert_no_lock(const Key &key, const T &value) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (existing) {
+      return {false, &slots_[idx].value_};
+    }
+    if (idx >= slots_.size()) {
+      size_type h = hash_fn_(key);
+      size_type stripe = stripe_of(h);
+      unlock_stripe(stripe);
+      lock_all();
+      if (!rehash_no_lock(slots_.size() * 2)) {
+        unlock_all();
+        lock_stripe(stripe);
+        return {false, nullptr};
+      }
+      InsertResult<T> result = insert_no_rehash(key, value);
+      unlock_all();
+      lock_stripe(stripe);
+      return result;
+    }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = value;
+    size_.fetch_add(1);
+    size_type cur_size = size_.load();
+    if (cur_size * 4 > slots_.size() * 3) {
+      size_type h = hash_fn_(key);
+      size_type stripe = stripe_of(h);
+      unlock_stripe(stripe);
+      lock_all();
+      maybe_rehash_locked();
+      unlock_all();
+      lock_stripe(stripe);
+    }
+    return {true, &slots_[idx].value_};
+  }
+
+  /** operator[] without locking (caller holds stripe lock) */
+  HSHM_CROSS_FUN
+  T &subscript_no_lock(const Key &key) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (existing) {
+      return slots_[idx].value_;
+    }
+    if (idx >= slots_.size()) {
+      size_type h = hash_fn_(key);
+      size_type stripe = stripe_of(h);
+      unlock_stripe(stripe);
+      lock_all();
+      rehash_no_lock(slots_.size() * 2);
+      // Re-find after rehash
+      find_insert_slot(key, idx, existing);
+      if (existing) {
+        unlock_all();
+        lock_stripe(stripe);
+        return slots_[idx].value_;
+      }
+      slots_[idx].state_ = kOccupied;
+      slots_[idx].key_ = key;
+      slots_[idx].value_ = T();
+      size_.fetch_add(1);
+      maybe_rehash_locked();
+      T &ref = slots_[idx].value_;
+      unlock_all();
+      lock_stripe(stripe);
+      return ref;
+    }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = T();
+    size_.fetch_add(1);
+    size_type cur_size = size_.load();
+    if (cur_size * 4 > slots_.size() * 3) {
+      size_type h = hash_fn_(key);
+      size_type stripe = stripe_of(h);
+      unlock_stripe(stripe);
+      lock_all();
+      maybe_rehash_locked();
+      unlock_all();
+      lock_stripe(stripe);
+    }
+    return slots_[idx].value_;
   }
 };
 

@@ -89,24 +89,32 @@ struct GpuBlobEntry {
 using GpuBlobMap = hshm::priv::unordered_map_ll<
     chi::priv::string, GpuBlobEntry, CHI_PRIV_ALLOC_T>;
 
+/** Tag map: TagId (as u64) → TagInfo */
+using GpuTagIdMap = hshm::priv::unordered_map_ll<
+    chi::u64, TagInfo, CHI_PRIV_ALLOC_T>;
+
+/** Reverse tag index: tag name → TagId (as u64) */
+using GpuTagNameMap = hshm::priv::unordered_map_ll<
+    chi::priv::string, chi::u64, CHI_PRIV_ALLOC_T>;
+
+/** Default tag map capacity */
+static constexpr chi::u32 kDefaultTagMapCapacity = 64;
+
 /**
  * GPU-resident metadata store for CTE Core GpuRuntime.
  * Uses chi::priv data structures backed by ThreadAllocator.
  */
 struct GpuMetadata {
-  hshm::Mutex tag_lock_;
-  hshm::Mutex blob_lock_;
   GpuBlobMap blob_map_;
-  chi::priv::vector<TagInfo> tags_;
-  hshm::Mutex target_lock_;
+  GpuTagIdMap tag_id_map_;
+  GpuTagNameMap tag_name_to_id_;
   chi::priv::vector<TargetInfo> targets_;
 
   HSHM_GPU_FUN GpuMetadata()
       : blob_map_(CHI_PRIV_ALLOC, kDefaultBlobMapCapacity),
-        tags_(CHI_PRIV_ALLOC), targets_(CHI_PRIV_ALLOC) {
-    tag_lock_.Init();
-    blob_lock_.Init();
-    target_lock_.Init();
+        tag_id_map_(CHI_PRIV_ALLOC, kDefaultTagMapCapacity),
+        tag_name_to_id_(CHI_PRIV_ALLOC, kDefaultTagMapCapacity),
+        targets_(CHI_PRIV_ALLOC) {
   }
 };
 
@@ -167,8 +175,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::RegisterTarget(
   chi::u64 total_size = task->total_size_;
   chi::PoolQuery target_query = task->target_query_;
 
-  // Lock and create TargetInfo
-  hshm::ScopedMutex guard(meta_->target_lock_, 0);
   TargetInfo info;
   info.target_name_ = target_name;
   info.bdev_client_.Init(bdev_id);
@@ -223,37 +229,27 @@ HSHM_GPU_FUN void GpuRuntime::EnsureMetaInit() {
 
 HSHM_GPU_FUN TagInfo *GpuRuntime::FindTagById(const TagId &tag_id) {
   if (!meta_) return nullptr;
-  for (size_t i = 0; i < meta_->tags_.size(); ++i) {
-    if (meta_->tags_[i].tag_id_ == tag_id) {
-      return &meta_->tags_[i];
-    }
-  }
-  return nullptr;
+  return meta_->tag_id_map_.find(tag_id.ToU64());
 }
 
-HSHM_GPU_FUN TagId *GpuRuntime::FindTagIdByName(const chi::priv::string &name) {
+HSHM_GPU_FUN chi::u64 *GpuRuntime::FindTagIdByName(
+    const chi::priv::string &name) {
   if (!meta_) return nullptr;
-  for (size_t i = 0; i < meta_->tags_.size(); ++i) {
-    if (meta_->tags_[i].tag_name_ == name) {
-      return &meta_->tags_[i].tag_id_;
-    }
-  }
-  return nullptr;
+  return meta_->tag_name_to_id_.find(name);
 }
 
 HSHM_GPU_FUN TagInfo *GpuRuntime::UpsertTag(const chi::priv::string &tag_name,
                                              const TagId &tag_id) {
   if (!meta_) return nullptr;
-  // Check if tag exists by name
-  for (size_t i = 0; i < meta_->tags_.size(); ++i) {
-    if (meta_->tags_[i].tag_name_ == tag_name) {
-      return &meta_->tags_[i];
-    }
-  }
-  // Insert new
+  chi::u64 id_key = tag_id.ToU64();
+  // Check if tag exists
+  TagInfo *existing = meta_->tag_id_map_.find(id_key);
+  if (existing) return existing;
+  // Insert into both maps
   TagInfo info(tag_name, tag_id);
-  meta_->tags_.push_back(info);
-  return &meta_->tags_.back();
+  meta_->tag_id_map_.insert(id_key, info);
+  meta_->tag_name_to_id_.insert(tag_name, id_key);
+  return meta_->tag_id_map_.find(id_key);
 }
 
 //==============================================================================
@@ -276,15 +272,14 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetOrCreateTag(
   (void)rctx;
   if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
-  hshm::ScopedMutex guard(meta_->tag_lock_, 0);
 
   chi::priv::string name(CHI_PRIV_ALLOC, task->tag_name_.data());
   TagId preferred_id = task->tag_id_;
 
-  // Look up existing tag by name
-  TagId *existing = FindTagIdByName(name);
+  // Look up existing tag by name (fine-grained lock inside map)
+  chi::u64 *existing = FindTagIdByName(name);
   if (existing != nullptr) {
-    task->tag_id_ = *existing;
+    task->tag_id_ = TagId::FromU64(*existing);
     task->return_code_ = 0;
     co_return;
   }
@@ -298,7 +293,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetOrCreateTag(
     tag_id.minor_ = atomicAdd(&next_tag_minor_, 1u) + 1;
   }
 
-  // Insert
+  // Insert into both maps (fine-grained locks inside)
   UpsertTag(name, tag_id);
 
   task->tag_id_ = tag_id;
@@ -325,7 +320,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
   (void)rctx;
   if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
-  hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
 
   TagId tag_id = task->tag_id_;
 
@@ -336,12 +330,12 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
       task->return_code_ = 1;
       co_return;
     }
-    TagId *found = FindTagIdByName(name);
+    chi::u64 *found = FindTagIdByName(name);
     if (found == nullptr) {
       task->return_code_ = 1;
       co_return;
     }
-    tag_id = *found;
+    tag_id = TagId::FromU64(*found);
     task->tag_id_ = tag_id;
   }
 
@@ -365,15 +359,12 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
     meta_->blob_map_.erase(keys_to_erase[i]);
   }
 
-  // Erase tag from tag store
+  // Erase tag from both tag maps
   TagInfo *tag_info = FindTagById(tag_id);
   if (tag_info != nullptr) {
-    size_t tag_idx = tag_info - meta_->tags_.data();
-    size_t last = meta_->tags_.size() - 1;
-    if (tag_idx != last) {
-      meta_->tags_[tag_idx] = meta_->tags_[last];
-    }
-    meta_->tags_.pop_back();
+    chi::priv::string tag_name = tag_info->tag_name_;
+    meta_->tag_id_map_.erase(tag_id.ToU64());
+    meta_->tag_name_to_id_.erase(tag_name);
   }
 
   task->return_code_ = 0;
@@ -421,30 +412,30 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
   GpuBlobEntry *entry = nullptr;
   bool is_new_blob = false;
 
-  // Scope 1: Lock blob map, find or create entry, clear old blocks if needed
+  // Scope 1: Lock blob key, find or create entry, clear old blocks if needed
   {
-    hshm::ScopedMutex blob_guard(meta_->blob_lock_, 0);
-    entry = meta_->blob_map_.find(ck);
+    meta_->blob_map_.lock_key(ck);
+    entry = meta_->blob_map_.find_locked(ck);
     if (entry == nullptr) {
-      auto result = meta_->blob_map_.insert(ck, GpuBlobEntry());
+      auto result = meta_->blob_map_.insert_locked(ck, GpuBlobEntry());
       if (result.value == nullptr) {
+        meta_->blob_map_.unlock_key(ck);
         task->return_code_ = 10;
         co_return;
       }
       entry = result.value;
       is_new_blob = true;
     } else {
-      // Clear old blocks before unlocking
+      // Clear old blocks
       entry->blocks_.clear();
     }
+    meta_->blob_map_.unlock_key(ck);
   }
 
-  // Find a target with sufficient space (must be under target_lock_)
-  // Copy target info locally to avoid holding lock during co_await
+  // Find a target with sufficient space (write-once targets, no lock needed)
   TargetInfo target_info;
   chi::u64 old_blob_size = entry->size_;
   {
-    hshm::ScopedMutex target_guard(meta_->target_lock_, 0);
     bool found = false;
     for (size_t i = 0; i < meta_->targets_.size(); ++i) {
       if (meta_->targets_[i].remaining_space_ >= size) {
@@ -479,9 +470,9 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
     co_return;
   }
 
-  // Re-lock blob map and update entry with blocks
+  // Re-lock blob key and update entry with blocks
   {
-    hshm::ScopedMutex blob_guard(meta_->blob_lock_, 0);
+    meta_->blob_map_.lock_key(ck);
 
     // Create BlobBlock structs from allocated blocks
     entry->blocks_.clear();
@@ -497,12 +488,14 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
     if (is_new_blob) {
       entry->last_read_ = 0;
     }
+    meta_->blob_map_.unlock_key(ck);
   }
 
-  // Update tag total_size_ (under tag_lock_)
+  // Update tag total_size_ (fine-grained lock inside map)
   {
-    hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
-    TagInfo *tag = FindTagById(tag_id);
+    chi::u64 tag_key = tag_id.ToU64();
+    meta_->tag_id_map_.lock_key(tag_key);
+    TagInfo *tag = meta_->tag_id_map_.find_locked(tag_key);
     if (tag != nullptr) {
       if (is_new_blob) {
         tag->total_size_ += size;
@@ -510,11 +503,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
         tag->total_size_ = tag->total_size_ - old_blob_size + size;
       }
     }
+    meta_->tag_id_map_.unlock_key(tag_key);
   }
 
-  // Update target remaining_space_ (under target_lock_)
+  // Update target remaining_space_ (write-once targets, no lock needed)
   {
-    hshm::ScopedMutex target_guard(meta_->target_lock_, 0);
     for (size_t i = 0; i < meta_->targets_.size(); ++i) {
       if (meta_->targets_[i].target_name_ == target_info.target_name_) {
         chi::u64 space_used = is_new_blob ? size : size - old_blob_size;
@@ -558,13 +551,18 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetBlob(
   chi::priv::vector<BlobBlock> blocks(CHI_PRIV_ALLOC);
   chi::u64 blob_size = 0;
   {
-    hshm::ScopedMutex blob_guard(meta_->blob_lock_, 0);
-    GpuBlobEntry *entry = meta_->blob_map_.find(ck);
-    if (entry == nullptr) { task->return_code_ = 1; co_return; }
+    meta_->blob_map_.lock_key(ck);
+    GpuBlobEntry *entry = meta_->blob_map_.find_locked(ck);
+    if (entry == nullptr) {
+      meta_->blob_map_.unlock_key(ck);
+      task->return_code_ = 1;
+      co_return;
+    }
 
     blocks = entry->blocks_;
     blob_size = entry->size_;
     entry->last_read_ = GetCurrentTimeNs();
+    meta_->blob_map_.unlock_key(ck);
   }
 
   // For GPU simplicity, assume single-block blobs (typical case)
@@ -622,12 +620,17 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::ReorganizeBlob(
   }
 
   chi::priv::string ck = MakeCompoundKey(tag_id, blob_name, blob_name_len);
-  hshm::ScopedMutex blob_guard(meta_->blob_lock_, 0);
+  meta_->blob_map_.lock_key(ck);
 
-  GpuBlobEntry *entry = meta_->blob_map_.find(ck);
-  if (entry == nullptr) { task->return_code_ = 3; co_return; }
+  GpuBlobEntry *entry = meta_->blob_map_.find_locked(ck);
+  if (entry == nullptr) {
+    meta_->blob_map_.unlock_key(ck);
+    task->return_code_ = 3;
+    co_return;
+  }
 
   entry->score_ = new_score;
+  meta_->blob_map_.unlock_key(ck);
   task->return_code_ = 0;
   co_return;
 }
@@ -651,22 +654,29 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelBlob(
 
   chi::u64 blob_size = 0;
   {
-    hshm::ScopedMutex blob_guard(meta_->blob_lock_, 0);
-    GpuBlobEntry *entry = meta_->blob_map_.find(ck);
-    if (entry == nullptr) { task->return_code_ = 1; co_return; }
+    meta_->blob_map_.lock_key(ck);
+    GpuBlobEntry *entry = meta_->blob_map_.find_locked(ck);
+    if (entry == nullptr) {
+      meta_->blob_map_.unlock_key(ck);
+      task->return_code_ = 1;
+      co_return;
+    }
 
     blob_size = entry->size_;
-    meta_->blob_map_.erase(ck);
+    meta_->blob_map_.erase_locked(ck);
+    meta_->blob_map_.unlock_key(ck);
   }
 
-  // Update tag total_size_
+  // Update tag total_size_ (fine-grained lock inside map)
   {
-    hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
-    TagInfo *tag = FindTagById(tag_id);
+    chi::u64 tag_key = tag_id.ToU64();
+    meta_->tag_id_map_.lock_key(tag_key);
+    TagInfo *tag = meta_->tag_id_map_.find_locked(tag_key);
     if (tag != nullptr) {
       tag->total_size_ =
           (blob_size <= tag->total_size_) ? tag->total_size_ - blob_size : 0;
     }
+    meta_->tag_id_map_.unlock_key(tag_key);
   }
 
   task->return_code_ = 0;
