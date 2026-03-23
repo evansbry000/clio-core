@@ -851,6 +851,10 @@ class Future {
    * @return True if task is complete, false if coroutine should suspend
    */
   HSHM_CROSS_FUN bool await_ready() const noexcept {
+    // A null future (e.g. SendGpu allocation failure) is immediately ready
+    // to prevent suspending with awaited_fshm_=nullptr, which would resume
+    // the coroutine into a null task_ptr_ dereference.
+    if (future_shm_.IsNull() && task_ptr_.IsNull()) return true;
     if (IsComplete()) return true;
     if (!task_ptr_.IsNull() &&
         task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {

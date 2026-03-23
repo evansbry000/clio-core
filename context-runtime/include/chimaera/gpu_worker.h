@@ -55,6 +55,27 @@
 namespace chi {
 namespace gpu {
 
+/**
+ * Coroutine frame allocator using ThreadAllocator (gpu_heap_alloc_).
+ * alloc_ctx is CHI_GPU_HEAP_T* (hipc::ThreadAllocator*).
+ * Stores FullPtr offset in FrameHeader::opaque_ for deallocation.
+ */
+__device__ inline void *HeapCoroAlloc(size_t size, void *alloc_ctx) {
+  auto *alloc = static_cast<CHI_GPU_HEAP_T *>(alloc_ctx);
+  auto fp = alloc->template AllocateObjs<char>(size);
+  if (fp.IsNull()) return nullptr;
+  return fp.ptr_;
+}
+
+__device__ inline void HeapCoroFree(void *ptr, void *alloc_ctx) {
+  auto *alloc = static_cast<CHI_GPU_HEAP_T *>(alloc_ctx);
+  hipc::FullPtr<char> fp(static_cast<char *>(ptr));
+  fp.shm_.off_ = static_cast<size_t>(
+      static_cast<char *>(ptr) - alloc->GetBackendData());
+  fp.shm_.alloc_id_ = alloc->GetId();
+  alloc->Free(fp);
+}
+
 static constexpr u32 kWarpSize = 32;
 
 /**
@@ -93,6 +114,7 @@ class Worker {
   volatile bool is_running_;         /**< Running flag for the poll loop */
   TaskQueue *cpu2gpu_queue_;         /**< CPU → GPU queue (GPU work orchestrator polls) */
   TaskQueue *gpu2gpu_queue_;         /**< GPU → GPU queue (GPU work orchestrator polls) */
+  TaskQueue *internal_queue_;        /**< Internal subtask queue (GPU orchestrator polls) */
   PoolManager *pool_mgr_;            /**< GPU-side container lookup table */
   char *queue_backend_base_;         /**< Base of queue backend for ShmPtr resolution */
   RunContext rctx_;                   /**< Template RunContext (copied per task) */
@@ -124,6 +146,7 @@ class Worker {
                           u32 lane_id,
                           TaskQueue *cpu2gpu_queue,
                           TaskQueue *gpu2gpu_queue,
+                          TaskQueue *internal_queue,
                           PoolManager *pool_mgr,
                           char *queue_backend_base,
                           WorkOrchestratorControl *dbg_ctrl,
@@ -132,6 +155,7 @@ class Worker {
     lane_id_ = lane_id;
     cpu2gpu_queue_ = cpu2gpu_queue;
     gpu2gpu_queue_ = gpu2gpu_queue;
+    internal_queue_ = internal_queue;
     pool_mgr_ = pool_mgr;
     queue_backend_base_ = queue_backend_base;
     dbg_ctrl_ = dbg_ctrl;
@@ -148,6 +172,13 @@ class Worker {
     u32 warp_id = IpcManager::GetWarpId();
     u32 warp_lane = IpcManager::GetLaneId();
     rctx_ = RunContext(blockIdx.x, threadIdx.x, warp_id, warp_lane);
+    // Wire coroutine frame allocation to ThreadAllocator (gpu_heap)
+    auto *heap = CHI_IPC->GetGpuHeap();
+    if (heap) {
+      rctx_.alloc_fn_ = HeapCoroAlloc;
+      rctx_.free_fn_ = HeapCoroFree;
+      rctx_.alloc_ctx_ = heap;
+    }
 #else
     rctx_ = RunContext(0, 0, 0, 0);
 #endif
@@ -179,6 +210,26 @@ class Worker {
   HSHM_GPU_FUN void DbgTaskCompleted() {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
       dbg_ctrl_->dbg_tasks_completed[worker_id_]++;
+#ifdef HSHM_BUDDY_ALLOC_DEBUG
+      u32 completed = dbg_ctrl_->dbg_tasks_completed[worker_id_];
+      if (completed % 50 == 0) {
+        auto *heap = CHI_IPC->gpu_heap_alloc_;
+        if (heap) {
+          int tid = heap->GetAutoTid();
+          auto *part = heap->DbgGetPartition(tid);
+          if (part) {
+            printf("[W%u] task#%u heap[%d]: allocs=%llu frees=%llu net=%llu "
+                   "bigheap=%llu/%llu\n",
+                   worker_id_, completed, tid,
+                   (unsigned long long)part->DbgAllocCount(),
+                   (unsigned long long)part->DbgFreeCount(),
+                   (unsigned long long)part->DbgNetBytes(),
+                   (unsigned long long)part->DbgBigHeapOffset(),
+                   (unsigned long long)part->DbgBigHeapMax());
+          }
+        }
+      }
+#endif
     }
   }
   HSHM_GPU_FUN void DbgTaskResumed() {
@@ -257,8 +308,15 @@ class Worker {
         // First execution: create coroutine
         my_ctx.coro = my_ctx.container->Run(
             my_ctx.method_id, my_ctx.task_ptr, my_ctx.rctx);
-        my_ctx.coro.get_handle().promise().set_run_context(&my_ctx.rctx);
-        my_ctx.coro.resume();
+        if (!my_ctx.coro.get_handle()) {
+          printf("[W%u] CORO ALLOC FAILED: method=%u pool=%u.%u\n",
+                 worker_id_, my_ctx.method_id,
+                 my_ctx.task_ptr.ptr_->pool_id_.major_,
+                 my_ctx.task_ptr.ptr_->pool_id_.minor_);
+        } else {
+          my_ctx.coro.get_handle().promise().set_run_context(&my_ctx.rctx);
+          my_ctx.coro.resume();
+        }
       } else {
         // Resuming from suspension
         if (!my_ctx.coro.done()) {
@@ -470,6 +528,9 @@ class Worker {
    * Called only by lane 0.
    */
   HSHM_GPU_FUN bool TryPopNewTask() {
+    // Poll internal queue first (highest priority) to prevent deadlock:
+    // orchestrator subtasks must drain before client tasks can unblock.
+    if (TryPopFromQueue(internal_queue_, lane_id_, true)) return true;
     if (TryPopFromQueue(gpu2gpu_queue_, lane_id_, true)) return true;
     if (lane_id_ == 0) {
       if (TryPopFromQueue(cpu2gpu_queue_, 0, false)) return true;
@@ -484,16 +545,20 @@ class Worker {
     auto &lane = queue->GetLane(qlane, 0);
 
     // Debug: snapshot ring buffer head/tail via device-scope reads (bypass L1)
-    if (is_gpu2gpu && dbg_ctrl_ &&
-        worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
+    if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
       u64 h = lane.GetHeadDevice();
       u64 t = lane.GetTailDevice();
-      dbg_ctrl_->dbg_input_tw[worker_id_] = t;
-      dbg_ctrl_->dbg_input_cs[worker_id_] = h;
-      // Store queue pointer for verification (first time only)
-      if (dbg_ctrl_->dbg_ser_total_written[worker_id_] == 0) {
-        dbg_ctrl_->dbg_ser_total_written[worker_id_] =
-            reinterpret_cast<unsigned long long>(queue);
+      if (queue == internal_queue_) {
+        dbg_ctrl_->dbg_iq_head[worker_id_] = h;
+        dbg_ctrl_->dbg_iq_tail[worker_id_] = t;
+      } else if (is_gpu2gpu) {
+        dbg_ctrl_->dbg_input_tw[worker_id_] = t;
+        dbg_ctrl_->dbg_input_cs[worker_id_] = h;
+        // Store queue pointer for verification (first time only)
+        if (dbg_ctrl_->dbg_ser_total_written[worker_id_] == 0) {
+          dbg_ctrl_->dbg_ser_total_written[worker_id_] =
+              reinterpret_cast<unsigned long long>(queue);
+        }
       }
     }
 
@@ -506,6 +571,10 @@ class Worker {
 
     // Count every successful pop (before sptr check)
     DbgQueuePop();
+    if (queue == internal_queue_ && dbg_ctrl_ &&
+        worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
+      dbg_ctrl_->dbg_iq_pops[worker_id_]++;
+    }
 
     // Resolve FutureShm
     hipc::ShmPtr<FutureShm> sptr = future.GetFutureShmPtr();
@@ -701,7 +770,15 @@ class Worker {
       hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
     }
 
-    task_ptr.ptr_->~Task();
+    // Destroy the deserialized task via its derived destructor.
+    // Task has a non-virtual destructor, so calling ~Task() directly would
+    // skip derived members (priv::vector, priv::string), leaking gpu_alloc_.
+    container->LocalDestroyTask(method_id, task_ptr);
+    // Free task memory back to scratch allocator.
+    // LocalAllocLoadTask allocated from gpu_alloc_ (container's allocator);
+    // without this Free the scratch partition leaks on every completed task,
+    // eventually exhausting the partition and causing SendGpu() to fail.
+    CHI_IPC->gpu_alloc_->Free(task_ptr.template Cast<char>());
     hipc::threadfence();
 
     if (is_gpu2gpu) {
