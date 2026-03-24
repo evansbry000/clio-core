@@ -45,8 +45,8 @@ macro(wrp_core_enable_cuda CXX_STANDARD)
     endif()
 
     message(STATUS "USING CUDA ARCH: ${CMAKE_CUDA_ARCHITECTURES}")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --forward-unknown-to-host-compiler -diag-suppress=177,20014,20011,20012")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-Wno-format,-Wno-pedantic,-Wno-sign-compare,-Wno-unused-but-set-variable")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-unused-variable")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-format -Wno-pedantic -Wno-sign-compare -Wno-unused-but-set-variable")
     enable_language(CUDA)
 
     set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
@@ -91,7 +91,7 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
     set(CMAKE_${GPU_RUNTIME}_STANDARD ${CXX_STANDARD})
     set(CMAKE_${GPU_RUNTIME}_EXTENSIONS OFF)
     set(CMAKE_${GPU_RUNTIME}_STANDARD_REQUIRED ON)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --forward-unknown-to-host-compiler")
+    # --forward-unknown-to-host-compiler is nvcc-only; not needed with clang
     set(ROCM_ROOT
         "/opt/rocm"
         CACHE PATH
@@ -429,11 +429,10 @@ function(add_cuda_library TARGET SHARED DO_COPY)
         add_custom_command(
             OUTPUT ${DEVICE_LINK_OBJ}
             COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/clang_cuda"
-            COMMAND ${CMAKE_CUDA_COMPILER}
+            COMMAND ${WRP_CORE_CLANG_CUDA_PATH}/bin/nvcc
                 -dlink
                 -shared
                 ${NVCC_ARCH_FLAGS}
-                -Xcompiler=-fPIC
                 ${OBJECT_FILES}
                 -o ${DEVICE_LINK_OBJ}
                 -L${WRP_CORE_CLANG_CUDA_PATH}/lib64
@@ -466,9 +465,6 @@ function(add_cuda_library TARGET SHARED DO_COPY)
 
         set_target_properties(${TARGET} PROPERTIES
             CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-
-        target_compile_options(${TARGET} PUBLIC
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 
         if(SHARED STREQUAL "SHARED")
             set_target_properties(${TARGET} PROPERTIES
@@ -595,10 +591,10 @@ function(add_cuda_executable TARGET DO_COPY)
         add_custom_command(
             OUTPUT ${DEVICE_LINK_OBJ}
             COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/clang_cuda"
-            COMMAND ${CMAKE_CUDA_COMPILER}
+            COMMAND ${WRP_CORE_CLANG_CUDA_PATH}/bin/nvcc
                 -dlink
+                -shared
                 ${NVCC_ARCH_FLAGS}
-                -Xcompiler=-fPIC
                 ${DLINK_OBJECT_FILES}
                 -o ${DEVICE_LINK_OBJ}
                 -L${WRP_CORE_CLANG_CUDA_PATH}/lib64
@@ -629,9 +625,6 @@ function(add_cuda_executable TARGET DO_COPY)
         if(${DO_COPY})
             target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         endif()
-
-        target_compile_options(${TARGET} PUBLIC
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 
         if(CUDA_INCLUDE_DIRS)
             foreach(_dir IN LISTS CUDA_INCLUDE_DIRS)
