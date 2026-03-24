@@ -105,6 +105,13 @@ class WorkOrchestrator {
   u32 blocks_ = 0;
   u32 threads_per_block_ = 0;
 
+  // Cross-warp scheduling resources (freed in Finalize)
+  void *warp_group_load_ = nullptr;
+  void *warp_load_ = nullptr;
+  void *warp_group_queue_data_ = nullptr;
+  void *warp_group_queue_ptr_ = nullptr;  // TaskQueue* on device
+  u32 launched_num_warps_ = 0;            // Warp count at last Launch/Resume
+
   /**
    * Launch the GPU work orchestrator
    * @param gpu_info IPC info with queue pointers

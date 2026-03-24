@@ -815,8 +815,6 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     REQUIRE(gpu_heap_backend.shm_init(heap_backend_id, 4 * 1024 * 1024,
                                       "/gpu_test_heap_sd", 0));
     chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
-    gpu_info.gpu_priv_backend =
-        static_cast<hipc::MemoryBackend &>(gpu_heap_backend);
 
     int *d_results = hshm::GpuApi::Malloc<int>(sizeof(int));
     int h_init = -1;
@@ -842,8 +840,6 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     REQUIRE(gpu_heap_backend2.shm_init(heap_backend_id2, 4 * 1024 * 1024,
                                        "/gpu_test_heap_sc", 0));
     chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
-    gpu_info.gpu_priv_backend =
-        static_cast<hipc::MemoryBackend &>(gpu_heap_backend2);
 
     // Allocate pinned host buffer for transfer
     size_t buffer_size = 1024;
@@ -958,8 +954,6 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
                                    "/gpu_heap_test2", 0));
 
     chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue.ptr_);
-    gpu_info.gpu_priv_backend =
-        static_cast<hipc::MemoryBackend &>(heap_backend2);
 
     int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
     int h_result_init = -999;
@@ -1045,8 +1039,6 @@ TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
                                    "/gpu_heap_test3", 0));
 
     chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue.ptr_);
-    gpu_info.gpu_priv_backend =
-        static_cast<hipc::MemoryBackend &>(heap_backend3);
 
     int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
     int h_result_init = -999;

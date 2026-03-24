@@ -130,9 +130,10 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *src = data_ptr.ptr_;
 
-  // Warp-wide copy across all blocks with yield for asynchronicity
+  // Warp-wide coalesced copy across all blocks with yield for asynchronicity
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
+  long long t_start = clock64();
   for (size_t i = 0; i < num_blocks; ++i) {
     const Block &block = task->blocks_[i];
     chi::u64 remaining = task->length_ - data_off;
@@ -142,11 +143,34 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
     char *dst = dst_base + block.offset_;
     const char *block_src = src + data_off;
 
-    // Each lane copies a contiguous chunk
-    chi::u64 chunk = copy_size / 32;
-    chi::u64 start = lane * chunk;
-    chi::u64 len = (lane == 31) ? (copy_size - start) : chunk;
-    memcpy(dst + start, block_src + start, len);
+    // Coalesced warp-wide copy. Use uint4 (16B) loads/stores when both
+    // pointers are 16-byte aligned, otherwise fall back to u32 (4B).
+    bool aligned16 = ((reinterpret_cast<uintptr_t>(dst) |
+                        reinterpret_cast<uintptr_t>(block_src)) & 15) == 0;
+    if (aligned16) {
+      chi::u64 vec_elems = copy_size / sizeof(uint4);
+      const uint4 *src4 = reinterpret_cast<const uint4 *>(block_src);
+      uint4 *dst4 = reinterpret_cast<uint4 *>(dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(uint4);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        dst[b] = block_src[b];
+      }
+    } else {
+      // 4-byte coalesced fallback (still 128B transactions per warp)
+      chi::u64 vec_elems = copy_size / sizeof(chi::u32);
+      const chi::u32 *src4 = reinterpret_cast<const chi::u32 *>(block_src);
+      chi::u32 *dst4 = reinterpret_cast<chi::u32 *>(dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(chi::u32);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        dst[b] = block_src[b];
+      }
+    }
     data_off += copy_size;
 
     // Yield between blocks to let other coroutines run
@@ -154,8 +178,14 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
       co_await chi::gpu::yield(2);
     }
   }
+  long long t_end = clock64();
 
   if (lane == 0) {
+    chi::u32 warp_id = chi::IpcManager::GetWarpId();
+    double ms = (double)(t_end - t_start) / 1.4e6;  // ~1.4 GHz SM clock
+    printf("[Write W%u blk%u tid%u] %llu bytes, %.2f ms\n",
+           warp_id, (unsigned)blockIdx.x, (unsigned)threadIdx.x,
+           (unsigned long long)data_off, ms);
     task->bytes_written_ = data_off;
     task->return_code_ = 0;
   }
@@ -193,9 +223,10 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *dst = data_ptr.ptr_;
 
-  // Warp-wide copy across all blocks with yield for asynchronicity
+  // Warp-wide coalesced copy across all blocks with yield for asynchronicity
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
+  long long t_start = clock64();
   for (size_t i = 0; i < num_blocks; ++i) {
     const Block &block = task->blocks_[i];
     chi::u64 remaining = task->length_ - data_off;
@@ -205,11 +236,34 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
     const char *block_src = src_base + block.offset_;
     char *block_dst = dst + data_off;
 
-    // Each lane copies a contiguous chunk
-    chi::u64 chunk = copy_size / 32;
-    chi::u64 start = lane * chunk;
-    chi::u64 len = (lane == 31) ? (copy_size - start) : chunk;
-    memcpy(block_dst + start, block_src + start, len);
+    // Coalesced warp-wide copy. Use uint4 (16B) loads/stores when both
+    // pointers are 16-byte aligned, otherwise fall back to u32 (4B).
+    bool aligned16 = ((reinterpret_cast<uintptr_t>(block_dst) |
+                        reinterpret_cast<uintptr_t>(block_src)) & 15) == 0;
+    if (aligned16) {
+      chi::u64 vec_elems = copy_size / sizeof(uint4);
+      const uint4 *src4 = reinterpret_cast<const uint4 *>(block_src);
+      uint4 *dst4 = reinterpret_cast<uint4 *>(block_dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(uint4);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        block_dst[b] = block_src[b];
+      }
+    } else {
+      // 4-byte coalesced fallback (still 128B transactions per warp)
+      chi::u64 vec_elems = copy_size / sizeof(chi::u32);
+      const chi::u32 *src4 = reinterpret_cast<const chi::u32 *>(block_src);
+      chi::u32 *dst4 = reinterpret_cast<chi::u32 *>(block_dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(chi::u32);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        block_dst[b] = block_src[b];
+      }
+    }
     data_off += copy_size;
 
     // Yield between blocks to let other coroutines run
@@ -217,11 +271,17 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
       co_await chi::gpu::yield(2);
     }
   }
+  long long t_end = clock64();
 
   // Ensure GPU writes to pinned host memory are visible to CPU
   __threadfence_system();
 
   if (lane == 0) {
+    chi::u32 warp_id = chi::IpcManager::GetWarpId();
+    double ms = (double)(t_end - t_start) / 1.4e6;  // ~1.4 GHz SM clock
+    printf("[Read  W%u blk%u tid%u] %llu bytes, %.2f ms\n",
+           warp_id, (unsigned)blockIdx.x, (unsigned)threadIdx.x,
+           (unsigned long long)data_off, ms);
     task->bytes_read_ = data_off;
     task->return_code_ = 0;
   }

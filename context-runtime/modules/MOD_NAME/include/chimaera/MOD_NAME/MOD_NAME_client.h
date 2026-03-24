@@ -209,11 +209,13 @@ class Client : public chi::ContainerClient {
   HSHM_CROSS_FUN
   chi::Future<GpuSubmitTask> AsyncGpuSubmit(const chi::PoolQuery& pool_query,
                                             chi::u32 gpu_id,
-                                            chi::u32 test_value) {
+                                            chi::u32 test_value,
+                                            chi::u64 counter_addr = 0) {
     auto* ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GpuSubmitTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, gpu_id, test_value);
+        chi::CreateTaskId(), pool_id_, pool_query, gpu_id, test_value,
+        counter_addr);
 
     return ipc_manager->Send(task);
   }

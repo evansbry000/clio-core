@@ -797,6 +797,128 @@ add_custom_target(test_gpu_client_process
   COMMENT "Running Chimaera GPU client process tests"
 )
 
+# GPU Parallelism test executable (cross-warp validation)
+set(GPU_PARALLELISM_TEST_TARGET chimaera_gpu_parallelism_tests)
+set(GPU_PARALLELISM_TEST_CPU_SOURCES
+  test_gpu_parallelism_cpu.cc
+)
+set(GPU_PARALLELISM_TEST_GPU_SOURCES
+  test_gpu_parallelism_gpu.cc
+)
+
+if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+  set(GPU_PARALLELISM_CUDA_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/cuda/${GPU_PARALLELISM_TEST_GPU_SOURCES})
+  configure_file(${GPU_PARALLELISM_TEST_GPU_SOURCES} ${GPU_PARALLELISM_CUDA_SOURCE} COPYONLY)
+  set_source_files_properties(${GPU_PARALLELISM_CUDA_SOURCE} PROPERTIES LANGUAGE CUDA)
+
+  add_library(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels OBJECT ${GPU_PARALLELISM_CUDA_SOURCE})
+  target_include_directories(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+  )
+  target_link_libraries(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PRIVATE hshm::cuda_cxx)
+  set_target_properties(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 17
+  )
+  target_compile_options(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PUBLIC
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+
+  add_executable(${GPU_PARALLELISM_TEST_TARGET}
+    ${GPU_PARALLELISM_TEST_CPU_SOURCES}
+    $<TARGET_OBJECTS:${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels>
+  )
+
+  set_source_files_properties(${GPU_PARALLELISM_TEST_CPU_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-UHSHM_ENABLE_CUDA;-DHSHM_ENABLE_CUDA=0"
+  )
+
+  target_include_directories(${GPU_PARALLELISM_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  target_link_libraries(${GPU_PARALLELISM_TEST_TARGET}
+    chimaera_admin_runtime
+    chimaera_admin_client
+    chimaera_MOD_NAME_runtime
+    chimaera_MOD_NAME_client
+    hshm::cxx
+    hshm::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  set_target_properties(${GPU_PARALLELISM_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_SEPARABLE_COMPILATION ON
+    LINKER_LANGUAGE CUDA
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  message(STATUS "Building GPU parallelism tests with CUDA support")
+else()
+  add_executable(${GPU_PARALLELISM_TEST_TARGET} ${GPU_PARALLELISM_TEST_CPU_SOURCES})
+
+  target_include_directories(${GPU_PARALLELISM_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+  )
+
+  target_link_libraries(${GPU_PARALLELISM_TEST_TARGET}
+    chimaera_admin_runtime
+    chimaera_admin_client
+    chimaera_MOD_NAME_runtime
+    chimaera_MOD_NAME_client
+    hshm::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  set_target_properties(${GPU_PARALLELISM_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  message(STATUS "Building GPU parallelism tests without CUDA support (CPU-only)")
+endif()
+
+add_custom_target(test_gpu_parallelism
+  COMMAND ${GPU_PARALLELISM_TEST_TARGET}
+  DEPENDS ${GPU_PARALLELISM_TEST_TARGET}
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  COMMENT "Running GPU cross-warp parallelism validation tests"
+)
+
+if(WRP_CORE_ENABLE_TESTS)
+  add_test(
+    NAME cr_gpu_parallelism_tests
+    COMMAND ${GPU_PARALLELISM_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_parallelism_tests PROPERTIES
+    TIMEOUT 180
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CHI_GPU_BLOCKS=64;CHI_GPU_THREADS=32"
+    LABELS "msan_skip;asan_skip"
+  )
+endif()
+
+# Install GPU parallelism test
+install(TARGETS ${GPU_PARALLELISM_TEST_TARGET}
+  RUNTIME DESTINATION bin
+)
+
 # Migrate test executable (integration test binary for container migration)
 set(MIGRATE_TEST_TARGET chimaera_migrate_tests)
 set(MIGRATE_TEST_SOURCES

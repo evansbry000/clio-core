@@ -80,21 +80,12 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
   u32 warp_id = IpcManager::GetWarpId();
   u32 lane_id = IpcManager::GetLaneId();
 
-  // Shared pointer-per-warp: lane 0 sets its warp's pointer to a heap-allocated
-  // GpuRunContext[32] array. All lanes read it after __syncwarp().
-  constexpr u32 kMaxWarpsPerBlock = 32;  // 1024 threads / 32
-  __shared__ gpu::RunContext *s_active_ptrs[kMaxWarpsPerBlock];
-  u32 warp_in_block = threadIdx.x / 32;
-  if (threadIdx.x == 0) {
-    memset(s_active_ptrs, 0, sizeof(s_active_ptrs));
-  }
-  __syncthreads();
-
   // Thread 0 of block 0 signals that the orchestrator is running
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     control->running_flag = 1;
     __threadfence_system();  // Flush to CPU-visible memory
   }
+  __syncthreads();
 
   // Each warp polls its own lane from the gpu2gpu queue
   gpu::Worker worker;
@@ -106,7 +97,8 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
               pool_mgr,
               gpu_info.cpu2gpu_queue_base,
               control,
-              &s_active_ptrs[warp_in_block]);
+              gpu_info.warp_group_queue,
+              gpu_info.warp_group_queue_base);
 
   // Poll until exit signal
   while (!control->exit_flag) {
@@ -172,6 +164,38 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   launch_info.gpu2gpu_num_lanes = num_warps;
   launch_info.internal_num_lanes = num_warps;
 
+  // Compute warp group topology
+  launch_info.num_warps = num_warps;
+  u32 W2 = 1;
+  while (W2 * W2 < num_warps) ++W2;
+  launch_info.num_warp_groups = W2;
+  launch_info.warp_group_num_lanes = W2;
+
+  // Allocate per-warp-group and per-warp load counters
+  {
+    size_t grp_sz = W2 * sizeof(hipc::atomic<u32>);
+    size_t warp_sz = num_warps * sizeof(hipc::atomic<u32>);
+    cudaMalloc(&launch_info.warp_group_load, grp_sz);
+    cudaMemset(launch_info.warp_group_load, 0, grp_sz);
+    cudaMalloc(&launch_info.warp_load, warp_sz);
+    cudaMemset(launch_info.warp_load, 0, warp_sz);
+    warp_group_load_ = launch_info.warp_group_load;
+    warp_load_ = launch_info.warp_load;
+  }
+
+  // Allocate cross-warp task queue (warp group queue)
+  {
+    size_t wgq_cap = 512 * 1024;  // 512KB for warp group queue
+    char *wgq_data = nullptr;
+    cudaMalloc(&wgq_data, wgq_cap);
+    cudaMemset(wgq_data, 0, wgq_cap);
+    auto wgq_fp = gpu::InitQueueOnDevice(wgq_data, wgq_cap, W2, 128);
+    launch_info.warp_group_queue = wgq_fp.ptr_;
+    launch_info.warp_group_queue_base = wgq_data;
+    warp_group_queue_data_ = wgq_data;
+    warp_group_queue_ptr_ = wgq_fp.ptr_;
+  }
+
   // Launch persistent GPU work orchestrator.
   HLOG(kInfo, "Launching GPU work orchestrator with {} blocks, {} threads/block ({} warps)",
        blocks, threads_per_block, launch_info.gpu2gpu_num_lanes);
@@ -179,6 +203,7 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
       static_cast<cudaStream_t>(stream_)>>>(
       d_pm, control_, launch_info, blocks);
 
+  launched_num_warps_ = num_warps;
   is_launched_ = true;
   HLOG(kInfo, "GPU work orchestrator launched successfully");
   return true;
@@ -202,6 +227,18 @@ void gpu::WorkOrchestrator::Finalize() {
     hshm::GpuApi::Synchronize();
   }
 
+  if (warp_group_load_) {
+    cudaFree(warp_group_load_);
+    warp_group_load_ = nullptr;
+  }
+  if (warp_load_) {
+    cudaFree(warp_load_);
+    warp_load_ = nullptr;
+  }
+  if (warp_group_queue_data_) {
+    cudaFree(warp_group_queue_data_);
+    warp_group_queue_data_ = nullptr;
+  }
   if (d_pool_mgr_) {
     hshm::GpuApi::Free(d_pool_mgr_);
     d_pool_mgr_ = nullptr;
@@ -256,6 +293,59 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
   if (num_warps == 0) num_warps = 1;
   resume_info.gpu2gpu_num_lanes = num_warps;
   resume_info.internal_num_lanes = num_warps;
+
+  // Recompute warp group topology
+  resume_info.num_warps = num_warps;
+  u32 W2 = 1;
+  while (W2 * W2 < num_warps) ++W2;
+  resume_info.num_warp_groups = W2;
+  resume_info.warp_group_num_lanes = W2;
+
+  // Reallocate cross-warp resources if warp count changed
+  if (num_warps != launched_num_warps_) {
+    HLOG(kInfo, "GPU orchestrator Resume: warp count changed {} -> {}, "
+         "reallocating cross-warp resources",
+         launched_num_warps_, num_warps);
+
+    // Free old load tracking arrays
+    if (warp_group_load_) { cudaFree(warp_group_load_); warp_group_load_ = nullptr; }
+    if (warp_load_) { cudaFree(warp_load_); warp_load_ = nullptr; }
+
+    // Allocate new load tracking arrays
+    size_t grp_sz = W2 * sizeof(hipc::atomic<u32>);
+    size_t warp_sz = num_warps * sizeof(hipc::atomic<u32>);
+    cudaMalloc(&warp_group_load_, grp_sz);
+    cudaMemset(warp_group_load_, 0, grp_sz);
+    cudaMalloc(&warp_load_, warp_sz);
+    cudaMemset(warp_load_, 0, warp_sz);
+
+    // Free and reallocate warp group queue
+    if (warp_group_queue_data_) {
+      cudaFree(warp_group_queue_data_);
+      warp_group_queue_data_ = nullptr;
+      warp_group_queue_ptr_ = nullptr;
+    }
+    size_t wgq_cap = 512 * 1024;
+    char *wgq_data = nullptr;
+    cudaMalloc(&wgq_data, wgq_cap);
+    cudaMemset(wgq_data, 0, wgq_cap);
+    auto wgq_fp = gpu::InitQueueOnDevice(wgq_data, wgq_cap, W2, 128);
+    warp_group_queue_data_ = wgq_data;
+    warp_group_queue_ptr_ = wgq_fp.ptr_;
+
+    launched_num_warps_ = num_warps;
+  }
+
+  resume_info.warp_group_load =
+      static_cast<hipc::atomic<u32> *>(warp_group_load_);
+  resume_info.warp_load =
+      static_cast<hipc::atomic<u32> *>(warp_load_);
+  if (warp_group_queue_data_) {
+    resume_info.warp_group_queue =
+        static_cast<TaskQueue *>(warp_group_queue_ptr_);
+    resume_info.warp_group_queue_base =
+        static_cast<char *>(warp_group_queue_data_);
+  }
 
   // Skip heap re-init — per-block allocators persist across pause/resume.
   resume_info.skip_heap_init = true;

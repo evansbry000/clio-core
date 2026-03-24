@@ -577,6 +577,13 @@ __global__ void gpu_bdev_read_write_kernel(
           __syncwarp();
 
           // Write (timed)
+          if (iter == 0 && lane_id == 0) {
+            chi::u32 client_warp = chi::IpcManager::GetWarpId();
+            chi::u32 nlanes = CHI_IPC->gpu2gpu_num_lanes_;
+            printf("[Client W%u] gpu2gpu_num_lanes=%u, target_lane=%u, queue=%p\n",
+                   client_warp, nlanes, nlanes > 1 ? client_warp % nlanes : 0u,
+                   (void*)CHI_IPC->gpu2gpu_queue_);
+          }
           long long t0 = clock64();
           auto write_future = bdev_client.AsyncWrite(
               pool_query_parallel, alloc_future->blocks_, data_shm, warp_bytes);
@@ -733,7 +740,6 @@ static int run_cte_gpu_bench_putblob(
   // --- 6. Build GPU info and launch data placement kernel ---
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
-  gpu_info.gpu_priv_backend = heap_backend;
 
 
   int *d_done;
@@ -977,7 +983,6 @@ static int run_cte_gpu_bench_putget(
   // --- 7. Build GPU info and launch putget kernel ---
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
-  gpu_info.gpu_priv_backend = heap_backend;
 
 
   int *d_done;
@@ -1307,7 +1312,6 @@ static int run_bdev_alloc_free(
 
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
-  gpu_info.gpu_priv_backend = heap_backend;
 
 
   int *d_done;
@@ -1460,7 +1464,6 @@ static int run_bdev_read_write(
 
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
-  gpu_info.gpu_priv_backend = heap_backend;
 
 
   int *d_done;
@@ -1780,7 +1783,6 @@ int main(int argc, char **argv) {
 
     chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
     gpu_info.backend = scratch_backend;
-    gpu_info.gpu_priv_backend = heap_backend;
 
     int *d_done;
     cudaMallocHost(&d_done, sizeof(int));

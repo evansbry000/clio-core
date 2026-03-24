@@ -117,7 +117,6 @@ struct TaskStat {
   size_t io_size_{0};  /**< I/O size in bytes */
   size_t compute_{0};  /**< Normalized compute time in microseconds */
   float wall_time_{0}; /**< Normalized wall time input for InferWallClockTime */
-  u32 parallelism{1};  /**< GPU warp parallelism: 1 (lane 0 only) or 32 (full warp) */
 };
 
 // Define macros for container template
@@ -503,6 +502,11 @@ struct FutureShm {
    */
   void *parent_gpu_rctx_;
 
+  /** Cross-warp: warps increment on done */
+  hipc::atomic<u32> completion_counter_;
+  /** Number of warps sharing this FutureShm */
+  u32 total_warps_;
+
   /** Copy space for serialized task data (flexible array member) */
   char copy_space[];
 
@@ -520,6 +524,8 @@ struct FutureShm {
     response_fd_ = -1;
     response_identity_len_ = 0;
     parent_gpu_rctx_ = nullptr;
+    completion_counter_.store(0);
+    total_warps_ = 1;
     flags_.Clear();
   }
 };
@@ -555,6 +561,14 @@ class Future {
 
   /** Whether Destroy(true) was called (via Wait/await_resume) */
   bool consumed_;
+
+  /** Cross-warp sub-range for this future */
+  struct Range {
+    u32 off;
+    u32 width;
+    HSHM_CROSS_FUN Range() : off(0), width(0) {}
+    HSHM_CROSS_FUN Range(u32 o, u32 w) : off(o), width(w) {}
+  } range_;
 
   /**
    * Implementation of await_suspend
@@ -709,6 +723,21 @@ class Future {
    */
   HSHM_CROSS_FUN TaskT* operator->() const { return task_ptr_.ptr_; }
 
+  /** Get the cross-warp range offset */
+  HSHM_CROSS_FUN u32 RangeOffset() const { return range_.off; }
+
+  /** Get the cross-warp range width */
+  HSHM_CROSS_FUN u32 RangeWidth() const { return range_.width; }
+
+  /** Set the cross-warp sub-range */
+  HSHM_CROSS_FUN void SetRange(u32 off, u32 width) {
+    range_.off = off;
+    range_.width = width;
+  }
+
+  /** Get the warp offset index for this future's range */
+  HSHM_CROSS_FUN u32 GetTaskWarpOffset() const { return range_.off / 32; }
+
   /**
    * Check if the task is complete
    * @return True if task has completed, false otherwise
@@ -733,7 +762,6 @@ class Future {
    */
   HSHM_CROSS_FUN bool Wait(float max_sec = 0);
 
-  /**
   /**
    * Mark the task as complete
    */
@@ -888,7 +916,12 @@ class Future {
     if constexpr (requires { handle.promise().get_run_context(); }) {
       auto *ctx = handle.promise().get_run_context();
       if (ctx) {
-        ctx->coro_handle_ = handle;
+#if HSHM_IS_GPU_COMPILER
+        u32 lane = threadIdx.x % 32;
+#else
+        u32 lane = 0;
+#endif
+        ctx->coro_handles_[lane] = handle;
         ctx->is_yielded_ = true;
         // Store FutureShm pointer so Worker checks FUTURE_COMPLETE before resume
         auto fshm_full = GetFutureShm();

@@ -177,7 +177,6 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
   // the primary backend and heap backend with our custom ones
   chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_heap;
 
   // Allocate UVM buffers (accessible from both CPU and GPU)
   // Using cudaMallocManaged so device-scope fences ensure cross-warp

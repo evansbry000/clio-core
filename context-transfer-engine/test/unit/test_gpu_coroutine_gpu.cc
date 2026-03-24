@@ -72,7 +72,6 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
 
   chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_heap;
 
   // Pinned result
   int *d_result;
@@ -164,7 +163,6 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
 
   chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_heap;
 
   // Pinned results
   int *d_result;

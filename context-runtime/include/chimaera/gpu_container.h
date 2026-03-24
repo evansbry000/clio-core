@@ -145,14 +145,9 @@ class Container {
     }
   }
 
-  /**
-   * Get GPU warp parallelism for a method.
-   * @param method_id Method to query
-   * @return 1 for lane-0-only execution, 32 for full warp parallelism
-   */
-  HSHM_GPU_FUN virtual u32 GetGpuParallelism(u32 method_id) const {
+  HSHM_GPU_FUN virtual TaskStat GetTaskStats(u32 method_id) const {
     (void)method_id;
-    return 1;
+    return TaskStat();
   }
 
   /**

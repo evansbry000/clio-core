@@ -76,26 +76,22 @@ class Worker {
   TaskQueue *cpu2gpu_queue_;         /**< CPU → GPU queue (GPU work orchestrator polls) */
   TaskQueue *gpu2gpu_queue_;         /**< GPU → GPU queue (GPU work orchestrator polls) */
   TaskQueue *internal_queue_;        /**< Internal subtask queue (GPU orchestrator polls) */
+  TaskQueue *warp_group_queue_;      /**< Cross-warp sub-task queue */
+  char *warp_group_queue_base_;      /**< Base of warp group queue backend */
   PoolManager *pool_mgr_;            /**< GPU-side container lookup table */
   char *queue_backend_base_;         /**< Base of queue backend for ShmPtr resolution */
   RunContext rctx_;                   /**< Template RunContext (copied per task) */
   WorkOrchestratorControl *dbg_ctrl_; /**< Debug control struct (pinned, CPU-readable) */
 
   /**
-   * Pointer to __shared__ memory holding the active RunContext.
-   * Lane 0 sets *active_ctx_ptr_ to a heap-allocated RunContext.
-   * All lanes read it after __syncwarp().
+   * Active RunContext pointer. Lane 0 sets this, then broadcasts
+   * to all lanes via __shfl_sync after __syncwarp().
    */
-  RunContext **active_ctx_ptr_;
+  RunContext *active_ctx_;
 
-  static constexpr u32 kMaxSuspended = 128;
-
-  /** State for a suspended warp-task */
-  struct SuspendedTask {
-    RunContext *ctx;                /**< Heap-allocated RunContext */
-    bool occupied;
-  };
-  SuspendedTask suspended_[kMaxSuspended];
+  /** Suspended task queue (ext_ring_buffer of RunContext*), lane 0 only */
+  using SuspendedQueue = hshm::ipc::ext_ring_buffer<RunContext*, CHI_PRIV_ALLOC_T>;
+  SuspendedQueue *suspended_;
   u32 num_suspended_;
 
   /**
@@ -109,25 +105,29 @@ class Worker {
                           PoolManager *pool_mgr,
                           char *queue_backend_base,
                           WorkOrchestratorControl *dbg_ctrl,
-                          RunContext **active_ctx_ptr) {
+                          TaskQueue *warp_group_queue = nullptr,
+                          char *warp_group_queue_base = nullptr) {
     worker_id_ = worker_id;
     lane_id_ = lane_id;
     cpu2gpu_queue_ = cpu2gpu_queue;
     gpu2gpu_queue_ = gpu2gpu_queue;
     internal_queue_ = internal_queue;
+    warp_group_queue_ = warp_group_queue;
+    warp_group_queue_base_ = warp_group_queue_base;
     pool_mgr_ = pool_mgr;
     queue_backend_base_ = queue_backend_base;
     dbg_ctrl_ = dbg_ctrl;
-    active_ctx_ptr_ = active_ctx_ptr;
+    active_ctx_ = nullptr;
     is_running_ = true;
     num_suspended_ = 0;
-    for (u32 i = 0; i < kMaxSuspended; ++i) {
-      suspended_[i].occupied = false;
-      suspended_[i].ctx = nullptr;
-    }
+    suspended_ = nullptr;
 #if HSHM_IS_GPU_COMPILER
     u32 warp_id = IpcManager::GetWarpId();
     u32 warp_lane = IpcManager::GetLaneId();
+    if (warp_lane == 0) {
+      auto fp = CHI_IPC->NewObj<SuspendedQueue>(CHI_PRIV_ALLOC, 128);
+      suspended_ = fp.ptr_;
+    }
     rctx_ = RunContext(blockIdx.x, threadIdx.x, warp_id, warp_lane);
 #else
     rctx_ = RunContext(0, 0, 0, 0);
@@ -163,8 +163,8 @@ class Worker {
 #ifdef HSHM_BUDDY_ALLOC_DEBUG
       u32 completed = dbg_ctrl_->dbg_tasks_completed[worker_id_];
       if (completed % 50 == 0) {
-        auto *priv = &CHI_IPC->gpu_priv_alloc_;
-        if (CHI_IPC->gpu_priv_alloc_init_) {
+        auto *priv = CHI_PRIV_ALLOC;
+        if (priv) {
           printf("[W%u] task#%u priv: allocs=%llu frees=%llu net=%llu "
                  "bigheap=%llu/%llu\n",
                  worker_id_, completed,
@@ -221,7 +221,7 @@ class Worker {
     // ================================================================
     if (lane_id == 0) {
       DbgPoll();
-      *active_ctx_ptr_ = nullptr;
+      active_ctx_ = nullptr;
 
       // Check suspended tasks for completion
       if (num_suspended_ > 0) {
@@ -229,19 +229,28 @@ class Worker {
       }
 
       // Pop new task if no resumed task and we have capacity
-      if (*active_ctx_ptr_ == nullptr && num_suspended_ < kMaxSuspended) {
+      if (active_ctx_ == nullptr) {
         did_work |= TryPopNewTask();
       }
     }
 
+    // Broadcast active_ctx_ from lane 0 to all lanes
 #if HSHM_IS_GPU_COMPILER
-    __syncwarp();
+    {
+      u64 ctx_bits = reinterpret_cast<u64>(active_ctx_);
+      u32 lo = static_cast<u32>(ctx_bits);
+      u32 hi = static_cast<u32>(ctx_bits >> 32);
+      lo = __shfl_sync(0xFFFFFFFF, lo, 0);
+      hi = __shfl_sync(0xFFFFFFFF, hi, 0);
+      active_ctx_ = reinterpret_cast<RunContext *>(
+          (static_cast<u64>(hi) << 32) | lo);
+    }
 #endif
 
     // ================================================================
     // Phase 2: Execute the active task (all participating lanes)
     // ================================================================
-    RunContext *ctx = *active_ctx_ptr_;
+    RunContext *ctx = active_ctx_;
     if (ctx != nullptr) {
       if (lane_id == 0) {
         GPU_WORKER_DPRINTF("[W%u] Phase2: method %u, parallelism %u\n",
@@ -323,27 +332,52 @@ class Worker {
         DbgTaskCompleted();
         GPU_WORKER_DPRINTF("[W%u] Task DONE: method %u\n",
                            worker_id_, ctx->method_id_);
-        if (ctx->is_copy_path_) {
-          auto *container = static_cast<Container *>(ctx->container_);
-          auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
-          SerializeAndComplete(fshm, container,
-                               ctx->method_id_, ctx->task_ptr_,
-                               ctx->is_gpu2gpu_);
+        auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
+        if (fshm->total_warps_ > 1) {
+          // Cross-warp: increment completion counter
+#if !HSHM_IS_HOST
+          u32 prev = fshm->completion_counter_.fetch_add(1);
+          __threadfence();
+#else
+          u32 prev = 0;
+#endif
+          if (prev + 1 < fshm->total_warps_) {
+            // Not the last warp — free context and continue
+            FreeContext(ctx);
+            active_ctx_ = nullptr;
+          } else {
+            // Last warp: serialize and signal completion
+            if (ctx->is_copy_path_) {
+              auto *container = static_cast<Container *>(ctx->container_);
+              SerializeAndComplete(fshm, container,
+                                   ctx->method_id_, ctx->task_ptr_,
+                                   ctx->is_gpu2gpu_);
+            } else {
+              CompleteAndResumeParent(fshm, ctx->is_gpu2gpu_);
+            }
+            FreeContext(ctx);
+            active_ctx_ = nullptr;
+          }
         } else {
-          auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
-          CompleteAndResumeParent(fshm, ctx->is_gpu2gpu_);
+          // Single-warp path
+          if (ctx->is_copy_path_) {
+            auto *container = static_cast<Container *>(ctx->container_);
+            SerializeAndComplete(fshm, container,
+                                 ctx->method_id_, ctx->task_ptr_,
+                                 ctx->is_gpu2gpu_);
+          } else {
+            CompleteAndResumeParent(fshm, ctx->is_gpu2gpu_);
+          }
+          FreeContext(ctx);
+          active_ctx_ = nullptr;
         }
-        FreeContext(ctx);
-        *active_ctx_ptr_ = nullptr;
       } else {
         DbgState(3);
-        u32 slot = FindFreeSlot();
-        GPU_WORKER_DPRINTF("[W%u] Task SUSPEND: method %u -> slot %u (nsus=%u)\n",
-                           worker_id_, ctx->method_id_, slot, num_suspended_ + 1);
-        suspended_[slot].ctx = ctx;
-        suspended_[slot].occupied = true;
+        GPU_WORKER_DPRINTF("[W%u] Task SUSPEND: method %u (nsus=%u)\n",
+                           worker_id_, ctx->method_id_, num_suspended_ + 1);
+        suspended_->Push(ctx);
         ++num_suspended_;
-        *active_ctx_ptr_ = nullptr;
+        active_ctx_ = nullptr;
       }
     }
 
@@ -380,7 +414,8 @@ class Worker {
   HSHM_GPU_FUN RunContext *AllocContext(
       Container *container, u32 method_id,
       hipc::FullPtr<Task> task_ptr, FutureShm *fshm,
-      bool is_gpu2gpu, bool is_copy_path, u32 parallelism) {
+      bool is_gpu2gpu, bool is_copy_path, u32 parallelism,
+      u32 range_off = 0, u32 range_width = 0) {
     auto *ipc = CHI_IPC;
     auto alloc_result = ipc->gpu_alloc_->AllocateObjs<RunContext>(1);
     RunContext *ctx = alloc_result.ptr_;
@@ -396,6 +431,8 @@ class Worker {
     ctx->task_fshm_ = fshm;
     ctx->is_gpu2gpu_ = is_gpu2gpu;
     ctx->is_copy_path_ = is_copy_path;
+    ctx->range_off_ = range_off;
+    ctx->range_width_ = (range_width > 0) ? range_width : parallelism;
     // Coroutine state starts clean
     ctx->is_yielded_ = false;
     ctx->awaited_fshm_ = nullptr;
@@ -431,32 +468,28 @@ class Worker {
   // Suspended task management
   // ================================================================
 
-  HSHM_GPU_FUN u32 FindFreeSlot() {
-    for (u32 i = 0; i < kMaxSuspended; ++i) {
-      if (!suspended_[i].occupied) return i;
-    }
-    return 0;
-  }
-
   /**
-   * Check suspended tasks. If any are ready to resume, set active_tasks_ptr_.
+   * Check suspended tasks. Pop each, check readiness, re-push if not ready.
+   * If one is ready to resume, set active_ctx_.
    * Called only by lane 0.
    */
   HSHM_GPU_FUN bool CheckAndResumeSuspended() {
     bool did_work = false;
-    for (u32 i = 0; i < kMaxSuspended; ++i) {
-      if (!suspended_[i].occupied) continue;
-
-      RunContext *ctx = suspended_[i].ctx;
+    u32 count = num_suspended_;
+    for (u32 i = 0; i < count; ++i) {
+      RunContext *ctx;
+      if (!suspended_->Pop(ctx)) break;
 
       // Check if the awaited sub-task is complete
       if (ctx->awaited_fshm_) {
         auto *awaited = reinterpret_cast<FutureShm *>(ctx->awaited_fshm_);
         if (!awaited->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
-          continue;  // Sub-task not done yet
+          // Not ready — re-enqueue
+          suspended_->Push(ctx);
+          continue;
         }
-        GPU_WORKER_DPRINTF("[W%u] Suspended[%u]: sub-task complete, resuming\n",
-                           worker_id_, i);
+        GPU_WORKER_DPRINTF("[W%u] Suspended: sub-task complete, resuming\n",
+                           worker_id_);
 #if !HSHM_IS_HOST
         DeserializeAwaitedOutput(*ctx, awaited);
 #endif
@@ -467,7 +500,6 @@ class Worker {
       // Check if the top-level coroutine completed (from previous resume)
       if (ctx->task_coros_[0] && ctx->task_coros_[0].done()) {
         DbgTaskCompleted();
-        suspended_[i].occupied = false;
         --num_suspended_;
         if (ctx->is_copy_path_) {
           auto *container = static_cast<Container *>(ctx->container_);
@@ -484,10 +516,9 @@ class Worker {
         continue;
       }
 
-      // Ready to resume: set as active and remove from suspended list
+      // Ready to resume: set as active
       DbgTaskResumed();
-      *active_ctx_ptr_ = ctx;
-      suspended_[i].occupied = false;
+      active_ctx_ = ctx;
       --num_suspended_;
       did_work = true;
       break;  // Resume one at a time
@@ -501,13 +532,15 @@ class Worker {
 
   /**
    * Try to pop a new task from gpu2gpu or cpu2gpu queue.
-   * On success, prepares a RunContext and sets active_ctx_ptr_.
+   * On success, prepares a RunContext and sets active_ctx_.
    * Called only by lane 0.
    */
   HSHM_GPU_FUN bool TryPopNewTask() {
     // Poll internal queue first (highest priority) to prevent deadlock:
     // orchestrator subtasks must drain before client tasks can unblock.
     if (TryPopFromQueue(internal_queue_, lane_id_, true)) return true;
+    // Poll cross-warp sub-task queue (higher priority than client queues)
+    if (TryPopCrossWarpTask()) return true;
     if (TryPopFromQueue(gpu2gpu_queue_, lane_id_, true)) return true;
     if (lane_id_ == 0) {
       if (TryPopFromQueue(cpu2gpu_queue_, 0, false)) return true;
@@ -593,8 +626,108 @@ class Worker {
 
   /**
    * Prepare a copy-path task: deserialize input, allocate contexts.
-   * Sets *active_ctx_ptr_ on success.
+   * Sets active_ctx_ on success.
    */
+  /** Compact descriptor for a cross-warp sub-task pushed to warp_group_queue */
+  struct CrossWarpDescriptor {
+    FutureShm *fshm;
+    Container *container;
+    hipc::FullPtr<Task> task_ptr;
+    u32 method_id;
+    u32 range_off;
+    u32 range_width;
+    u32 parallelism;  /**< Per-warp parallelism (capped at 32) */
+    bool is_gpu2gpu;
+    bool is_copy_path;
+  };
+
+  /**
+   * Push a cross-warp sub-task descriptor to the warp group queue.
+   * Called by lane 0 of the originating warp for each additional warp needed.
+   */
+  HSHM_GPU_FUN void PushCrossWarpSubTask(
+      FutureShm *fshm, Container *container, u32 method_id,
+      hipc::FullPtr<Task> task_ptr, bool is_gpu2gpu, bool is_copy_path,
+      u32 range_off, u32 range_width) {
+    if (!warp_group_queue_) return;
+    auto *ipc = CHI_IPC;
+    auto *alloc = ipc->gpu_alloc_;
+    auto desc_fp = alloc->template AllocateObjs<CrossWarpDescriptor>(1);
+    if (desc_fp.IsNull()) return;
+    auto *desc = desc_fp.ptr_;
+    desc->fshm = fshm;
+    desc->container = container;
+    desc->task_ptr = task_ptr;
+    desc->method_id = method_id;
+    desc->range_off = range_off;
+    desc->range_width = range_width;
+    desc->parallelism = range_width;
+    desc->is_gpu2gpu = is_gpu2gpu;
+    desc->is_copy_path = is_copy_path;
+
+    // Pack descriptor address into a Future<Task> for the queue
+    Future<Task> future;
+    hipc::ShmPtr<FutureShm> sptr;
+    sptr.off_ = reinterpret_cast<size_t>(desc);
+    sptr.alloc_id_ = hipc::AllocatorId::GetNull();
+    future = Future<Task>(sptr);
+
+    // Distribute sub-tasks across all lanes based on range_off
+    u32 num_lanes = warp_group_queue_->GetNumLanes();
+    u32 lane = (range_off / 32) % num_lanes;
+    auto &qlane = warp_group_queue_->GetLane(lane, 0);
+    bool pushed = qlane.Push(future);
+    if (!pushed) {
+      // Push failed - free descriptor
+      ipc->gpu_alloc_->Free(desc_fp);
+      GPU_WORKER_DPRINTF("[W%u] CrossWarp PUSH FAILED: lane=%u off=%u\n",
+                         worker_id_, lane, range_off);
+    }
+  }
+
+  /**
+   * Try to pop a cross-warp sub-task from the warp group queue.
+   * Returns true if a task was popped and active_ctx_ptr_ was set.
+   */
+  HSHM_GPU_FUN bool TryPopCrossWarpTask() {
+    if (!warp_group_queue_) return false;
+
+    u32 lane = worker_id_ % warp_group_queue_->GetNumLanes();
+    auto &qlane = warp_group_queue_->GetLane(lane, 0);
+
+    Future<Task> future;
+    if (!qlane.PopDevice(future)) return false;
+
+    hipc::ShmPtr<FutureShm> sptr = future.GetFutureShmPtr();
+    if (sptr.IsNull()) return true;
+
+    auto *desc = reinterpret_cast<CrossWarpDescriptor *>(sptr.off_.load());
+    if (!desc) return true;
+
+    RunContext *rctx = AllocContext(
+        desc->container, desc->method_id, desc->task_ptr, desc->fshm,
+        desc->is_gpu2gpu, desc->is_copy_path, desc->parallelism,
+        desc->range_off, desc->range_width);
+    if (!rctx) {
+      // Cannot allocate context — push back? For now just drop and let
+      // completion counter handle the partial completion.
+      auto *ipc = CHI_IPC;
+      hipc::FullPtr<CrossWarpDescriptor> fp(
+          reinterpret_cast<hipc::Allocator *>(ipc->gpu_alloc_), desc);
+      ipc->gpu_alloc_->Free(fp);
+      return true;
+    }
+
+    // Free the descriptor
+    auto *ipc = CHI_IPC;
+    hipc::FullPtr<CrossWarpDescriptor> fp(
+        reinterpret_cast<hipc::Allocator *>(ipc->gpu_alloc_), desc);
+    ipc->gpu_alloc_->Free(fp);
+
+    active_ctx_ = rctx;
+    return true;
+  }
+
   HSHM_GPU_FUN void DbgStep(unsigned int step) {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
       dbg_ctrl_->dbg_dispatch_step[worker_id_] = step;
@@ -661,23 +794,55 @@ class Worker {
 
     // Allocate RunContext
     GPU_WORKER_DPRINTF("[W%u] PrepCopy: allocating context\n", worker_id_);
-    u32 parallelism = container->GetTaskStats(method_id).parallelism;
-    RunContext *rctx = AllocContext(
-        container, method_id, task_ptr, fshm, is_gpu2gpu, true, parallelism);
-    if (!rctx) {
-      DbgAllocFailure();
-      GPU_WORKER_DPRINTF("[W%u] PrepCopy: context alloc FAILED\n", worker_id_);
-      // Must signal completion so the client doesn't spin forever
-      if (is_gpu2gpu) {
-        fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
-      } else {
-        fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
-      }
-      return true;
-    }
+    u32 parallelism = task_ptr.ptr_->pool_query_.GetParallelism();
 
-    GPU_WORKER_DPRINTF("[W%u] PrepCopy: done\n", worker_id_);
-    *active_ctx_ptr_ = rctx;
+    if (parallelism <= 32) {
+      // Single-warp path
+      RunContext *rctx = AllocContext(
+          container, method_id, task_ptr, fshm, is_gpu2gpu, true,
+          parallelism, 0, parallelism);
+      if (!rctx) {
+        DbgAllocFailure();
+        GPU_WORKER_DPRINTF("[W%u] PrepCopy: context alloc FAILED\n", worker_id_);
+        if (is_gpu2gpu) {
+          fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+        } else {
+          fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+        }
+        return true;
+      }
+      GPU_WORKER_DPRINTF("[W%u] PrepCopy: done\n", worker_id_);
+      active_ctx_ = rctx;
+    } else {
+      // Cross-warp path
+      u32 num_warps_needed = (parallelism + 31) / 32;
+      fshm->total_warps_ = num_warps_needed;
+      fshm->completion_counter_.store(0);
+
+      // This warp takes range [0, 32)
+      RunContext *rctx = AllocContext(
+          container, method_id, task_ptr, fshm, is_gpu2gpu, true,
+          32, 0, 32);
+      if (!rctx) {
+        DbgAllocFailure();
+        if (is_gpu2gpu) {
+          fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+        } else {
+          fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+        }
+        return true;
+      }
+
+      // Push remaining sub-ranges to warp_group_queue
+      for (u32 w = 1; w < num_warps_needed; ++w) {
+        u32 off = w * 32;
+        u32 width = 32;
+        if (off + width > parallelism) width = parallelism - off;
+        PushCrossWarpSubTask(fshm, container, method_id, task_ptr,
+                             is_gpu2gpu, true, off, width);
+      }
+      active_ctx_ = rctx;
+    }
     return true;
 #else
     return false;
@@ -686,7 +851,7 @@ class Worker {
 
   /**
    * Prepare a direct-path task: no deserialization needed.
-   * Sets *active_ctx_ptr_ on success.
+   * Sets active_ctx_ on success.
    */
   HSHM_GPU_FUN bool PrepareTaskDirect(FutureShm *fshm, Container *container,
                                         u32 method_id, bool is_gpu2gpu) {
@@ -701,20 +866,51 @@ class Worker {
     task_ptr.shm_.off_ = fshm->client_task_vaddr_;
     task_ptr.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
 
-    u32 parallelism = container->GetTaskStats(method_id).parallelism;
-    RunContext *rctx = AllocContext(
-        container, method_id, task_ptr, fshm, is_gpu2gpu, false, parallelism);
-    if (!rctx) {
-      DbgAllocFailure();
-      if (is_gpu2gpu) {
-        fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
-      } else {
-        fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
-      }
-      return true;
-    }
+    u32 parallelism = task_ptr.ptr_->pool_query_.GetParallelism();
 
-    *active_ctx_ptr_ = rctx;
+    if (parallelism <= 32) {
+      // Single-warp path
+      RunContext *rctx = AllocContext(
+          container, method_id, task_ptr, fshm, is_gpu2gpu, false,
+          parallelism, 0, parallelism);
+      if (!rctx) {
+        DbgAllocFailure();
+        if (is_gpu2gpu) {
+          fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+        } else {
+          fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+        }
+        return true;
+      }
+      active_ctx_ = rctx;
+    } else {
+      // Cross-warp path
+      u32 num_warps_needed = (parallelism + 31) / 32;
+      fshm->total_warps_ = num_warps_needed;
+      fshm->completion_counter_.store(0);
+
+      RunContext *rctx = AllocContext(
+          container, method_id, task_ptr, fshm, is_gpu2gpu, false,
+          32, 0, 32);
+      if (!rctx) {
+        DbgAllocFailure();
+        if (is_gpu2gpu) {
+          fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+        } else {
+          fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+        }
+        return true;
+      }
+
+      for (u32 w = 1; w < num_warps_needed; ++w) {
+        u32 off = w * 32;
+        u32 width = 32;
+        if (off + width > parallelism) width = parallelism - off;
+        PushCrossWarpSubTask(fshm, container, method_id, task_ptr,
+                             is_gpu2gpu, false, off, width);
+      }
+      active_ctx_ = rctx;
+    }
     return true;
   }
 
@@ -731,7 +927,8 @@ class Worker {
     out_ctx.copy_space = fshm->copy_space;
     out_ctx.shm_info_ = &fshm->output_;
 
-    LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeOut, CHI_PRIV_ALLOC);
+    auto *priv_alloc = CHI_PRIV_ALLOC;
+    LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeOut, priv_alloc);
     container->LocalSaveTask(method_id, save_ar, task_ptr);
     if (is_gpu2gpu) {
       hshm::lbm::ShmTransport::SendDevice(save_ar, out_ctx);
@@ -739,14 +936,7 @@ class Worker {
       hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
     }
 
-    // Destroy the deserialized task via its derived destructor.
-    // Task has a non-virtual destructor, so calling ~Task() directly would
-    // skip derived members (priv::vector, priv::string), leaking gpu_alloc_.
     container->LocalDestroyTask(method_id, task_ptr);
-    // Free task memory back to scratch allocator.
-    // LocalAllocLoadTask allocated from gpu_alloc_ (container's allocator);
-    // without this Free the scratch partition leaks on every completed task,
-    // eventually exhausting the partition and causing SendGpu() to fail.
     CHI_IPC->gpu_alloc_->Free(task_ptr.template Cast<char>());
     hipc::threadfence();
 

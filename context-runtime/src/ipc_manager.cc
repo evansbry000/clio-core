@@ -655,7 +655,6 @@ bool IpcManager::ServerInitGpuQueues() {
     gpu2cpu_copy_backends_.reserve(num_gpus);
     cpu2gpu_copy_backends_.reserve(num_gpus);
     gpu_orchestrator_backends_.reserve(num_gpus);
-    gpu_priv_backends_.reserve(num_gpus);
     gpu2gpu_queues_.reserve(num_gpus);
     internal_queues_.reserve(num_gpus);
     gpu2cpu_queues_.reserve(num_gpus);
@@ -832,21 +831,7 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     gpu_orchestrator_backends_.push_back(std::move(backend));
   }
 
-  // --- 7. GPU private backend (GpuMalloc, device memory) ---
-  // Per-block BuddyAllocator for NewObj/NewTask/CHI_PRIV_ALLOC.
-  // Not registered with the Chimaera runtime — local to client/orchestrator.
-  {
-    hipc::MemoryBackendId bid(9000 + gpu_id, 0);
-    std::string url = "/chi_gpu_priv_" + sid;
-    auto backend = std::make_unique<hipc::GpuMalloc>();
-    if (!backend->shm_init(bid, hshm::Unit<size_t>::Megabytes(512), url, gpu_id)) {
-      HLOG(kError, "Failed to init GPU private backend for GPU {}", gpu_id);
-      return false;
-    }
-    gpu_priv_backends_.push_back(std::move(backend));
-  }
-
-  // --- 8. Internal subtask queue backend (device memory, GpuMalloc) ---
+  // --- 7. Internal subtask queue backend (device memory, GpuMalloc) ---
   // Separate queue for orchestrator subtasks to prevent deadlock with
   // client tasks on the gpu2gpu queue.
   {
@@ -898,8 +883,6 @@ void IpcManager::BuildOrchestratorInfo(u32 gpu_id, u32 queue_depth) {
   gpu_orchestrator_info_.gpu2cpu_queue = gpu2cpu_queues_[gpu_id].ptr_;
   gpu_orchestrator_info_.gpu2cpu_backend =
       static_cast<hipc::MemoryBackend &>(*gpu2cpu_copy_backends_[gpu_id]);
-  gpu_orchestrator_info_.gpu_priv_backend =
-      static_cast<hipc::MemoryBackend &>(*gpu_priv_backends_[gpu_id]);
   gpu_orchestrator_info_.gpu_queue_depth = queue_depth;
 }
 

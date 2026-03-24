@@ -175,6 +175,11 @@ struct RunContext {
   bool is_gpu2gpu_;
   bool is_copy_path_;
 
+  // ==== Cross-warp range ====
+
+  u32 range_off_;     /**< Start of this warp's sub-range within [0, parallelism) */
+  u32 range_width_;   /**< Width of this warp's sub-range (typically <=32) */
+
   // ==== Constructors ====
 
   __host__ __device__ RunContext()
@@ -192,7 +197,9 @@ struct RunContext {
         method_id_(0),
         parallelism_(1),
         is_gpu2gpu_(false),
-        is_copy_path_(false) {
+        is_copy_path_(false),
+        range_off_(0),
+        range_width_(0) {
     for (u32 i = 0; i < kWarpSize; ++i) {
       coro_handles_[i] = nullptr;
       task_coros_[i] = nullptr;
@@ -215,12 +222,17 @@ struct RunContext {
         method_id_(0),
         parallelism_(1),
         is_gpu2gpu_(false),
-        is_copy_path_(false) {
+        is_copy_path_(false),
+        range_off_(0),
+        range_width_(0) {
     for (u32 i = 0; i < kWarpSize; ++i) {
       coro_handles_[i] = nullptr;
       task_coros_[i] = nullptr;
     }
   }
+
+  /** Get the warp offset index for this context's range */
+  __host__ __device__ u32 GetTaskWarpOffset() const { return range_off_ / kWarpSize; }
 
   /** Allocate memory via CHI_PRIV_ALLOC (PrivateBuddyAllocator) */
   __device__ void *Alloc(size_t size) {

@@ -196,7 +196,6 @@ __global__ void gpu_bench_alloc_kernel(
  * No serialization — purely measures allocation/deallocation cost of the
  * two objects that SendToGpu's copy path must create.
  *
- * Requires gpu_priv_backend for LocalSaveTaskArchive (CHI_PRIV_ALLOC).
  */
 __global__ void gpu_bench_alloc_serde_kernel(
     chi::IpcManagerGpu gpu_info,
@@ -333,7 +332,6 @@ __global__ void gpu_bench_alloc_serde_kernel(
  *   3. LocalLoadTaskArchive >> task2 — deserialize into new task
  *   4. DelTask — free both
  *
- * Requires gpu_priv_backend for serialization scratch (CHI_PRIV_ALLOC).
  */
 __global__ void gpu_bench_serde_kernel(
     chi::IpcManagerGpu gpu_info,
@@ -1035,20 +1033,9 @@ extern "C" int run_gpu_bench_latency(
                                  gpu_backend.data_capacity_);
 
   // Allocate GPU heap backend (GpuMalloc, device memory): 4 MB per block.
-  // Used by BuddyAllocator (CHI_PRIV_ALLOC_T) for serialization scratch buffers.
-  constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
-  size_t heap_backend_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
-
-  hipc::MemoryBackendId heap_backend_id(101, 0);
-  hipc::GpuMalloc gpu_priv_backend;
-  if (!gpu_priv_backend.shm_init(heap_backend_id, heap_backend_size, "", 0)) {
-    return -1;
-  }
-
   // Build IpcManagerGpuInfo from runtime's full GPU info, then override backends
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_priv_backend;
 
   int *d_done;
   cudaMallocHost(&d_done, sizeof(int));
@@ -1136,18 +1123,8 @@ extern "C" int run_gpu_bench_coroutine(
   CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
-  size_t heap_backend_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
-
-  hipc::MemoryBackendId heap_backend_id(103, 0);
-  hipc::GpuMalloc gpu_priv_backend;
-  if (!gpu_priv_backend.shm_init(heap_backend_id, heap_backend_size, "", 0)) {
-    return -1;
-  }
-
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_priv_backend;
 
   int *d_done;
   cudaMallocHost(&d_done, sizeof(int));
@@ -1286,18 +1263,8 @@ extern "C" int run_gpu_bench_serde(
   // Heap backend for serialization scratch (CHI_PRIV_ALLOC / CHI_PRIV_ALLOC).
   // Arena allocations are bump-only (frees are no-ops), so the heap must
   // hold all baseline + full-serde allocations across all threads.
-  constexpr size_t kPerBlockHeapBytes = 32 * 1024 * 1024;
-  size_t heap_backend_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
-
-  hipc::MemoryBackendId heap_backend_id(106, 0);
-  hipc::GpuMalloc gpu_priv_backend;
-  if (!gpu_priv_backend.shm_init(heap_backend_id, heap_backend_size, "", 0)) {
-    return -1;
-  }
-
   chi::IpcManagerGpu gpu_info{};
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_priv_backend;
 
   // The serde kernel has many local variables and deep call stacks
   // (serialization, allocator, vector operations).  32KB stack is needed.
@@ -1370,19 +1337,8 @@ extern "C" int run_gpu_bench_alloc_serde(
     return -1;
   }
 
-  // Heap backend for NewObj<LocalSaveTaskArchive> (BuddyAllocator)
-  constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
-  size_t heap_backend_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
-
-  hipc::MemoryBackendId heap_backend_id(108, 0);
-  hipc::GpuMalloc gpu_priv_backend;
-  if (!gpu_priv_backend.shm_init(heap_backend_id, heap_backend_size, "", 0)) {
-    return -1;
-  }
-
   chi::IpcManagerGpu gpu_info{};
   gpu_info.backend = gpu_backend;
-  gpu_info.gpu_priv_backend = gpu_priv_backend;
 
   cudaDeviceSetLimit(cudaLimitStackSize, 32768);
   cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 4 * 1024 * 1024);
@@ -1846,7 +1802,6 @@ extern "C" int run_gpu_bench_putblob(
   // --- 6. Build GPU info and launch data placement kernel ---
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
-  gpu_info.gpu_priv_backend = heap_backend;
 
   chi::u32 total_warps = (client_blocks * client_threads) / 32;
   if (total_warps == 0) total_warps = 1;
