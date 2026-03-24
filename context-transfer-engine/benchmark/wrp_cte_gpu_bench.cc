@@ -125,29 +125,10 @@ __global__ void gpu_putblob_kernel(
     bool to_cpu,
     int *d_done,
     volatile int *d_progress) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("[putblob] PRE-INIT: sizeof(IpcManager)=%llu backend.data_=%p priv.data_=%p\n",
-           (unsigned long long)sizeof(chi::IpcManager),
-           (void*)gpu_info.backend.data_,
-           (void*)gpu_info.gpu_priv_backend.data_);
-  }
-  __syncthreads();
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("[putblob] POST-INIT: gpu_alloc_=%p priv_init=%d\n",
-           (void*)CHI_IPC->gpu_alloc_,
-           (int)CHI_IPC->gpu_priv_alloc_init_);
-  }
-  __syncthreads();
 
   chi::u32 warp_id = chi::IpcManager::GetWarpId();
   chi::u32 lane_id = chi::IpcManager::GetLaneId();
-
-  if (lane_id == 0 && warp_id == 0) {
-    printf("[putblob] warp=%u about to write d_progress=%p, total_warps=%u\n",
-           warp_id, (void*)d_progress, total_warps);
-  }
-  __syncwarp();
 
   // Write progress to pinned memory (visible to host immediately)
   if (lane_id == 0 && warp_id < total_warps) {
@@ -1869,12 +1850,10 @@ int main(int argc, char **argv) {
       HLOG(kError, "Failed to create BDEV pool: {}", create_future->GetReturnCode());
       return 1;
     }
-    std::this_thread::sleep_for(200ms);
-
-    // Send UpdateTask to propagate device pointers to GPU container
-    auto update_future = bdev_client.AsyncUpdate(chi::PoolQuery::LocalGpuBcast());
-    update_future.Wait();
-    std::this_thread::sleep_for(200ms);
+    // PostGpuContainerCreate() already sends an UpdateTask with correct
+    // device pointers after the GPU container is registered.  An explicit
+    // AsyncUpdate() here would overwrite those pointers with zeros.
+    std::this_thread::sleep_for(400ms);
 
     HIPRINT("BDEV Pool ID: {}.{}", bdev_pool_id.major_, bdev_pool_id.minor_);
 
