@@ -83,7 +83,7 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
   // Shared pointer-per-warp: lane 0 sets its warp's pointer to a heap-allocated
   // GpuRunContext[32] array. All lanes read it after __syncwarp().
   constexpr u32 kMaxWarpsPerBlock = 32;  // 1024 threads / 32
-  __shared__ gpu::GpuRunContext *s_active_ptrs[kMaxWarpsPerBlock];
+  __shared__ gpu::RunContext *s_active_ptrs[kMaxWarpsPerBlock];
   u32 warp_in_block = threadIdx.x / 32;
   if (threadIdx.x == 0) {
     memset(s_active_ptrs, 0, sizeof(s_active_ptrs));

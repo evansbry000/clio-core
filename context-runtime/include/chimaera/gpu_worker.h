@@ -55,46 +55,7 @@
 namespace chi {
 namespace gpu {
 
-/**
- * Coroutine frame allocator using CHI_PRIV_ALLOC (PrivateBuddyAllocator).
- * alloc_ctx is hipc::PrivateBuddyAllocator* (cached per-warp pointer).
- * Stores FullPtr offset in FrameHeader::opaque_ for deallocation.
- */
-__device__ inline void *HeapCoroAlloc(size_t size, void *alloc_ctx) {
-  auto *alloc = static_cast<hipc::PrivateBuddyAllocator *>(alloc_ctx);
-  auto fp = alloc->template AllocateObjs<char>(size);
-  if (fp.IsNull()) return nullptr;
-  return fp.ptr_;
-}
-
-__device__ inline void HeapCoroFree(void *ptr, void *alloc_ctx) {
-  auto *alloc = static_cast<hipc::PrivateBuddyAllocator *>(alloc_ctx);
-  hipc::FullPtr<char> fp(static_cast<char *>(ptr));
-  fp.shm_.off_ = static_cast<size_t>(
-      static_cast<char *>(ptr) - alloc->GetBackendData());
-  fp.shm_.alloc_id_ = alloc->GetId();
-  alloc->Free(fp);
-}
-
-static constexpr u32 kWarpSize = 32;
-
-/**
- * Per-lane active task context, heap-allocated as array of 32.
- * The __shared__ pointer points to this array so all lanes can access it.
- */
-struct GpuRunContext {
-  // -- Shared across all 32 lanes (set by lane 0) --
-  Container *container;
-  u32 method_id;
-  hipc::FullPtr<Task> task_ptr;
-  FutureShm *fshm;
-  bool is_gpu2gpu;
-  bool is_copy_path;
-
-  // -- Per-lane state --
-  RunContext rctx;             /**< Per-lane RunContext (lane_id_ differs) */
-  TaskResume coro;             /**< Per-lane coroutine handle */
-};
+// kWarpSize defined in gpu_coroutine.h
 
 /**
  * GPU-side warp-level worker.
@@ -121,23 +82,21 @@ class Worker {
   WorkOrchestratorControl *dbg_ctrl_; /**< Debug control struct (pinned, CPU-readable) */
 
   /**
-   * Pointer to __shared__ memory holding the active task context array.
-   * Lane 0 sets *active_tasks_ptr_ to a heap-allocated GpuRunContext[32].
+   * Pointer to __shared__ memory holding the active RunContext.
+   * Lane 0 sets *active_ctx_ptr_ to a heap-allocated RunContext.
    * All lanes read it after __syncwarp().
    */
-  GpuRunContext **active_tasks_ptr_;
+  RunContext **active_ctx_ptr_;
 
   static constexpr u32 kMaxSuspended = 128;
 
   /** State for a suspended warp-task */
   struct SuspendedTask {
-    GpuRunContext *contexts;       /**< Heap array of GpuRunContexts */
-    u32 num_contexts;              /**< 1 or 32 */
+    RunContext *ctx;                /**< Heap-allocated RunContext */
     bool occupied;
   };
   SuspendedTask suspended_[kMaxSuspended];
   u32 num_suspended_;
-  u32 active_num_contexts_;        /**< Number of contexts in active task (1 or 32) */
 
   /**
    * Initialize the worker with queue and pool manager pointers.
@@ -150,7 +109,7 @@ class Worker {
                           PoolManager *pool_mgr,
                           char *queue_backend_base,
                           WorkOrchestratorControl *dbg_ctrl,
-                          GpuRunContext **active_tasks_ptr) {
+                          RunContext **active_ctx_ptr) {
     worker_id_ = worker_id;
     lane_id_ = lane_id;
     cpu2gpu_queue_ = cpu2gpu_queue;
@@ -159,26 +118,17 @@ class Worker {
     pool_mgr_ = pool_mgr;
     queue_backend_base_ = queue_backend_base;
     dbg_ctrl_ = dbg_ctrl;
-    active_tasks_ptr_ = active_tasks_ptr;
+    active_ctx_ptr_ = active_ctx_ptr;
     is_running_ = true;
     num_suspended_ = 0;
-    active_num_contexts_ = 0;
     for (u32 i = 0; i < kMaxSuspended; ++i) {
       suspended_[i].occupied = false;
-      suspended_[i].contexts = nullptr;
-      suspended_[i].num_contexts = 0;
+      suspended_[i].ctx = nullptr;
     }
 #if HSHM_IS_GPU_COMPILER
     u32 warp_id = IpcManager::GetWarpId();
     u32 warp_lane = IpcManager::GetLaneId();
     rctx_ = RunContext(blockIdx.x, threadIdx.x, warp_id, warp_lane);
-    // Wire coroutine frame allocation to CHI_PRIV_ALLOC (cached BuddyAllocator)
-    auto *priv_alloc = CHI_PRIV_ALLOC;
-    if (priv_alloc) {
-      rctx_.alloc_fn_ = HeapCoroAlloc;
-      rctx_.free_fn_ = HeapCoroFree;
-      rctx_.alloc_ctx_ = priv_alloc;
-    }
 #else
     rctx_ = RunContext(0, 0, 0, 0);
 #endif
@@ -256,9 +206,9 @@ class Worker {
    * Process one iteration of the warp-level poll loop.
    *
    * Phase 1 (lane 0): Check suspended tasks, pop new tasks from queues,
-   *   deserialize, allocate GpuRunContext[32], set __shared__ pointer.
-   * Phase 2 (all lanes): Execute active task — all 32 threads call
-   *   container->Run() with their per-lane RunContext.
+   *   deserialize, allocate single GpuRunContext, set __shared__ pointer.
+   * Phase 2 (all lanes or lane 0): Execute active task — lane 0 creates
+   *   the coroutine, all participating lanes resume it via SIMT.
    * Phase 3 (lane 0): Check completion, serialize output or suspend.
    *
    * @param lane_id Warp lane of the calling thread (0-31)
@@ -271,7 +221,7 @@ class Worker {
     // ================================================================
     if (lane_id == 0) {
       DbgPoll();
-      *active_tasks_ptr_ = nullptr;
+      *active_ctx_ptr_ = nullptr;
 
       // Check suspended tasks for completion
       if (num_suspended_ > 0) {
@@ -279,7 +229,7 @@ class Worker {
       }
 
       // Pop new task if no resumed task and we have capacity
-      if (*active_tasks_ptr_ == nullptr && num_suspended_ < kMaxSuspended) {
+      if (*active_ctx_ptr_ == nullptr && num_suspended_ < kMaxSuspended) {
         did_work |= TryPopNewTask();
       }
     }
@@ -289,44 +239,72 @@ class Worker {
 #endif
 
     // ================================================================
-    // Phase 2: Participating lanes execute the active task
+    // Phase 2: Execute the active task (all participating lanes)
     // ================================================================
-    GpuRunContext *contexts = *active_tasks_ptr_;
-    u32 num_ctx = active_num_contexts_;
-    if (contexts != nullptr && lane_id == 0) {
-      GPU_WORKER_DPRINTF("[W%u] Phase2: method %u, num_ctx %u\n",
-                         worker_id_, contexts[0].method_id, num_ctx);
-    }
-    if (contexts != nullptr && lane_id < num_ctx) {
-      GpuRunContext &my_ctx = contexts[lane_id];
+    RunContext *ctx = *active_ctx_ptr_;
+    if (ctx != nullptr) {
+      if (lane_id == 0) {
+        GPU_WORKER_DPRINTF("[W%u] Phase2: method %u, parallelism %u\n",
+                           worker_id_, ctx->method_id_, ctx->parallelism_);
+      }
+      bool participate = (ctx->parallelism_ > 1) || (lane_id == 0);
 
-      if (!my_ctx.coro) {
-        // First execution: create coroutine
-        my_ctx.coro = my_ctx.container->Run(
-            my_ctx.method_id, my_ctx.task_ptr, my_ctx.rctx);
-        if (!my_ctx.coro.get_handle()) {
-          printf("[W%u] CORO ALLOC FAILED: method=%u pool=%u.%u\n",
-                 worker_id_, my_ctx.method_id,
-                 my_ctx.task_ptr.ptr_->pool_id_.major_,
-                 my_ctx.task_ptr.ptr_->pool_id_.minor_);
-        } else {
-          my_ctx.coro.get_handle().promise().set_run_context(&my_ctx.rctx);
-          my_ctx.coro.resume();
+      if (participate) {
+        // Determine if coroutines need creation (broadcast from lane 0)
+        bool needs_create = (ctx->task_coros_[0] == nullptr);
+#if HSHM_IS_GPU_COMPILER
+        if (ctx->parallelism_ > 1) {
+          int nc = __shfl_sync(0xFFFFFFFF, (int)needs_create, 0);
+          needs_create = (nc != 0);
         }
-      } else {
-        // Resuming from suspension
-        if (!my_ctx.coro.done()) {
-          my_ctx.rctx.is_yielded_ = false;
-          // Chain-resume: resume the innermost yielded coroutine
-          if (my_ctx.rctx.coro_handle_ &&
-              !my_ctx.rctx.coro_handle_.done()) {
-            my_ctx.rctx.coro_handle_.resume();
+#endif
+        // Each participating lane creates its own coroutine.
+        // operator new bulk-allocates 32 frames internally via __shfl_sync.
+        if (needs_create) {
+          auto *container = static_cast<Container *>(ctx->container_);
+          TaskResume tmp = container->Run(ctx->method_id_, ctx->task_ptr_, *ctx);
+          if (!tmp.get_handle()) {
+            if (lane_id == 0) {
+              printf("[W%u] CORO ALLOC FAILED: method=%u\n",
+                     worker_id_, ctx->method_id_);
+            }
           } else {
-            my_ctx.coro.resume();
+            tmp.get_handle().promise().set_run_context(ctx);
+            ctx->task_coros_[lane_id] = tmp.release();
           }
         }
+#if HSHM_IS_GPU_COMPILER
+        if (ctx->parallelism_ > 1) __syncwarp();
+#endif
+        // Each lane resumes its own coroutine
+        if (ctx->task_coros_[lane_id] && !ctx->task_coros_[lane_id].done()) {
+          if (lane_id == 0) {
+            ctx->is_yielded_ = false;
+          }
+#if HSHM_IS_GPU_COMPILER
+          if (ctx->parallelism_ > 1) __syncwarp();
+#endif
+          auto &coro_h = ctx->coro_handles_[lane_id];
+          if (coro_h && !coro_h.done()) {
+            coro_h.resume();
+          } else {
+            ctx->task_coros_[lane_id].resume();
+          }
+        }
+        did_work = true;
       }
-      did_work = true;
+
+      // ================================================================
+      // Phase 2.5: Destroy completed coroutine frames (all lanes)
+      // ================================================================
+      // All participating lanes must call destroy() together so that
+      // operator delete's __syncwarp + lane-0-free works correctly.
+      if (participate && ctx->task_coros_[lane_id] &&
+          ctx->task_coros_[lane_id].done()) {
+        ctx->task_coros_[lane_id].destroy();
+        ctx->task_coros_[lane_id] = nullptr;
+        ctx->coro_handles_[lane_id] = nullptr;
+      }
     }
 
 #if HSHM_IS_GPU_COMPILER
@@ -336,41 +314,36 @@ class Worker {
     // ================================================================
     // Phase 3: Lane 0 handles completion / suspension
     // ================================================================
-    if (lane_id == 0 && contexts != nullptr) {
-      // Check lane 0's coroutine as representative (SIMT: all lanes
-      // follow the same control flow for well-structured tasks)
-      bool task_done = contexts[0].coro.done();
+    if (lane_id == 0 && ctx != nullptr) {
+      // After Phase 2.5, task_coros_[0] == nullptr means the task completed
+      bool task_done = (ctx->task_coros_[0] == nullptr);
 
       if (task_done) {
-        // Task complete: serialize output and free contexts
         DbgState(5);
         DbgTaskCompleted();
-        GPU_WORKER_DPRINTF("[W%u] Task DONE: pool %u.%u method %u\n",
-                           worker_id_, contexts[0].task_ptr.ptr_->pool_id_.major_,
-                           contexts[0].task_ptr.ptr_->pool_id_.minor_,
-                           contexts[0].method_id);
-        if (contexts[0].is_copy_path) {
-          SerializeAndComplete(contexts[0].fshm, contexts[0].container,
-                               contexts[0].method_id, contexts[0].task_ptr,
-                               contexts[0].is_gpu2gpu);
+        GPU_WORKER_DPRINTF("[W%u] Task DONE: method %u\n",
+                           worker_id_, ctx->method_id_);
+        if (ctx->is_copy_path_) {
+          auto *container = static_cast<Container *>(ctx->container_);
+          auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
+          SerializeAndComplete(fshm, container,
+                               ctx->method_id_, ctx->task_ptr_,
+                               ctx->is_gpu2gpu_);
         } else {
-          CompleteAndResumeParent(contexts[0].fshm, contexts[0].is_gpu2gpu);
+          auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
+          CompleteAndResumeParent(fshm, ctx->is_gpu2gpu_);
         }
-        FreeContexts(contexts, num_ctx);
-        *active_tasks_ptr_ = nullptr;
+        FreeContext(ctx);
+        *active_ctx_ptr_ = nullptr;
       } else {
-        // Task suspended (co_await): save to suspended list
         DbgState(3);
         u32 slot = FindFreeSlot();
-        GPU_WORKER_DPRINTF("[W%u] Task SUSPEND: pool %u.%u method %u -> slot %u (nsus=%u)\n",
-                           worker_id_, contexts[0].task_ptr.ptr_->pool_id_.major_,
-                           contexts[0].task_ptr.ptr_->pool_id_.minor_,
-                           contexts[0].method_id, slot, num_suspended_ + 1);
-        suspended_[slot].contexts = contexts;
-        suspended_[slot].num_contexts = num_ctx;
+        GPU_WORKER_DPRINTF("[W%u] Task SUSPEND: method %u -> slot %u (nsus=%u)\n",
+                           worker_id_, ctx->method_id_, slot, num_suspended_ + 1);
+        suspended_[slot].ctx = ctx;
         suspended_[slot].occupied = true;
         ++num_suspended_;
-        *active_tasks_ptr_ = nullptr;
+        *active_ctx_ptr_ = nullptr;
       }
     }
 
@@ -401,47 +374,58 @@ class Worker {
   // ================================================================
 
   /**
-   * Allocate and initialize GpuRunContext array from the heap.
-   * @param num_contexts 1 for lane-0-only, 32 for full warp parallelism
+   * Allocate and initialize a RunContext for a new task.
+   * Stores FullPtr<Task> components and dispatch info.
    */
-  HSHM_GPU_FUN GpuRunContext *AllocContexts(
+  HSHM_GPU_FUN RunContext *AllocContext(
       Container *container, u32 method_id,
       hipc::FullPtr<Task> task_ptr, FutureShm *fshm,
-      bool is_gpu2gpu, bool is_copy_path, u32 num_contexts) {
+      bool is_gpu2gpu, bool is_copy_path, u32 parallelism) {
     auto *ipc = CHI_IPC;
-    auto alloc_result = ipc->gpu_alloc_->AllocateObjs<GpuRunContext>(num_contexts);
-    GpuRunContext *ctxs = alloc_result.ptr_;
-    if (!ctxs) return nullptr;
+    auto alloc_result = ipc->gpu_alloc_->AllocateObjs<RunContext>(1);
+    RunContext *ctx = alloc_result.ptr_;
+    if (!ctx) return nullptr;
 
-    memset(ctxs, 0, num_contexts * sizeof(GpuRunContext));
-    for (u32 i = 0; i < num_contexts; ++i) {
-      ctxs[i].container = container;
-      ctxs[i].method_id = method_id;
-      ctxs[i].task_ptr = task_ptr;
-      ctxs[i].fshm = fshm;
-      ctxs[i].is_gpu2gpu = is_gpu2gpu;
-      ctxs[i].is_copy_path = is_copy_path;
-      ctxs[i].rctx = rctx_;
-      ctxs[i].rctx.lane_id_ = i;
+    // Copy template fields (identity)
+    *ctx = rctx_;
+    // Set task dispatch fields
+    ctx->container_ = container;
+    ctx->method_id_ = method_id;
+    ctx->parallelism_ = parallelism;
+    ctx->task_ptr_ = task_ptr;
+    ctx->task_fshm_ = fshm;
+    ctx->is_gpu2gpu_ = is_gpu2gpu;
+    ctx->is_copy_path_ = is_copy_path;
+    // Coroutine state starts clean
+    ctx->is_yielded_ = false;
+    ctx->awaited_fshm_ = nullptr;
+    ctx->awaited_task_ = nullptr;
+    for (u32 i = 0; i < kWarpSize; ++i) {
+      ctx->task_coros_[i] = nullptr;
+      ctx->coro_handles_[i] = nullptr;
     }
-    active_num_contexts_ = num_contexts;
-    return ctxs;
+    return ctx;
   }
 
   /**
-   * Destroy all coroutines in the context array and free it.
+   * Free coroutine frames (if any) and the RunContext.
+   *
+   * For the active-task path, Phase 2.5 already destroyed frames via
+   * operator delete (__syncwarp + lane-0 bulk free).  task_coros_[0]
+   * will be nullptr, so FreeFramesDirect() is a no-op.
+   *
+   * For the suspended-task path (lane 0 only), frames may still exist.
+   * FreeFramesDirect() frees the bulk block directly without needing
+   * all 32 lanes for __syncwarp.
    */
-  HSHM_GPU_FUN void FreeContexts(GpuRunContext *ctxs, u32 num_contexts) {
-    for (u32 i = 0; i < num_contexts; ++i) {
-      if (ctxs[i].coro) {
-        ctxs[i].coro.destroy();
-      }
-    }
+  HSHM_GPU_FUN void FreeContext(RunContext *ctx) {
+    ctx->FreeFramesDirect();
     auto *ipc = CHI_IPC;
-    hipc::FullPtr<GpuRunContext> ptr(
-        reinterpret_cast<hipc::Allocator *>(ipc->gpu_alloc_), ctxs);
+    hipc::FullPtr<RunContext> ptr(
+        reinterpret_cast<hipc::Allocator *>(ipc->gpu_alloc_), ctx);
     ipc->gpu_alloc_->Free(ptr);
   }
+
 
   // ================================================================
   // Suspended task management
@@ -463,49 +447,46 @@ class Worker {
     for (u32 i = 0; i < kMaxSuspended; ++i) {
       if (!suspended_[i].occupied) continue;
 
-      GpuRunContext *ctxs = suspended_[i].contexts;
-      u32 nc = suspended_[i].num_contexts;
-      // Use lane 0's context as representative
-      GpuRunContext &ctx0 = ctxs[0];
+      RunContext *ctx = suspended_[i].ctx;
 
       // Check if the awaited sub-task is complete
-      if (ctx0.rctx.awaited_fshm_) {
-        auto *awaited = reinterpret_cast<FutureShm *>(ctx0.rctx.awaited_fshm_);
+      if (ctx->awaited_fshm_) {
+        auto *awaited = reinterpret_cast<FutureShm *>(ctx->awaited_fshm_);
         if (!awaited->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
           continue;  // Sub-task not done yet
         }
         GPU_WORKER_DPRINTF("[W%u] Suspended[%u]: sub-task complete, resuming\n",
                            worker_id_, i);
-        // Deserialize sub-task output before resuming
 #if !HSHM_IS_HOST
-        DeserializeAwaitedOutput(ctx0.rctx, awaited);
+        DeserializeAwaitedOutput(*ctx, awaited);
 #endif
-        ctx0.rctx.awaited_fshm_ = nullptr;
-        ctx0.rctx.awaited_task_ = nullptr;
+        ctx->awaited_fshm_ = nullptr;
+        ctx->awaited_task_ = nullptr;
       }
 
       // Check if the top-level coroutine completed (from previous resume)
-      if (ctx0.coro.done()) {
-        // Completed while suspended — finalize
+      if (ctx->task_coros_[0] && ctx->task_coros_[0].done()) {
         DbgTaskCompleted();
         suspended_[i].occupied = false;
         --num_suspended_;
-        if (ctx0.is_copy_path) {
-          SerializeAndComplete(ctx0.fshm, ctx0.container,
-                               ctx0.method_id, ctx0.task_ptr,
-                               ctx0.is_gpu2gpu);
+        if (ctx->is_copy_path_) {
+          auto *container = static_cast<Container *>(ctx->container_);
+          auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
+          SerializeAndComplete(fshm, container,
+                               ctx->method_id_, ctx->task_ptr_,
+                               ctx->is_gpu2gpu_);
         } else {
-          CompleteAndResumeParent(ctx0.fshm, ctx0.is_gpu2gpu);
+          auto *fshm = static_cast<FutureShm *>(ctx->task_fshm_);
+          CompleteAndResumeParent(fshm, ctx->is_gpu2gpu_);
         }
-        FreeContexts(ctxs, nc);
+        FreeContext(ctx);
         did_work = true;
         continue;
       }
 
       // Ready to resume: set as active and remove from suspended list
       DbgTaskResumed();
-      *active_tasks_ptr_ = ctxs;
-      active_num_contexts_ = nc;
+      *active_ctx_ptr_ = ctx;
       suspended_[i].occupied = false;
       --num_suspended_;
       did_work = true;
@@ -520,7 +501,7 @@ class Worker {
 
   /**
    * Try to pop a new task from gpu2gpu or cpu2gpu queue.
-   * On success, prepares GpuRunContext[32] and sets active_tasks_ptr_.
+   * On success, prepares a RunContext and sets active_ctx_ptr_.
    * Called only by lane 0.
    */
   HSHM_GPU_FUN bool TryPopNewTask() {
@@ -612,7 +593,7 @@ class Worker {
 
   /**
    * Prepare a copy-path task: deserialize input, allocate contexts.
-   * Sets *active_tasks_ptr_ on success.
+   * Sets *active_ctx_ptr_ on success.
    */
   HSHM_GPU_FUN void DbgStep(unsigned int step) {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
@@ -678,12 +659,12 @@ class Worker {
       return true;
     }
 
-    // Allocate GpuRunContexts based on method parallelism
-    GPU_WORKER_DPRINTF("[W%u] PrepCopy: allocating contexts\n", worker_id_);
-    u32 num_ctx = container->GetGpuParallelism(method_id);
-    GpuRunContext *ctxs = AllocContexts(
-        container, method_id, task_ptr, fshm, is_gpu2gpu, true, num_ctx);
-    if (!ctxs) {
+    // Allocate RunContext
+    GPU_WORKER_DPRINTF("[W%u] PrepCopy: allocating context\n", worker_id_);
+    u32 parallelism = container->GetTaskStats(method_id).parallelism;
+    RunContext *rctx = AllocContext(
+        container, method_id, task_ptr, fshm, is_gpu2gpu, true, parallelism);
+    if (!rctx) {
       DbgAllocFailure();
       GPU_WORKER_DPRINTF("[W%u] PrepCopy: context alloc FAILED\n", worker_id_);
       // Must signal completion so the client doesn't spin forever
@@ -696,7 +677,7 @@ class Worker {
     }
 
     GPU_WORKER_DPRINTF("[W%u] PrepCopy: done\n", worker_id_);
-    *active_tasks_ptr_ = ctxs;
+    *active_ctx_ptr_ = rctx;
     return true;
 #else
     return false;
@@ -705,7 +686,7 @@ class Worker {
 
   /**
    * Prepare a direct-path task: no deserialization needed.
-   * Sets *active_tasks_ptr_ on success.
+   * Sets *active_ctx_ptr_ on success.
    */
   HSHM_GPU_FUN bool PrepareTaskDirect(FutureShm *fshm, Container *container,
                                         u32 method_id, bool is_gpu2gpu) {
@@ -720,10 +701,10 @@ class Worker {
     task_ptr.shm_.off_ = fshm->client_task_vaddr_;
     task_ptr.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
 
-    u32 num_ctx = container->GetGpuParallelism(method_id);
-    GpuRunContext *ctxs = AllocContexts(
-        container, method_id, task_ptr, fshm, is_gpu2gpu, false, num_ctx);
-    if (!ctxs) {
+    u32 parallelism = container->GetTaskStats(method_id).parallelism;
+    RunContext *rctx = AllocContext(
+        container, method_id, task_ptr, fshm, is_gpu2gpu, false, parallelism);
+    if (!rctx) {
       DbgAllocFailure();
       if (is_gpu2gpu) {
         fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
@@ -733,7 +714,7 @@ class Worker {
       return true;
     }
 
-    *active_tasks_ptr_ = ctxs;
+    *active_ctx_ptr_ = rctx;
     return true;
   }
 

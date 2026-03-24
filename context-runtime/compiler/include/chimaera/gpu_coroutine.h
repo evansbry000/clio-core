@@ -44,10 +44,10 @@
  *
  * === Memory Allocation ===
  *
- * Coroutine frames and scheduler entries are allocated through the
- * RunContext::alloc_fn_ / free_fn_ function pointers.  By default these
- * use device malloc/free.  The runtime sets them to CHI_IPC wrappers
- * (AllocateBuffer / FreeBuffer) for proper memory management.
+ * Coroutine frames and scheduler entries are allocated through
+ * CHI_PRIV_ALLOC (PrivateBuddyAllocator) directly.  No function
+ * pointers or indirection — the macro resolves to the per-warp
+ * cached allocator on GPU.
  *
  * === Clang Requirement ===
  *
@@ -59,6 +59,7 @@
 // Must be included first -- blocks libstdc++ <coroutine> and provides
 // GPU-compatible std::coroutine_handle with __host__ __device__ annotations.
 #include "chimaera/gpu_coroutine_handle.h"
+#include "chimaera/task.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -83,52 +84,53 @@ using u32 = uint32_t;
 // Forward declarations
 class TaskResume;
 
-// ============================================================================
-// Default device malloc/free allocator
-// ============================================================================
+static constexpr u32 kWarpSize = 32;
 
-__device__ inline void *DefaultGpuAlloc(size_t size, void *) {
-  return malloc(size);
-}
-
-__device__ inline void DefaultGpuFree(void *ptr, void *) {
-  free(ptr);
-}
-
-// Allocator function pointer types
-using GpuAllocFn = void *(*)(size_t size, void *alloc_ctx);
-using GpuFreeFn = void (*)(void *ptr, void *alloc_ctx);
+// Wrapper functions for coroutine frame allocation via CHI_PRIV_ALLOC.
+// Defined in gpu_coroutine_gpu.cc to avoid pulling ipc_manager.h here.
+HSHM_GPU_FUN hipc::FullPtr<char> GpuCoroAlloc(size_t size);
+HSHM_GPU_FUN void GpuCoroFree(hipc::FullPtr<char> fp);
+HSHM_GPU_FUN void GpuCoroFreeRaw(void *ptr);
 
 // ============================================================================
-// Coroutine compiler fence
+// FrameHeader -- prepended to each frame block for bulk vs single tracking
 // ============================================================================
 
 /**
- * Device-side volatile write that prevents Clang-CUDA from miscompiling
- * coroutine state machines across suspension/resume boundaries.
- *
- * Without this, the compiler may generate incorrect code when a coroutine
- * resumes via symmetric transfer and enters a new nested coroutine.
- * A volatile write to device global memory acts as a full compiler + HW
- * memory barrier that forces correct code generation.
- *
- * This works around a Clang-CUDA codegen bug (as of Clang 19/20) where
- * coroutine frames get corrupted during symmetric transfer chains.
+ * Prepended to each coroutine frame (block).  Stores parallelism so that
+ * operator delete knows whether to do a bulk free (lane 0 only after
+ * __syncwarp) or a single free.
  */
+struct alignas(8) FrameHeader {
+  u32 parallelism_;
+  u32 pad_;
+};
+
 // ============================================================================
 // RunContext -- execution context for coroutines (GPU-side)
 // ============================================================================
 
 /**
  * GPU-side execution context for coroutine-based task methods.
- * Coroutine methods receive RunContext& as a parameter; the promise_type
- * captures it so that yield() can access it without TLS.
+ *
+ * Serves as both the coroutine RunContext (captured by promise_type for
+ * yield/await) and the task dispatch context (used by Worker to manage
+ * the task lifecycle).  One RunContext is allocated per active task.
  *
  * Layout is GPU-friendly: no STL, no virtual functions, trivially copyable.
+ * Heavy types (Container*, FullPtr<Task>, FutureShm*) are stored as void*
+ * to avoid pulling in runtime headers from this low-level coroutine header.
  */
 struct RunContext {
-  /** Coroutine handle for the current coroutine */
-  std::coroutine_handle<> coro_handle_;
+  // ==== Per-lane coroutine handles ====
+
+  /** Per-lane innermost active coroutine handle (for chain-resume) */
+  std::coroutine_handle<> coro_handles_[kWarpSize];
+
+  /** Per-lane top-level coroutine handle (Worker manages lifetime) */
+  std::coroutine_handle<> task_coros_[kWarpSize];
+
+  // ==== Coroutine state (shared, set by lane 0) ====
 
   /** Set by YieldAwaiter::await_suspend when the coroutine yields */
   bool is_yielded_;
@@ -139,42 +141,44 @@ struct RunContext {
   /** Countdown decremented by the scheduler each iteration */
   u32 spins_remaining_;
 
-  /** Block and thread identity */
+  // ==== Thread identity ====
+
   u32 block_id_;
   u32 thread_id_;
-
-  /** Warp-level identity */
   u32 warp_id_;    /**< Warp index within the grid */
   u32 lane_id_;    /**< Thread lane within the warp (0-31) */
 
-  /**
-   * Opaque pointer to the FutureShm being awaited (set by Future::await_suspend).
-   * Non-null when suspended on co_await future. The Worker checks
-   * FUTURE_COMPLETE on this FutureShm before resuming the coroutine.
-   * Typed as void* to avoid circular dependency with task.h.
-   */
-  void *awaited_fshm_;
+  // ==== Awaited sub-task (co_await tracking) ====
 
-  /**
-   * Opaque pointer to the Task* being awaited (set by Future::await_suspend).
-   * Used by Worker to deserialize output before resuming the coroutine,
-   * avoiding allocation issues inside resumed coroutine frames.
-   */
+  /** FutureShm* of the sub-task being awaited (void* to avoid task.h dep) */
+  void *awaited_fshm_;
+  /** Task* of the sub-task being awaited (for output deserialization) */
   void *awaited_task_;
 
-  /**
-   * Memory allocator interface.
-   * Default: device malloc/free.
-   * Runtime sets these to CHI_IPC->AllocateBuffer / FreeBuffer wrappers.
-   * The alloc_ctx_ is passed as the second argument (e.g., IpcManager*).
-   */
-  GpuAllocFn alloc_fn_;
-  GpuFreeFn free_fn_;
-  void *alloc_ctx_;
+  // ==== Task dispatch (set by Worker) ====
+
+  /** gpu::Container* that executes this task (void* to avoid circular dep) */
+  void *container_;
+
+  /** FutureShm for signaling task completion */
+  chi::FutureShm *task_fshm_;
+
+  /** Full pointer to the task being executed */
+  hipc::FullPtr<chi::Task> task_ptr_;
+
+  /** Method ID to dispatch */
+  u32 method_id_;
+
+  /** 1 = lane-0-only, 32 = full warp participation */
+  u32 parallelism_;
+
+  bool is_gpu2gpu_;
+  bool is_copy_path_;
+
+  // ==== Constructors ====
 
   __host__ __device__ RunContext()
-      : coro_handle_(nullptr),
-        is_yielded_(false),
+      : is_yielded_(false),
         yield_spin_count_(0),
         spins_remaining_(0),
         block_id_(0),
@@ -183,29 +187,21 @@ struct RunContext {
         lane_id_(0),
         awaited_fshm_(nullptr),
         awaited_task_(nullptr),
-        alloc_fn_(nullptr),
-        free_fn_(nullptr),
-        alloc_ctx_(nullptr) {}
-
-  __host__ __device__ RunContext(u32 block_id, u32 thread_id)
-      : coro_handle_(nullptr),
-        is_yielded_(false),
-        yield_spin_count_(0),
-        spins_remaining_(0),
-        block_id_(block_id),
-        thread_id_(thread_id),
-        warp_id_(0),
-        lane_id_(0),
-        awaited_fshm_(nullptr),
-        awaited_task_(nullptr),
-        alloc_fn_(nullptr),
-        free_fn_(nullptr),
-        alloc_ctx_(nullptr) {}
+        container_(nullptr),
+        task_fshm_(nullptr),
+        method_id_(0),
+        parallelism_(1),
+        is_gpu2gpu_(false),
+        is_copy_path_(false) {
+    for (u32 i = 0; i < kWarpSize; ++i) {
+      coro_handles_[i] = nullptr;
+      task_coros_[i] = nullptr;
+    }
+  }
 
   __host__ __device__ RunContext(u32 block_id, u32 thread_id,
                                 u32 warp_id, u32 lane_id)
-      : coro_handle_(nullptr),
-        is_yielded_(false),
+      : is_yielded_(false),
         yield_spin_count_(0),
         spins_remaining_(0),
         block_id_(block_id),
@@ -214,37 +210,44 @@ struct RunContext {
         lane_id_(lane_id),
         awaited_fshm_(nullptr),
         awaited_task_(nullptr),
-        alloc_fn_(nullptr),
-        free_fn_(nullptr),
-        alloc_ctx_(nullptr) {}
+        container_(nullptr),
+        task_fshm_(nullptr),
+        method_id_(0),
+        parallelism_(1),
+        is_gpu2gpu_(false),
+        is_copy_path_(false) {
+    for (u32 i = 0; i < kWarpSize; ++i) {
+      coro_handles_[i] = nullptr;
+      task_coros_[i] = nullptr;
+    }
+  }
 
-  /** Allocate memory using the configured allocator */
+  /** Allocate memory via CHI_PRIV_ALLOC (PrivateBuddyAllocator) */
   __device__ void *Alloc(size_t size) {
-    if (alloc_fn_) return alloc_fn_(size, alloc_ctx_);
-    return malloc(size);
+    auto fp = GpuCoroAlloc(size);
+    return fp.IsNull() ? nullptr : fp.ptr_;
   }
 
-  /** Free memory using the configured allocator */
+  /** Free memory via CHI_PRIV_ALLOC (PrivateBuddyAllocator) */
   __device__ void Free(void *ptr) {
-    if (free_fn_) { free_fn_(ptr, alloc_ctx_); return; }
-    free(ptr);
+    GpuCoroFreeRaw(ptr);
   }
-};
 
-// ============================================================================
-// FrameHeader -- stored before each coroutine frame for deallocation
-// ============================================================================
-
-/**
- * Prepended to every coroutine frame allocation.  Stores the free function
- * and context so that promise_type::operator delete can deallocate without
- * access to the RunContext (which doesn't exist at delete time).
- */
-struct FrameHeader {
-  GpuFreeFn free_fn_;
-  void *alloc_ctx_;
-  /** Opaque storage for runtime allocator metadata (e.g., hipc::FullPtr). */
-  alignas(8) char opaque_[24];
+  /**
+   * Free the top-level coroutine frame block directly (lane-0-only path).
+   * Used when only lane 0 is active (e.g., suspended task cleanup) and
+   * we can't do __syncwarp for the full warp destroy path.
+   */
+  __device__ void FreeFramesDirect() {
+    if (task_coros_[0]) {
+      char *frame = static_cast<char *>(task_coros_[0].address());
+      GpuCoroFreeRaw(frame - sizeof(FrameHeader));
+      for (u32 i = 0; i < kWarpSize; ++i) {
+        task_coros_[i] = nullptr;
+        coro_handles_[i] = nullptr;
+      }
+    }
+  }
 };
 
 // ============================================================================
@@ -267,39 +270,87 @@ class TaskResume {
     __device__ promise_type(RunContext &ctx, Args &&...)
         : run_ctx_(&ctx), caller_handle_(nullptr) {}
 
+    /** Capture RunContext from the second parameter (FullPtr<Task>, RunContext&). */
+    template <typename TaskT, typename... Args>
+    __device__ promise_type(hipc::FullPtr<TaskT>, RunContext &ctx, Args &&...)
+        : run_ctx_(&ctx), caller_handle_(nullptr) {}
+
     __device__ promise_type()
         : run_ctx_(nullptr), caller_handle_(nullptr) {}
 
+    /**
+     * Warp-level bulk allocation helper shared by all operator new overloads.
+     * If parallelism > 1, lane 0 allocates 32 frames in one call and
+     * broadcasts the base via __shfl_sync. Each lane gets its own frame.
+     */
+    __device__ static void *AllocFrame(size_t size, u32 parallelism) noexcept {
+      size_t total = sizeof(FrameHeader) + size;
+#if HSHM_IS_GPU_COMPILER
+      u32 lane = threadIdx.x % kWarpSize;
+      if (parallelism > 1) {
+        unsigned long long base_ull = 0;
+        if (lane == 0) {
+          auto fp = GpuCoroAlloc(kWarpSize * total);
+          base_ull = fp.IsNull() ? 0
+              : reinterpret_cast<unsigned long long>(fp.ptr_);
+        }
+        base_ull = __shfl_sync(0xFFFFFFFF, base_ull, 0);
+        if (base_ull == 0) return nullptr;
+        char *my_frame = reinterpret_cast<char *>(base_ull) + lane * total;
+        auto *hdr = reinterpret_cast<FrameHeader *>(my_frame);
+        hdr->parallelism_ = parallelism;
+        return my_frame + sizeof(FrameHeader);
+      }
+#else
+      (void)parallelism;
+#endif
+      auto fp = GpuCoroAlloc(total);
+      if (fp.IsNull()) return nullptr;
+      auto *hdr = reinterpret_cast<FrameHeader *>(fp.ptr_);
+      hdr->parallelism_ = 1;
+      return fp.ptr_ + sizeof(FrameHeader);
+    }
+
+    /** operator new: RunContext is first parameter. */
     template <typename... Args>
     __device__ static void *operator new(size_t size, RunContext &ctx,
                                          Args &&...) noexcept {
-      size_t total = sizeof(FrameHeader) + size;
-      char *raw = static_cast<char *>(ctx.Alloc(total));
-      if (!raw) return nullptr;
-      auto *header = reinterpret_cast<FrameHeader *>(raw);
-      header->free_fn_ = ctx.free_fn_;
-      header->alloc_ctx_ = ctx.alloc_ctx_;
-      return raw + sizeof(FrameHeader);
+      return AllocFrame(size, ctx.parallelism_);
     }
 
+    /** operator new: FullPtr<T> first, RunContext second (bdev pattern). */
+    template <typename TaskT, typename... Args>
+    __device__ static void *operator new(size_t size, hipc::FullPtr<TaskT>,
+                                         RunContext &ctx,
+                                         Args &&...) noexcept {
+      return AllocFrame(size, ctx.parallelism_);
+    }
+
+    /** operator new: fallback, no RunContext (single frame only). */
     __device__ static void *operator new(size_t size) noexcept {
-      size_t total = sizeof(FrameHeader) + size;
-      char *raw = static_cast<char *>(malloc(total));
-      if (!raw) return nullptr;
-      auto *header = reinterpret_cast<FrameHeader *>(raw);
-      header->free_fn_ = nullptr;
-      header->alloc_ctx_ = nullptr;
-      return raw + sizeof(FrameHeader);
+      return AllocFrame(size, 1);
     }
 
+    /**
+     * Warp-level bulk free: if the frame was bulk-allocated, __syncwarp
+     * ensures all lanes finish cleanup, then lane 0 frees the entire block.
+     * For single allocations, free directly.
+     */
     __device__ static void operator delete(void *ptr, size_t) {
+      if (!ptr) return;
       char *raw = static_cast<char *>(ptr) - sizeof(FrameHeader);
-      auto *header = reinterpret_cast<FrameHeader *>(raw);
-      if (header->free_fn_) {
-        header->free_fn_(raw, header->alloc_ctx_);
-      } else {
-        free(raw);
+      auto *hdr = reinterpret_cast<FrameHeader *>(raw);
+#if HSHM_IS_GPU_COMPILER
+      if (hdr->parallelism_ > 1) {
+        __syncwarp();
+        u32 lane = threadIdx.x % kWarpSize;
+        if (lane == 0) {
+          GpuCoroFreeRaw(raw);
+        }
+        return;
       }
+#endif
+      GpuCoroFreeRaw(raw);
     }
 
     __device__ TaskResume get_return_object() {
@@ -473,12 +524,17 @@ class TaskResume {
       handle_.destroy();
       handle_ = nullptr;
 
-      // Update coro_handle_ to this coroutine (the caller) so that
+      // Update per-lane coro_handle to this coroutine (the caller) so that
       // subsequent yields or co_awaits are tracked correctly.
       if (ctx && caller_handle_) {
-        ctx->coro_handle_ = caller_handle_;
-        GPU_CORO_DPRINTF("[TaskResume::await_resume] updated coro_handle_ to caller %p\n",
-               caller_handle_.address());
+#if HSHM_IS_GPU_COMPILER
+        u32 lane = threadIdx.x % kWarpSize;
+#else
+        u32 lane = 0;
+#endif
+        ctx->coro_handles_[lane] = caller_handle_;
+        GPU_CORO_DPRINTF("[TaskResume::await_resume] updated coro_handles_[%u] to caller %p\n",
+               lane, caller_handle_.address());
       }
     }
   }
@@ -503,10 +559,17 @@ class YieldAwaiter {
         handle.address());
     auto *ctx = typed.promise().get_run_context();
     if (!ctx) return;
-    ctx->coro_handle_ = handle;
-    ctx->is_yielded_ = true;
-    ctx->yield_spin_count_ = spin_count_;
-    ctx->spins_remaining_ = spin_count_;
+#if HSHM_IS_GPU_COMPILER
+    u32 lane = threadIdx.x % kWarpSize;
+#else
+    u32 lane = 0;
+#endif
+    ctx->coro_handles_[lane] = handle;
+    if (lane == 0) {
+      ctx->is_yielded_ = true;
+      ctx->yield_spin_count_ = spin_count_;
+      ctx->spins_remaining_ = spin_count_;
+    }
   }
 
   __device__ void await_resume() noexcept {}
