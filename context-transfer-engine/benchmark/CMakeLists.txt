@@ -141,6 +141,20 @@ if(WRP_CORE_ENABLE_CUDA)
       --client-blocks 1 --client-threads 256)
   set_tests_properties(cte_gpu_bench_alloc_test PROPERTIES
     TIMEOUT 60 LABELS "msan_skip")
+
+  # Set CHI_REPO_PATH so the ChiMod plugin loader finds module .so files
+  set_tests_properties(
+    cte_gpu_bench_putblob_gpu
+    cte_gpu_bench_putblob_gpu_multiblock
+    cte_gpu_bench_direct
+    cte_gpu_bench_cudamemcpy
+    cte_gpu_bench_putblob_gpu_stress
+    cte_gpu_bench_putblob_gpu_64warp
+    cte_gpu_bench_putblob_gpu_64warp_stress
+    cte_gpu_bench_alloc_test
+    PROPERTIES
+      ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
 else()
   message(STATUS "Skipping wrp_cte_gpu_bench - CUDA not enabled")
 endif()
