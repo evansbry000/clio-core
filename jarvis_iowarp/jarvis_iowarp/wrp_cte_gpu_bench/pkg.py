@@ -53,7 +53,9 @@ class WrpCteGpuBench(Application):
                 'type': str,
                 'choices': [
                     'putblob', 'putblob_gpu', 'putget_gpu',
-                    'direct', 'cudamemcpy', 'alloc_test'
+                    'direct', 'cudamemcpy', 'managed',
+                    'alloc_test', 'bdev_alloc_free', 'bdev_read_write',
+                    'bam_read', 'bam_write',
                 ],
                 'default': 'putblob_gpu',
             },
@@ -187,14 +189,47 @@ class WrpCteGpuBench(Application):
 
     def _get_stat(self, stat_dict):
         output = self.exec.stdout['localhost']
+        pid = self.pkg_id
+
+        # Single-bandwidth tests (putblob_gpu, putget_gpu, direct, etc.)
         bandwidth = re.search(r'Bandwidth:\s+([0-9.]+)\s+GB/s', output)
         if bandwidth:
-            stat_dict[f'{self.pkg_id}.bandwidth_gbps'] = float(bandwidth.group(1))
-        stat_dict[f'{self.pkg_id}.test_case'] = self.config['test_case']
-        stat_dict[f'{self.pkg_id}.warps'] = (
+            stat_dict[f'{pid}.bandwidth_gbps'] = float(bandwidth.group(1))
+
+        # Dual-bandwidth tests (bdev_read_write)
+        write_bw = re.search(r'Write:\s+[0-9.]+\s+ms\s+\(([0-9.]+)\s+GB/s\)', output)
+        read_bw = re.search(r'Read:\s+[0-9.]+\s+ms\s+\(([0-9.]+)\s+GB/s\)', output)
+        if write_bw:
+            stat_dict[f'{pid}.write_gbps'] = float(write_bw.group(1))
+        if read_bw:
+            stat_dict[f'{pid}.read_gbps'] = float(read_bw.group(1))
+        # For dual-bandwidth tests, use average as the unified bandwidth
+        if write_bw and read_bw and not bandwidth:
+            stat_dict[f'{pid}.bandwidth_gbps'] = (
+                float(write_bw.group(1)) + float(read_bw.group(1))) / 2.0
+
+        # Elapsed time
+        elapsed = re.search(r'(?:Total )?[Ee]lapsed:\s+([0-9.]+)\s+ms', output)
+        if elapsed:
+            stat_dict[f'{pid}.elapsed_ms'] = float(elapsed.group(1))
+
+        stat_dict[f'{pid}.test_case'] = self.config['test_case']
+        stat_dict[f'{pid}.warps'] = (
             self.config['client_blocks'] * self.config['client_threads']) // 32
-        stat_dict[f'{self.pkg_id}.io_size'] = self.config['io_size']
-        stat_dict[f'{self.pkg_id}.bdev_type'] = self.config['bdev_type']
+        stat_dict[f'{pid}.io_size'] = self.config['io_size']
+        stat_dict[f'{pid}.bdev_type'] = self.config['bdev_type']
+
+    @staticmethod
+    def _io_sort_key(s):
+        """Sort I/O size strings numerically (4k < 64k < 1m < 16m)."""
+        s = str(s).strip().lower()
+        m = re.match(r'([0-9.]+)\s*([kmgt]?)', s)
+        if not m:
+            return 0
+        val = float(m.group(1))
+        suffix = m.group(2)
+        mult = {'': 1, 'k': 1024, 'm': 1024**2, 'g': 1024**3, 't': 1024**4}
+        return val * mult.get(suffix, 1)
 
     def _plot(self, results_csv, output_dir):
         try:
@@ -208,13 +243,13 @@ class WrpCteGpuBench(Application):
 
         df = pd.read_csv(results_csv)
 
-        # Find bandwidth column for this package
-        bw_col = None
-        warps_col = None
-        io_col = None
+        # Find columns for this package
+        bw_col = tc_col = warps_col = io_col = None
         for col in df.columns:
             if col.endswith('.bandwidth_gbps'):
                 bw_col = col
+            elif col.endswith('.test_case'):
+                tc_col = col
             elif col.endswith('.warps'):
                 warps_col = col
             elif col.endswith('.io_size'):
@@ -223,23 +258,60 @@ class WrpCteGpuBench(Application):
         if not bw_col:
             return
 
-        # Bandwidth vs warps
+        # --- Plot 1: Bandwidth vs I/O size, grouped by test case ---
+        if tc_col and io_col and len(df[io_col].dropna().unique()) > 1:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            pivot = df.groupby([io_col, tc_col])[bw_col].mean().unstack()
+            # Sort I/O sizes numerically
+            pivot = pivot.reindex(
+                sorted(pivot.index, key=self._io_sort_key))
+            pivot.plot(kind='bar', ax=ax)
+            ax.set_xlabel('I/O Size per Warp')
+            ax.set_ylabel('Bandwidth (GB/s)')
+            ax.set_title('CTE vs BaM: Bandwidth by I/O Size')
+            ax.legend(title='Test Case', bbox_to_anchor=(1.02, 1),
+                      loc='upper left', fontsize=8)
+            fig.tight_layout()
+            fig.savefig(os.path.join(output_dir,
+                                     'bandwidth_vs_iosize_by_testcase.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Plot 2: Bandwidth vs warp count, grouped by test case ---
+        if tc_col and warps_col and len(df[warps_col].dropna().unique()) > 1:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            pivot = df.groupby([warps_col, tc_col])[bw_col].mean().unstack()
+            pivot.plot(kind='bar', ax=ax)
+            ax.set_xlabel('Warp Count')
+            ax.set_ylabel('Bandwidth (GB/s)')
+            ax.set_title('CTE vs BaM: Bandwidth Scaling by Warps')
+            ax.legend(title='Test Case', bbox_to_anchor=(1.02, 1),
+                      loc='upper left', fontsize=8)
+            fig.tight_layout()
+            fig.savefig(os.path.join(output_dir,
+                                     'bandwidth_vs_warps_by_testcase.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Plot 3: Simple bandwidth vs warps (single test case runs) ---
         if warps_col and len(df[warps_col].dropna().unique()) > 1:
             fig, ax = plt.subplots(figsize=(8, 5))
             grouped = df.groupby(warps_col)[bw_col].mean()
             grouped.plot(kind='bar', ax=ax)
             ax.set_xlabel('Warps')
             ax.set_ylabel('Bandwidth (GB/s)')
-            ax.set_title('CTE GPU Bandwidth vs Warp Count')
+            ax.set_title('GPU Bandwidth vs Warp Count')
             fig.tight_layout()
             fig.savefig(os.path.join(output_dir, 'bandwidth_vs_warps.png'),
                         dpi=150)
             plt.close(fig)
 
-        # Bandwidth vs IO size
+        # --- Plot 4: Simple bandwidth vs IO size (single test case runs) ---
         if io_col and len(df[io_col].dropna().unique()) > 1:
             fig, ax = plt.subplots(figsize=(8, 5))
             grouped = df.groupby(io_col)[bw_col].mean()
+            grouped = grouped.reindex(
+                sorted(grouped.index, key=self._io_sort_key))
             grouped.plot(kind='bar', ax=ax)
             ax.set_xlabel('I/O Size per Warp')
             ax.set_ylabel('Bandwidth (GB/s)')

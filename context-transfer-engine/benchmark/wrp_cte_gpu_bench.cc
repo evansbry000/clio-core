@@ -2292,6 +2292,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   std::this_thread::sleep_for(500ms);
+  fprintf(stderr, "DEBUG: past sleep_for(500ms)\n"); fflush(stderr);
 
   const char *tc_name = (cfg.test_case == TestCase::kPutBlob) ? "putblob" :
                          (cfg.test_case == TestCase::kPutBlobGpu) ? "putblob_gpu" :
@@ -2361,13 +2362,75 @@ int main(int argc, char **argv) {
     wcfg.param_seq_len = cfg.param_seq_len;
     wcfg.param_decode_tokens = cfg.param_decode_tokens;
 
-    // For CTE mode, pass pool and tag IDs (set up by the CTE init above)
-    // These are used by workloads that call AsyncPutBlob/AsyncGetBlob
-    // For non-CTE modes, these are unused.
+    // For CTE mode: use the same pool setup as putblob_gpu
+    if (cfg.workload_mode == "cte") {
+      fprintf(stderr, "CTE SETUP: Creating pool...\n"); fflush(stderr);
+      chi::PoolId gpu_pool_id(wrp_cte::core::kCtePoolId.major_ + 1,
+                               wrp_cte::core::kCtePoolId.minor_);
+      wrp_cte::core::Client cte_client(gpu_pool_id);
+      wrp_cte::core::CreateParams params;
+      auto create_task = cte_client.AsyncCreate(
+          chi::PoolQuery::Dynamic(),
+          "cte_workload_pool", gpu_pool_id, params);
+      fprintf(stderr, "CTE SETUP: Waiting for pool create...\n"); fflush(stderr);
+      create_task.Wait();
+      fprintf(stderr, "CTE SETUP: Pool created rc=%d\n", create_task->GetReturnCode()); fflush(stderr);
+      if (create_task->GetReturnCode() != 0) {
+        HLOG(kError, "Failed to create CTE workload pool: {}",
+             create_task->GetReturnCode());
+        return 1;
+      }
+      std::this_thread::sleep_for(200ms);
 
-    // Pause GPU orchestrator for non-CTE workload modes
-    // (otherwise the persistent GPU kernel conflicts with workload kernels)
-    if (cfg.workload_mode != "cte") {
+      chi::PoolId bdev_pool_id(800, 0);
+      chimaera::bdev::BdevType bdev_enum = chimaera::bdev::BdevType::kPinned;
+      if (cfg.bdev_type == "hbm") bdev_enum = chimaera::bdev::BdevType::kHbm;
+      else if (cfg.bdev_type == "ram") bdev_enum = chimaera::bdev::BdevType::kRam;
+      std::string target_name = cfg.bdev_type + "::workload_target";
+
+      auto reg_task = cte_client.AsyncRegisterTarget(
+          target_name, bdev_enum, 256ULL * 1024 * 1024,
+          chi::PoolQuery::Local(), bdev_pool_id);
+      reg_task.Wait();
+      if (reg_task->GetReturnCode() != 0) {
+        HLOG(kError, "Failed to register target: {}", reg_task->GetReturnCode());
+        return 1;
+      }
+      std::this_thread::sleep_for(200ms);
+
+      auto gpu_reg_task = cte_client.AsyncRegisterTarget(
+          target_name, bdev_enum, 256ULL * 1024 * 1024,
+          chi::PoolQuery::Local(), bdev_pool_id,
+          chi::PoolQuery::LocalGpuBcast());
+      gpu_reg_task.Wait();
+      if (gpu_reg_task->GetReturnCode() != 0) {
+        HLOG(kError, "Failed to register GPU target: {}",
+             gpu_reg_task->GetReturnCode());
+        return 1;
+      }
+      std::this_thread::sleep_for(200ms);
+
+      auto tag_task = cte_client.AsyncGetOrCreateTag(
+          "workload_tag", wrp_cte::core::TagId::GetNull(),
+          chi::PoolQuery::Local());
+      tag_task.Wait();
+      if (tag_task->GetReturnCode() != 0) {
+        HLOG(kError, "Failed to create tag: {}", tag_task->GetReturnCode());
+        return 1;
+      }
+      wcfg.tag_id = tag_task->tag_id_;
+
+      auto gpu_tag_task = cte_client.AsyncGetOrCreateTag(
+          "workload_tag", wcfg.tag_id, chi::PoolQuery::LocalGpuBcast());
+      gpu_tag_task.Wait();
+      std::this_thread::sleep_for(200ms);
+
+      wcfg.cte_pool_id = cte_client.pool_id_;
+      HIPRINT("CTE pool: {}.{}, tag: {}.{}",
+              wcfg.cte_pool_id.major_, wcfg.cte_pool_id.minor_,
+              wcfg.tag_id.major_, wcfg.tag_id.minor_);
+    } else {
+      // Pause GPU orchestrator for non-CTE workload modes
       CHI_IPC->PauseGpuOrchestrator();
     }
 

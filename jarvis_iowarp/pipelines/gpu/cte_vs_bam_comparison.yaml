@@ -1,0 +1,65 @@
+# CTE vs BaM GPU Benchmark Comparison
+#
+# Compares IOWarp CTE GPU data path against BaM page cache across:
+#   1. I/O sizes:   4k .. 16m
+#   2. Warp counts:  1 .. 32 warps (via client_blocks)
+#   3. Test cases:
+#      - bdev_read_write  : Raw bdev read/write (CTE storage layer only)
+#      - putblob_gpu      : Full CTE PutBlob path (GPU runtime)
+#      - putget_gpu       : Full CTE PutBlob + GetBlob roundtrip
+#      - bam_read         : BaM page cache read (DRAM -> HBM)
+#      - bam_write        : BaM page cache write (HBM -> DRAM)
+#      - cudamemcpy       : cudaMemcpyAsync baseline (PCIe ceiling)
+#      - direct           : GPU kernel direct pinned memory access
+#
+# Requirements:
+#   - wrp_cte_gpu_bench in PATH
+#   - CUDA-capable GPU
+#   - BaM tests require -DWRP_CORE_ENABLE_BAM=ON
+#
+# Usage:
+#   jarvis pipeline test gpu/cte_vs_bam_comparison.yaml
+
+config:
+  name: cte_vs_bam
+  pkgs:
+    - pkg_type: jarvis_iowarp.wrp_cte_gpu_bench
+      pkg_name: bench
+      test_case: "bdev_read_write"
+      client_blocks: 1
+      client_threads: 32
+      rt_blocks: 1
+      rt_threads: 32
+      io_size: "128k"
+      iterations: 16
+      bdev_type: "hbm"
+      timeout: 120
+
+vars:
+  # --- Test cases to compare ---
+  # CTE paths vs BaM vs baselines
+  bench.test_case:
+    - "bdev_read_write"
+    - "putblob_gpu"
+    - "putget_gpu"
+    - "bam_read"
+    - "bam_write"
+    - "cudamemcpy"
+    - "direct"
+
+  # --- I/O sizes (with iterations scaled to ~256MB total per warp) ---
+  bench.io_size:    ["4k",   "64k",  "256k", "1m",  "4m",  "16m"]
+  bench.iterations: [65536,  4096,   1024,   256,   64,    16   ]
+
+  # --- Warp scaling (client_blocks x 32 threads = warps) ---
+  # rt_blocks matches client_blocks for CTE paths
+  bench.client_blocks: [1, 4, 8, 16, 32]
+  bench.rt_blocks:     [1, 4, 8, 16, 32]
+
+loop:
+  - [bench.test_case]
+  - [bench.io_size, bench.iterations]
+  - [bench.client_blocks, bench.rt_blocks]
+
+repeat: 3
+output: "${HOME}/cte_vs_bam_results"
