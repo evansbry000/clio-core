@@ -92,5 +92,9 @@ template class Array<uint32_t>;
 template class Array<int64_t>;
 template class Array<uint64_t>;
 template class Array<uint8_t>;
+template class Array<char>;
+template class Array<int8_t>;
+template class Array<int16_t>;
+template class Array<uint16_t>;
 
 }  // namespace bam
