@@ -75,7 +75,8 @@ __global__ void gpu_tiered_putget_kernel(
 
       hipc::ShmPtr<> shm;
       shm.alloc_id_ = data_alloc_id;
-      shm.off_.exchange(write_ptr.shm_.off_.load() + b * kBlobChunkSize);
+      size_t base_off = write_ptr.shm_.off_.load();
+      shm.off_.exchange(base_off + b * kBlobChunkSize);
 
       auto future = cte_client.AsyncPutBlob(
           tag_id, name,
@@ -128,7 +129,8 @@ __global__ void gpu_tiered_putget_kernel(
 
       hipc::ShmPtr<> shm;
       shm.alloc_id_ = data_alloc_id;
-      shm.off_.exchange(read_ptr.shm_.off_.load() + b * kBlobChunkSize);
+      size_t base_off = read_ptr.shm_.off_.load();
+      shm.off_.exchange(base_off + b * kBlobChunkSize);
 
       auto future = cte_client.AsyncGetBlob(
           tag_id, name,
@@ -158,22 +160,62 @@ __global__ void gpu_tiered_putget_kernel(
   // ========== STEP 5: Verify 100MB read data matches write pattern ==========
   __threadfence_system();
 
-  int mismatches = 0;
-  for (chi::u64 i = lane_id; i < total_read; i += 32) {
-    char expected = static_cast<char>(i % 251);
-    if (read_ptr.ptr_[i] != expected) {
-      mismatches++;
-    }
-  }
-
-  // Warp-reduce mismatches
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    mismatches += __shfl_down_sync(0xFFFFFFFF, mismatches, offset);
-  }
-
+  // Debug: print first 16 bytes of read buffer
   if (lane_id == 0) {
+    printf("GPU DEBUG: read_ptr first 16 bytes:");
+    for (int i = 0; i < 16; i++) printf(" %02x", (unsigned char)read_ptr.ptr_[i]);
+    printf("\n");
+    printf("GPU DEBUG: expected first 16 bytes:");
+    for (int i = 0; i < 16; i++) printf(" %02x", (unsigned char)(i % 251));
+    printf("\n");
+    printf("GPU DEBUG: write_ptr first 16 bytes:");
+    for (int i = 0; i < 16; i++) printf(" %02x", (unsigned char)write_ptr.ptr_[i]);
+    printf("\n");
+    // Check at 1MB offset
+    chi::u64 off1m = 1024*1024;
+    printf("GPU DEBUG: read_ptr @1MB: %02x %02x %02x %02x (expect %02x %02x %02x %02x)\n",
+        (unsigned char)read_ptr.ptr_[off1m], (unsigned char)read_ptr.ptr_[off1m+1],
+        (unsigned char)read_ptr.ptr_[off1m+2], (unsigned char)read_ptr.ptr_[off1m+3],
+        (unsigned char)(off1m%251), (unsigned char)((off1m+1)%251),
+        (unsigned char)((off1m+2)%251), (unsigned char)((off1m+3)%251));
+    // Check at 49MB (near end of first blob)
+    chi::u64 off49m = 49*1024*1024;
+    printf("GPU DEBUG: read_ptr @49MB: %02x %02x %02x %02x (expect %02x %02x %02x %02x)\n",
+        (unsigned char)read_ptr.ptr_[off49m], (unsigned char)read_ptr.ptr_[off49m+1],
+        (unsigned char)read_ptr.ptr_[off49m+2], (unsigned char)read_ptr.ptr_[off49m+3],
+        (unsigned char)(off49m%251), (unsigned char)((off49m+1)%251),
+        (unsigned char)((off49m+2)%251), (unsigned char)((off49m+3)%251));
+    // Check at 51MB (in second blob)
+    chi::u64 off51m = 51*1024*1024;
+    printf("GPU DEBUG: read_ptr @51MB: %02x %02x %02x %02x (expect %02x %02x %02x %02x)\n",
+        (unsigned char)read_ptr.ptr_[off51m], (unsigned char)read_ptr.ptr_[off51m+1],
+        (unsigned char)read_ptr.ptr_[off51m+2], (unsigned char)read_ptr.ptr_[off51m+3],
+        (unsigned char)(off51m%251), (unsigned char)((off51m+1)%251),
+        (unsigned char)((off51m+2)%251), (unsigned char)((off51m+3)%251));
+  }
+  __syncwarp();
+
+  // Single-thread verification for correctness (lane 0 only)
+  if (lane_id == 0) {
+    int mismatches = 0;
+    int first_mismatch_idx = -1;
+    for (chi::u64 i = 0; i < total_read; i++) {
+      char expected = static_cast<char>(i % 251);
+      if (read_ptr.ptr_[i] != expected) {
+        mismatches++;
+        if (first_mismatch_idx < 0) {
+          first_mismatch_idx = (int)i;
+          printf("GPU DEBUG: first mismatch at %d: got %02x, expected %02x\n",
+                 first_mismatch_idx, (unsigned char)read_ptr.ptr_[i],
+                 (unsigned char)expected);
+        }
+      }
+    }
+
     if (mismatches > 0) {
-      *d_result = -500 - mismatches;  // Verification failed
+      printf("GPU DEBUG: %d total mismatches out of %llu bytes\n",
+             mismatches, (unsigned long long)total_read);
+      *d_result = -500 - mismatches;
     } else {
       *d_result = 1;  // SUCCESS
     }
