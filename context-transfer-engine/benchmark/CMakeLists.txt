@@ -69,8 +69,13 @@ if(WRP_CORE_ENABLE_CUDA)
 
   add_cuda_executable(wrp_cte_gpu_bench TRUE
       wrp_cte_gpu_bench.cc
+      gpu/workload_pagerank.cc
+      gpu/workload_gnn.cc
+      gpu/workload_gray_scott.cc
+      gpu/workload_llm_kvcache.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+          ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
           ${CMAKE_SOURCE_DIR}/context-runtime/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
