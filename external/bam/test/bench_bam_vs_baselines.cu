@@ -115,6 +115,113 @@ __global__ void bam_write_kernel(
   __threadfence_system();
 }
 
+/* ================================================================== */
+/* Warp-cooperative BaM kernels (inspired by GIDS)                     */
+/* ================================================================== */
+
+/**
+ * Warp-cooperative BaM read.
+ * Each warp processes pages together: lane 0 acquires, all 32 lanes copy.
+ * After the page is in HBM, all lanes read their elements from it.
+ */
+__global__ void bam_warp_read_kernel(
+    bam::ArrayDevice<char> arr,
+    uint64_t total_bytes,
+    int *d_done) {
+  uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  uint32_t lane_id = threadIdx.x & 31;
+  uint32_t num_warps = (blockDim.x * gridDim.x) / 32;
+
+  uint32_t page_size = arr.cache_state.page_size;
+  uint64_t num_pages = (total_bytes + page_size - 1) / page_size;
+
+  volatile uint32_t sink = 0;
+
+  // Each warp processes pages in a strided pattern
+  for (uint64_t p = warp_id; p < num_pages; p += num_warps) {
+    uint64_t page_off = p * page_size;
+
+    // Warp-cooperative acquire: lane 0 does atomic, broadcasts result
+    bool needs_load;
+    uint8_t *page = bam::warp_page_cache_acquire(
+        arr.cache_state, page_off, &needs_load);
+
+    if (needs_load) {
+      // All 32 lanes cooperate on page copy (GIDS-style)
+      bam::warp_host_read_page(page, arr.host_base, page_off, page_size);
+      bam::warp_page_cache_finish_load(arr.cache_state, page_off);
+    }
+
+    // All lanes read their slice of the page
+    uint32_t words_per_page = page_size / 4;
+    for (uint32_t w = lane_id; w < words_per_page; w += 32) {
+      sink += reinterpret_cast<const uint32_t *>(page)[w];
+    }
+    __syncwarp();
+  }
+
+  if (sink == 0xDEADBEEF && lane_id == 0) atomicAdd(d_done, -1);
+  if (lane_id == 0) {
+    atomicAdd(d_done, 1);
+    __threadfence_system();
+  }
+}
+
+/**
+ * Warp-cooperative BaM write.
+ * Each warp loads a page cooperatively, all lanes write their slice,
+ * then all lanes cooperatively flush the page back to DRAM.
+ * No per-element write-through — one flush per page.
+ */
+__global__ void bam_warp_write_kernel(
+    bam::ArrayDevice<char> arr,
+    uint64_t total_bytes,
+    int *d_done) {
+  uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  uint32_t lane_id = threadIdx.x & 31;
+  uint32_t num_warps = (blockDim.x * gridDim.x) / 32;
+
+  uint32_t page_size = arr.cache_state.page_size;
+  uint64_t num_pages = (total_bytes + page_size - 1) / page_size;
+
+  for (uint64_t p = warp_id; p < num_pages; p += num_warps) {
+    uint64_t page_off = p * page_size;
+
+    bool needs_load;
+    uint8_t *page = bam::warp_page_cache_acquire(
+        arr.cache_state, page_off, &needs_load);
+
+    if (needs_load) {
+      bam::warp_host_read_page(page, arr.host_base, page_off, page_size);
+      bam::warp_page_cache_finish_load(arr.cache_state, page_off);
+    }
+
+    // All lanes write their slice of the page
+    uint32_t words_per_page = page_size / 4;
+    for (uint32_t w = lane_id; w < words_per_page; w += 32) {
+      reinterpret_cast<uint32_t *>(page)[w] = warp_id + w;
+    }
+    __syncwarp();
+
+    // One cooperative flush per page (not per element)
+    bam::warp_host_write_page(page, const_cast<uint8_t *>(arr.host_base),
+                              page_off, page_size);
+    if (lane_id == 0) {
+      bam::page_cache_mark_dirty(arr.cache_state, page_off);
+    }
+    __syncwarp();
+  }
+
+  if (lane_id == 0) {
+    atomicAdd(d_done, 1);
+    __threadfence_system();
+  }
+}
+
+/* ================================================================== */
+/* Baseline kernels                                                    */
+/* ================================================================== */
+
 /** Direct read: GPU reads from pinned host DRAM, no cache. */
 __global__ void direct_read_kernel(
     const char *h_src,
@@ -263,6 +370,108 @@ static BenchResult run_bam_write(uint32_t blocks, uint32_t threads,
     auto t0 = std::chrono::high_resolution_clock::now();
     bam_write_kernel<<<blocks, threads>>>(arr.device(), total_bytes, d_done);
     poll_done(d_done, total_threads);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto t1 = std::chrono::high_resolution_clock::now();
+    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+  }
+
+  r.elapsed_ms = total_ms / iters;
+  r.bandwidth_gbps = (total_bytes / 1e9) / (r.elapsed_ms / 1e3);
+  CUDA_CHECK(cudaFreeHost(d_done));
+  return r;
+}
+
+static BenchResult run_bam_warp_read(uint32_t blocks, uint32_t threads,
+                                      uint64_t total_bytes, uint64_t page_size,
+                                      uint32_t cache_pages, int iters) {
+  BenchResult r = {"bam_warp_read", 0, 0, total_bytes};
+
+  bam::PageCacheConfig config;
+  config.page_size = page_size;
+  config.num_pages = cache_pages;
+  config.num_queues = 0;
+  config.queue_depth = 0;
+  config.backend = bam::BackendType::kHostMemory;
+  config.nvme_dev = nullptr;
+
+  bam::PageCache cache(config);
+  bam::Array<char> arr(total_bytes, cache);
+
+  std::vector<char> host_data(total_bytes);
+  for (uint64_t i = 0; i < total_bytes; i++) host_data[i] = (char)(i & 0xFF);
+  arr.load_from_host(host_data.data(), total_bytes);
+
+  int *d_done;
+  CUDA_CHECK(cudaMallocHost(&d_done, sizeof(int)));
+  uint32_t num_warps = (blocks * threads) / 32;
+
+  // Warmup
+  *d_done = 0;
+  bam_warp_read_kernel<<<blocks, threads>>>(arr.device(), total_bytes, d_done);
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  double total_ms = 0;
+  for (int it = 0; it < iters; it++) {
+    CUDA_CHECK(cudaMemset(cache.device_state().page_tags, 0xFF,
+                           cache_pages * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(cache.device_state().page_states, 0,
+                           cache_pages * sizeof(uint32_t)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    *d_done = 0;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    bam_warp_read_kernel<<<blocks, threads>>>(arr.device(), total_bytes, d_done);
+    poll_done(d_done, num_warps);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto t1 = std::chrono::high_resolution_clock::now();
+    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+  }
+
+  r.elapsed_ms = total_ms / iters;
+  r.bandwidth_gbps = (total_bytes / 1e9) / (r.elapsed_ms / 1e3);
+  CUDA_CHECK(cudaFreeHost(d_done));
+  return r;
+}
+
+static BenchResult run_bam_warp_write(uint32_t blocks, uint32_t threads,
+                                       uint64_t total_bytes, uint64_t page_size,
+                                       uint32_t cache_pages, int iters) {
+  BenchResult r = {"bam_warp_write", 0, 0, total_bytes};
+
+  bam::PageCacheConfig config;
+  config.page_size = page_size;
+  config.num_pages = cache_pages;
+  config.num_queues = 0;
+  config.queue_depth = 0;
+  config.backend = bam::BackendType::kHostMemory;
+  config.nvme_dev = nullptr;
+
+  bam::PageCache cache(config);
+  bam::Array<char> arr(total_bytes, cache);
+  std::vector<char> zeros(total_bytes, 0);
+  arr.load_from_host(zeros.data(), total_bytes);
+
+  int *d_done;
+  CUDA_CHECK(cudaMallocHost(&d_done, sizeof(int)));
+  uint32_t num_warps = (blocks * threads) / 32;
+
+  // Warmup
+  *d_done = 0;
+  bam_warp_write_kernel<<<blocks, threads>>>(arr.device(), total_bytes, d_done);
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  double total_ms = 0;
+  for (int it = 0; it < iters; it++) {
+    CUDA_CHECK(cudaMemset(cache.device_state().page_tags, 0xFF,
+                           cache_pages * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(cache.device_state().page_states, 0,
+                           cache_pages * sizeof(uint32_t)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    *d_done = 0;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    bam_warp_write_kernel<<<blocks, threads>>>(arr.device(), total_bytes, d_done);
+    poll_done(d_done, num_warps);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::high_resolution_clock::now();
     total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -493,6 +702,14 @@ int main(int argc, char **argv) {
   printf("Running bam_write...\n");
   results.push_back(run_bam_write(blocks, threads_per_block, total_bytes,
                                    page_size, cache_pages, iterations));
+
+  printf("Running bam_warp_read...\n");
+  results.push_back(run_bam_warp_read(blocks, threads_per_block, total_bytes,
+                                       page_size, cache_pages, iterations));
+
+  printf("Running bam_warp_write...\n");
+  results.push_back(run_bam_warp_write(blocks, threads_per_block, total_bytes,
+                                        page_size, cache_pages, iterations));
 
   printf("Running direct_read...\n");
   results.push_back(run_direct_read(blocks, threads_per_block, total_bytes,
