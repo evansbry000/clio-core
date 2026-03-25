@@ -865,6 +865,18 @@ if(WRP_CORE_ENABLE_ELF)
     set(ELF_LIB_DIRS ${libelf_LIBRARY_DIRS})
 endif()
 
+# BaM (Big Accelerator Memory) — GPU page cache with optional NVMe
+option(WRP_CORE_ENABLE_BAM "Enable BaM GPU page cache module" OFF)
+option(WRP_CORE_ENABLE_BAM_NVME "Enable NVMe backend for BaM (requires gpu-nvme-bridge)" OFF)
+if(WRP_CORE_ENABLE_BAM)
+    message(STATUS "Building BaM GPU page cache module")
+    set(BAM_ENABLE_NVME ${WRP_CORE_ENABLE_BAM_NVME} CACHE BOOL "NVMe for BaM" FORCE)
+    set(BAM_ENABLE_TESTS ${WRP_CORE_ENABLE_TESTS} CACHE BOOL "BaM tests" FORCE)
+    add_subdirectory(external/bam)
+else()
+    message(STATUS "BaM module disabled")
+endif()
+
 add_subdirectory(context-transport-primitives)
 # Set HSHM_ROOT for cross-component access
 set(HSHM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/context-transport-primitives" CACHE PATH "Root directory for context-transport-primitives")
