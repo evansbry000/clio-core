@@ -166,10 +166,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
     char *block_dst = dst_base + block.offset_;
     const char *block_src = src + data_off;
 
-    if (lane >= num_lanes) { data_off += copy_size; continue; }
+    chi::u32 my_lane = threadIdx.x % 32;
+    if (my_lane >= num_lanes) { data_off += copy_size; continue; }
     chi::u64 stripe = copy_size / num_lanes;
-    chi::u64 my_start = lane * stripe;
-    chi::u64 my_end = (lane == num_lanes - 1) ? copy_size : (lane + 1) * stripe;
+    chi::u64 my_start = my_lane * stripe;
+    chi::u64 my_end = (my_lane == num_lanes - 1) ? copy_size : (my_lane + 1) * stripe;
     chi::u64 my_len = my_end - my_start;
 
     const char *my_src = block_src + my_start;
@@ -251,10 +252,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
     const char *block_src = src_base + block.offset_;
     char *block_dst = dst + data_off;
 
-    if (lane >= num_lanes) { data_off += copy_size; continue; }
+    chi::u32 my_lane = threadIdx.x % 32;
+    if (my_lane >= num_lanes) { data_off += copy_size; continue; }
     chi::u64 stripe = copy_size / num_lanes;
-    chi::u64 my_start = lane * stripe;
-    chi::u64 my_end = (lane == num_lanes - 1) ? copy_size : (lane + 1) * stripe;
+    chi::u64 my_start = my_lane * stripe;
+    chi::u64 my_end = (my_lane == num_lanes - 1) ? copy_size : (my_lane + 1) * stripe;
     chi::u64 my_len = my_end - my_start;
 
     const char *my_src = block_src + my_start;
