@@ -440,14 +440,16 @@ int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
 
     if (!ctx.resume_and_poll(cfg.timeout_sec)) {
       HLOG(kError, "synthetic CTE timed out");
+      CHI_IPC->PauseGpuOrchestrator();
       hshm::GpuApi::Synchronize(stream);
       hshm::GpuApi::DestroyStream(stream);
       cudaFreeHost(d_errors);
       ctx.cleanup();
-      CHI_IPC->ResumeGpuOrchestrator();
       return -2;
     }
 
+    // Pause orchestrator before synchronizing client stream
+    CHI_IPC->PauseGpuOrchestrator();
     hshm::GpuApi::Synchronize(stream);
     hshm::GpuApi::DestroyStream(stream);
 
@@ -466,7 +468,6 @@ int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
 
     cudaFreeHost(d_errors);
     ctx.cleanup();
-    CHI_IPC->ResumeGpuOrchestrator();
   }
 
 #ifdef WRP_CORE_ENABLE_BAM

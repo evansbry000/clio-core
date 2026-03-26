@@ -215,6 +215,22 @@ if(WRP_CORE_ENABLE_CUDA)
   set_tests_properties(cte_gpu_synthetic_hbm_validate PROPERTIES
     TIMEOUT 60 LABELS "gpu;msan_skip")
 
+  add_test(NAME cte_gpu_synthetic_cte
+    COMMAND wrp_cte_gpu_bench
+      --test-case synthetic --workload-mode cte
+      --client-blocks 1 --client-threads 32
+      --io-size 4k --iterations 1)
+  set_tests_properties(cte_gpu_synthetic_cte PROPERTIES
+    TIMEOUT 60 LABELS "gpu;msan_skip")
+
+  add_test(NAME cte_gpu_synthetic_cte_validate
+    COMMAND wrp_cte_gpu_bench
+      --test-case synthetic --workload-mode cte
+      --client-blocks 1 --client-threads 32
+      --io-size 4k --iterations 1 --validate)
+  set_tests_properties(cte_gpu_synthetic_cte_validate PROPERTIES
+    TIMEOUT 60 LABELS "gpu;msan_skip")
+
   if(WRP_CORE_ENABLE_BAM AND TARGET bam)
     add_test(NAME cte_gpu_synthetic_bam
       COMMAND wrp_cte_gpu_bench
@@ -240,6 +256,8 @@ if(WRP_CORE_ENABLE_CUDA)
     cte_gpu_synthetic_hbm
     cte_gpu_synthetic_direct
     cte_gpu_synthetic_hbm_validate
+    cte_gpu_synthetic_cte
+    cte_gpu_synthetic_cte_validate
     ${_BAM_TEST_NAMES}
     PROPERTIES
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
