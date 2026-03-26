@@ -10,11 +10,11 @@ pkgs:
     pkg_name: gpu_local
     # test_case: "putblob_gpu"
     test_case: "bdev_read_write"
-    rt_blocks: 1
+    rt_blocks: 32
     rt_threads: 32
-    client_blocks: 1
+    client_blocks: 32
     client_threads: 32
     io_size: "16m"
     iterations: 30
-    bdev_type: "pinned"
+    bdev_type: "hbm"
     timeout: 120
