@@ -294,7 +294,6 @@ class TaskResume {
      */
     __device__ static void *AllocFrame(size_t size, u32 parallelism) noexcept {
       size_t total = sizeof(FrameHeader) + size;
-#if HSHM_IS_GPU_COMPILER
       u32 lane = threadIdx.x % kWarpSize;
       if (parallelism > 1) {
         unsigned long long base_ull = 0;
@@ -311,9 +310,6 @@ class TaskResume {
         hdr->lane_id_ = lane;
         return my_frame + sizeof(FrameHeader);
       }
-#else
-      (void)parallelism;
-#endif
       auto fp = GpuCoroAlloc(total);
       if (fp.IsNull()) return nullptr;
       auto *hdr = reinterpret_cast<FrameHeader *>(fp.ptr_);
