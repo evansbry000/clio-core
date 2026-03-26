@@ -484,13 +484,17 @@ class Worker {
       MarkComplete(fshm, is_gpu2gpu);
       return nullptr;
     }
+    u32 push_count = 0;
     for (u32 w = 1; w < num_warps_needed; ++w) {
       u32 off = w * 32;
       u32 width = 32;
       if (off + width > parallelism) width = parallelism - off;
       PushCrossWarpSubTask(fshm, container, method_id, task_ptr, is_gpu2gpu,
                            is_copy_path, off, width);
+      push_count++;
     }
+    printf("[CrossWarp] pushed %u sub-tasks for %u warps\n",
+           push_count, num_warps_needed);
     return rctx;
   }
 
@@ -541,6 +545,7 @@ class Worker {
     u32 lane = (range_off / 32) % num_lanes;
     auto &qlane = warp_group_queue_->GetLane(lane, 0);
     if (!qlane.Push(future)) {
+      printf("[CrossWarp] PUSH FAILED lane=%u\n", lane);
       ipc->gpu_alloc_->Free(desc_fp);
     }
   }

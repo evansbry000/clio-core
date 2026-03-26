@@ -164,10 +164,9 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   launch_info.gpu2gpu_num_lanes = num_warps;
   launch_info.internal_num_lanes = num_warps;
 
-  // Compute warp group topology
+  // Warp group topology: one lane per warp for single-consumer safety
   launch_info.num_warps = num_warps;
-  u32 W2 = 1;
-  while (W2 * W2 < num_warps) ++W2;
+  u32 W2 = num_warps;
   launch_info.num_warp_groups = W2;
   launch_info.warp_group_num_lanes = W2;
 
