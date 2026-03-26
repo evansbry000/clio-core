@@ -26,6 +26,7 @@
 #include <bam/bam.h>
 #endif
 
+#include "bench_common.h"
 #include <cstdint>
 #include <string>
 
@@ -37,6 +38,12 @@ struct WorkloadConfig {
   uint32_t client_threads = 256;
   uint32_t iterations = 1;
   int timeout_sec = 60;
+
+  // I/O config
+  uint64_t warp_bytes = 4096;
+  IoPattern io_pattern = IoPattern::kSequential;
+  bool validate = false;
+  std::string routing = "local";  // "local" or "to_cpu"
 
   // BaM config
   uint64_t bam_page_size = 65536;
@@ -85,6 +92,9 @@ int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
 
 int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode,
                              WorkloadResult *result);
+
+int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
+                            WorkloadResult *result);
 
 #endif  // HSHM_IS_HOST
 #endif  // BENCH_GPU_WORKLOAD_H

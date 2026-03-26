@@ -35,6 +35,11 @@ enum class BenchMode {
   kHbm,     // Full HBM (ceiling)
 };
 
+enum class IoPattern {
+  kSequential,  // Each warp accesses its contiguous slice
+  kRandom,      // Each warp picks a random warp_bytes-aligned offset per iter
+};
+
 struct BenchResult {
   const char *workload;
   const char *mode;

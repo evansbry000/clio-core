@@ -73,6 +73,7 @@ if(WRP_CORE_ENABLE_CUDA)
       gpu/workload_gnn.cc
       gpu/workload_gray_scott.cc
       gpu/workload_llm_kvcache.cc
+      gpu/workload_synthetic.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
@@ -189,6 +190,43 @@ if(WRP_CORE_ENABLE_CUDA)
     set(_BAM_TEST_NAMES cte_gpu_bench_bam_read cte_gpu_bench_bam_write)
   endif()
 
+  # Synthetic I/O benchmarks
+  add_test(NAME cte_gpu_synthetic_hbm
+    COMMAND wrp_cte_gpu_bench
+      --test-case synthetic --workload-mode hbm
+      --client-blocks 1 --client-threads 32
+      --io-size 4k --iterations 10)
+  set_tests_properties(cte_gpu_synthetic_hbm PROPERTIES
+    TIMEOUT 60 LABELS "gpu;msan_skip")
+
+  add_test(NAME cte_gpu_synthetic_direct
+    COMMAND wrp_cte_gpu_bench
+      --test-case synthetic --workload-mode direct
+      --client-blocks 1 --client-threads 32
+      --io-size 4k --iterations 10)
+  set_tests_properties(cte_gpu_synthetic_direct PROPERTIES
+    TIMEOUT 60 LABELS "gpu;msan_skip")
+
+  add_test(NAME cte_gpu_synthetic_hbm_validate
+    COMMAND wrp_cte_gpu_bench
+      --test-case synthetic --workload-mode hbm
+      --client-blocks 1 --client-threads 32
+      --io-size 4k --iterations 5 --validate)
+  set_tests_properties(cte_gpu_synthetic_hbm_validate PROPERTIES
+    TIMEOUT 60 LABELS "gpu;msan_skip")
+
+  if(WRP_CORE_ENABLE_BAM AND TARGET bam)
+    add_test(NAME cte_gpu_synthetic_bam
+      COMMAND wrp_cte_gpu_bench
+        --test-case synthetic --workload-mode bam
+        --client-blocks 1 --client-threads 32
+        --io-size 4k --iterations 10
+        --bam-page-size 4k --bam-cache-pages 16)
+    set_tests_properties(cte_gpu_synthetic_bam PROPERTIES
+      TIMEOUT 60 LABELS "gpu;msan_skip")
+    list(APPEND _BAM_TEST_NAMES cte_gpu_synthetic_bam)
+  endif()
+
   # Set CHI_REPO_PATH so the ChiMod plugin loader finds module .so files
   set_tests_properties(
     cte_gpu_bench_putblob_gpu
@@ -199,6 +237,9 @@ if(WRP_CORE_ENABLE_CUDA)
     cte_gpu_bench_putblob_gpu_64warp
     cte_gpu_bench_putblob_gpu_64warp_stress
     cte_gpu_bench_alloc_test
+    cte_gpu_synthetic_hbm
+    cte_gpu_synthetic_direct
+    cte_gpu_synthetic_hbm_validate
     ${_BAM_TEST_NAMES}
     PROPERTIES
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"

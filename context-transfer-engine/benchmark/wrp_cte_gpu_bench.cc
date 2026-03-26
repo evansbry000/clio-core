@@ -2096,7 +2096,7 @@ static int run_bdev_read_write(
 //==============================================================================
 
 enum class TestCase { kPutBlob, kPutBlobGpu, kPutGetGpu, kDirect, kCudaMemcpy, kManaged, kAllocTest, kBdevAllocFree, kBdevReadWrite, kBamRead, kBamWrite, kBamWarpRead, kBamWarpWrite,
-  kWorkloadPageRank, kWorkloadGNN, kWorkloadGrayScott, kWorkloadLLMKVCache };
+  kWorkloadPageRank, kWorkloadGNN, kWorkloadGrayScott, kWorkloadLLMKVCache, kWorkloadSynthetic };
 
 struct BenchConfig {
   TestCase test_case = TestCase::kPutBlob;
@@ -2110,7 +2110,11 @@ struct BenchConfig {
   int timeout_sec = 60;              // PollDone timeout in seconds
   chi::u64 bam_page_size = 65536;    // BaM page cache page size
   chi::u32 bam_cache_pages = 256;    // BaM number of cache pages in HBM
-  // Workload mode: hbm, direct, cte
+  // I/O options
+  bool validate = false;
+  std::string io_pattern = "sequential";  // "sequential" or "random"
+  std::string routing = "local";          // "local" or "to_cpu"
+  // Workload mode: hbm, direct, cte, bam
   std::string workload_mode = "hbm";
   // Workload-specific parameters
   chi::u32 param_vertices = 100000;
@@ -2155,8 +2159,8 @@ void PrintUsage(const char *prog) {
   HIPRINT("Options:");
   HIPRINT("  --test-case <case>     putblob, putblob_gpu, putget_gpu, direct, cudamemcpy, managed,");
   HIPRINT("                         bam_read, bam_write, bdev_alloc_free, bdev_read_write,");
-  HIPRINT("                         pagerank, gnn, gray_scott, llm_kvcache");
-  HIPRINT("  --workload-mode <m>    For workloads: hbm, direct, or cte (default: hbm)");
+  HIPRINT("                         pagerank, gnn, gray_scott, llm_kvcache, synthetic");
+  HIPRINT("  --workload-mode <m>    For workloads: hbm, direct, bam, or cte (default: hbm)");
   HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
   HIPRINT("  --rt-threads <N>       GPU runtime threads/block (default: 32)");
   HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
@@ -2167,6 +2171,9 @@ void PrintUsage(const char *prog) {
   HIPRINT("  --bam-page-size <B>    BaM page cache page size (default: 64K)");
   HIPRINT("  --bam-cache-pages <N>  BaM number of HBM cache pages (default: 256)");
   HIPRINT("  --timeout <seconds>    PollDone timeout in seconds (default: 60)");
+  HIPRINT("  --validate             Enable data validation after reads");
+  HIPRINT("  --io-pattern <p>       I/O pattern: sequential or random (default: sequential)");
+  HIPRINT("  --routing <r>          Task routing: local or to_cpu (default: local)");
   HIPRINT("  --help, -h             Show this help");
 }
 
@@ -2197,6 +2204,7 @@ bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
       else if (tc == "gnn") cfg.test_case = TestCase::kWorkloadGNN;
       else if (tc == "gray_scott") cfg.test_case = TestCase::kWorkloadGrayScott;
       else if (tc == "llm_kvcache") cfg.test_case = TestCase::kWorkloadLLMKVCache;
+      else if (tc == "synthetic") cfg.test_case = TestCase::kWorkloadSynthetic;
       else {
         HLOG(kError, "Unknown test case '{}'", tc);
         return false;
@@ -2228,6 +2236,12 @@ bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
       cfg.bam_cache_pages = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--workload-mode" && i + 1 < argc) {
       cfg.workload_mode = argv[++i];
+    } else if (arg == "--validate") {
+      cfg.validate = true;
+    } else if (arg == "--io-pattern" && i + 1 < argc) {
+      cfg.io_pattern = argv[++i];
+    } else if (arg == "--routing" && i + 1 < argc) {
+      cfg.routing = argv[++i];
     } else if (arg == "--vertices" && i + 1 < argc) {
       cfg.param_vertices = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--avg-degree" && i + 1 < argc) {
@@ -2325,6 +2339,7 @@ int main(int argc, char **argv) {
                          (cfg.test_case == TestCase::kWorkloadGNN) ? "gnn" :
                          (cfg.test_case == TestCase::kWorkloadGrayScott) ? "gray_scott" :
                          (cfg.test_case == TestCase::kWorkloadLLMKVCache) ? "llm_kvcache" :
+                         (cfg.test_case == TestCase::kWorkloadSynthetic) ? "synthetic" :
                          "direct";
 
   HIPRINT("\n=== CTE GPU Benchmark ===");
@@ -2352,7 +2367,8 @@ int main(int argc, char **argv) {
   if (cfg.test_case == TestCase::kWorkloadPageRank ||
       cfg.test_case == TestCase::kWorkloadGNN ||
       cfg.test_case == TestCase::kWorkloadGrayScott ||
-      cfg.test_case == TestCase::kWorkloadLLMKVCache) {
+      cfg.test_case == TestCase::kWorkloadLLMKVCache ||
+      cfg.test_case == TestCase::kWorkloadSynthetic) {
     WorkloadConfig wcfg;
     wcfg.rt_blocks = cfg.rt_blocks;
     wcfg.rt_threads = cfg.rt_threads;
@@ -2376,6 +2392,11 @@ int main(int argc, char **argv) {
     wcfg.param_head_dim = cfg.param_head_dim;
     wcfg.param_seq_len = cfg.param_seq_len;
     wcfg.param_decode_tokens = cfg.param_decode_tokens;
+    wcfg.warp_bytes = cfg.warp_bytes;
+    wcfg.validate = cfg.validate;
+    wcfg.routing = cfg.routing;
+    wcfg.io_pattern = (cfg.io_pattern == "random") ? IoPattern::kRandom
+                                                    : IoPattern::kSequential;
 
     // For CTE mode: use the same pool setup as putblob_gpu
     if (cfg.workload_mode == "cte") {
@@ -2466,6 +2487,9 @@ int main(int argc, char **argv) {
     } else if (cfg.test_case == TestCase::kWorkloadLLMKVCache) {
       HIPRINT("Workload:            LLM KV cache offloading");
       rc = run_workload_llm_kvcache(wcfg, wmode, &wresult);
+    } else if (cfg.test_case == TestCase::kWorkloadSynthetic) {
+      HIPRINT("Workload:            Synthetic I/O");
+      rc = run_workload_synthetic(wcfg, wmode, &wresult);
     }
 
     if (rc != 0) {
