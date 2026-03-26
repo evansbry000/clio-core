@@ -1497,61 +1497,65 @@ static int run_cte_gpu_bench_bam_warp_read(
     float *out_elapsed_ms) {
   CHI_IPC->PauseGpuOrchestrator();
 
-  bam::PageCacheConfig config;
-  config.page_size = page_size;
-  config.num_pages = cache_pages;
-  config.num_queues = 0;
-  config.queue_depth = 0;
-  config.backend = bam::BackendType::kHostMemory;
-  config.nvme_dev = nullptr;
+  bool completed;
+  {
+    bam::PageCacheConfig config;
+    config.page_size = page_size;
+    config.num_pages = cache_pages;
+    config.num_queues = 0;
+    config.queue_depth = 0;
+    config.backend = bam::BackendType::kHostMemory;
+    config.nvme_dev = nullptr;
 
-  bam::PageCache cache(config);
-  bam::Array<char> arr(total_bytes, cache);
+    bam::PageCache cache(config);
+    bam::Array<char> arr(total_bytes, cache);
 
-  std::vector<char> host_data(total_bytes);
-  for (chi::u64 i = 0; i < total_bytes; i++) {
-    host_data[i] = static_cast<char>(i & 0xFF);
-  }
-  arr.load_from_host(host_data.data(), total_bytes);
+    std::vector<char> host_data(total_bytes);
+    for (chi::u64 i = 0; i < total_bytes; i++) {
+      host_data[i] = static_cast<char>(i & 0xFF);
+    }
+    arr.load_from_host(host_data.data(), total_bytes);
 
-  chi::u32 num_warps = (client_blocks * client_threads) / 32;
-  if (num_warps == 0) num_warps = 1;
+    chi::u32 num_warps = (client_blocks * client_threads) / 32;
+    if (num_warps == 0) num_warps = 1;
 
-  int *d_done;
-  cudaMallocHost(&d_done, sizeof(int));
-  *d_done = 0;
+    int *d_done;
+    cudaMallocHost(&d_done, sizeof(int));
+    *d_done = 0;
 
-  void *stream = hshm::GpuApi::CreateStream();
-  cudaGetLastError();
+    void *stream = hshm::GpuApi::CreateStream();
+    cudaGetLastError();
 
-  auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-  gpu_bam_warp_read_kernel<<<
-      client_blocks, client_threads, 0,
-      static_cast<cudaStream_t>(stream)>>>(
-      arr.device(), total_bytes, d_done);
+    gpu_bam_warp_read_kernel<<<
+        client_blocks, client_threads, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+        arr.device(), total_bytes, d_done);
 
-  cudaError_t launch_err = cudaGetLastError();
-  if (launch_err != cudaSuccess) {
-    HLOG(kError, "BaM warp read kernel launch failed: {}", cudaGetErrorString(launch_err));
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+      HLOG(kError, "BaM warp read kernel launch failed: {}", cudaGetErrorString(launch_err));
+      cudaFreeHost(d_done);
+      hshm::GpuApi::DestroyStream(stream);
+      CHI_IPC->ResumeGpuOrchestrator();
+      return -1;
+    }
+
+    completed = PollDone(d_done, static_cast<int>(num_warps), 60000000);
+    hshm::GpuApi::Synchronize(stream);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_end - t_start).count();
+    *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
-    CHI_IPC->ResumeGpuOrchestrator();
-    return -1;
+    // BaM objects (arr, cache) destroyed here, before orchestrator resumes
   }
 
-  bool completed = PollDone(d_done, static_cast<int>(num_warps), 60000000);
-  hshm::GpuApi::Synchronize(stream);
-
-  auto t_end = std::chrono::high_resolution_clock::now();
-  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          t_end - t_start).count();
-  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
-
-  cudaFreeHost(d_done);
-  hshm::GpuApi::DestroyStream(stream);
   CHI_IPC->ResumeGpuOrchestrator();
-
   return completed ? 0 : -2;
 }
 
@@ -1567,58 +1571,62 @@ static int run_cte_gpu_bench_bam_warp_write(
     float *out_elapsed_ms) {
   CHI_IPC->PauseGpuOrchestrator();
 
-  bam::PageCacheConfig config;
-  config.page_size = page_size;
-  config.num_pages = cache_pages;
-  config.num_queues = 0;
-  config.queue_depth = 0;
-  config.backend = bam::BackendType::kHostMemory;
-  config.nvme_dev = nullptr;
+  bool completed;
+  {
+    bam::PageCacheConfig config;
+    config.page_size = page_size;
+    config.num_pages = cache_pages;
+    config.num_queues = 0;
+    config.queue_depth = 0;
+    config.backend = bam::BackendType::kHostMemory;
+    config.nvme_dev = nullptr;
 
-  bam::PageCache cache(config);
-  bam::Array<char> arr(total_bytes, cache);
+    bam::PageCache cache(config);
+    bam::Array<char> arr(total_bytes, cache);
 
-  std::vector<char> host_data(total_bytes, 0);
-  arr.load_from_host(host_data.data(), total_bytes);
+    std::vector<char> host_data(total_bytes, 0);
+    arr.load_from_host(host_data.data(), total_bytes);
 
-  chi::u32 num_warps = (client_blocks * client_threads) / 32;
-  if (num_warps == 0) num_warps = 1;
+    chi::u32 num_warps = (client_blocks * client_threads) / 32;
+    if (num_warps == 0) num_warps = 1;
 
-  int *d_done;
-  cudaMallocHost(&d_done, sizeof(int));
-  *d_done = 0;
+    int *d_done;
+    cudaMallocHost(&d_done, sizeof(int));
+    *d_done = 0;
 
-  void *stream = hshm::GpuApi::CreateStream();
-  cudaGetLastError();
+    void *stream = hshm::GpuApi::CreateStream();
+    cudaGetLastError();
 
-  auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-  gpu_bam_warp_write_kernel<<<
-      client_blocks, client_threads, 0,
-      static_cast<cudaStream_t>(stream)>>>(
-      arr.device(), total_bytes, d_done);
+    gpu_bam_warp_write_kernel<<<
+        client_blocks, client_threads, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+        arr.device(), total_bytes, d_done);
 
-  cudaError_t launch_err = cudaGetLastError();
-  if (launch_err != cudaSuccess) {
-    HLOG(kError, "BaM warp write kernel launch failed: {}", cudaGetErrorString(launch_err));
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+      HLOG(kError, "BaM warp write kernel launch failed: {}", cudaGetErrorString(launch_err));
+      cudaFreeHost(d_done);
+      hshm::GpuApi::DestroyStream(stream);
+      CHI_IPC->ResumeGpuOrchestrator();
+      return -1;
+    }
+
+    completed = PollDone(d_done, static_cast<int>(num_warps), 60000000);
+    hshm::GpuApi::Synchronize(stream);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_end - t_start).count();
+    *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
-    CHI_IPC->ResumeGpuOrchestrator();
-    return -1;
+    // BaM objects (arr, cache) destroyed here, before orchestrator resumes
   }
 
-  bool completed = PollDone(d_done, static_cast<int>(num_warps), 60000000);
-  hshm::GpuApi::Synchronize(stream);
-
-  auto t_end = std::chrono::high_resolution_clock::now();
-  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          t_end - t_start).count();
-  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
-
-  cudaFreeHost(d_done);
-  hshm::GpuApi::DestroyStream(stream);
   CHI_IPC->ResumeGpuOrchestrator();
-
   return completed ? 0 : -2;
 }
 
@@ -1636,63 +1644,67 @@ static int run_cte_gpu_bench_bam_read(
     float *out_elapsed_ms) {
   CHI_IPC->PauseGpuOrchestrator();
 
-  // Configure BaM: HBM cache + DRAM backing store
-  bam::PageCacheConfig config;
-  config.page_size = page_size;
-  config.num_pages = cache_pages;
-  config.num_queues = 0;
-  config.queue_depth = 0;
-  config.backend = bam::BackendType::kHostMemory;
-  config.nvme_dev = nullptr;
+  bool completed;
+  {
+    // Configure BaM: HBM cache + DRAM backing store
+    bam::PageCacheConfig config;
+    config.page_size = page_size;
+    config.num_pages = cache_pages;
+    config.num_queues = 0;
+    config.queue_depth = 0;
+    config.backend = bam::BackendType::kHostMemory;
+    config.nvme_dev = nullptr;
 
-  bam::PageCache cache(config);
-  bam::Array<char> arr(total_bytes, cache);
+    bam::PageCache cache(config);
+    bam::Array<char> arr(total_bytes, cache);
 
-  // Populate DRAM backing store with test data
-  std::vector<char> host_data(total_bytes);
-  for (chi::u64 i = 0; i < total_bytes; i++) {
-    host_data[i] = static_cast<char>(i & 0xFF);
-  }
-  arr.load_from_host(host_data.data(), total_bytes);
+    // Populate DRAM backing store with test data
+    std::vector<char> host_data(total_bytes);
+    for (chi::u64 i = 0; i < total_bytes; i++) {
+      host_data[i] = static_cast<char>(i & 0xFF);
+    }
+    arr.load_from_host(host_data.data(), total_bytes);
 
-  chi::u32 total_threads = client_blocks * client_threads;
-  if (total_threads == 0) total_threads = 1;
+    chi::u32 total_threads = client_blocks * client_threads;
+    if (total_threads == 0) total_threads = 1;
 
-  int *d_done;
-  cudaMallocHost(&d_done, sizeof(int));
-  *d_done = 0;
+    int *d_done;
+    cudaMallocHost(&d_done, sizeof(int));
+    *d_done = 0;
 
-  void *stream = hshm::GpuApi::CreateStream();
-  cudaGetLastError();
+    void *stream = hshm::GpuApi::CreateStream();
+    cudaGetLastError();
 
-  auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-  gpu_bam_read_kernel<<<
-      client_blocks, client_threads, 0,
-      static_cast<cudaStream_t>(stream)>>>(
-      arr.device(), total_bytes, d_done);
+    gpu_bam_read_kernel<<<
+        client_blocks, client_threads, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+        arr.device(), total_bytes, d_done);
 
-  cudaError_t launch_err = cudaGetLastError();
-  if (launch_err != cudaSuccess) {
-    HLOG(kError, "BaM read kernel launch failed: {}", cudaGetErrorString(launch_err));
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+      HLOG(kError, "BaM read kernel launch failed: {}", cudaGetErrorString(launch_err));
+      cudaFreeHost(d_done);
+      hshm::GpuApi::DestroyStream(stream);
+      CHI_IPC->ResumeGpuOrchestrator();
+      return -1;
+    }
+
+    completed = PollDone(d_done, static_cast<int>(total_threads), 60000000);
+    hshm::GpuApi::Synchronize(stream);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_end - t_start).count();
+    *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
-    CHI_IPC->ResumeGpuOrchestrator();
-    return -1;
+    // BaM objects (arr, cache) destroyed here, before orchestrator resumes
   }
 
-  bool completed = PollDone(d_done, static_cast<int>(total_threads), 60000000);
-  hshm::GpuApi::Synchronize(stream);
-
-  auto t_end = std::chrono::high_resolution_clock::now();
-  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          t_end - t_start).count();
-  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
-
-  cudaFreeHost(d_done);
-  hshm::GpuApi::DestroyStream(stream);
   CHI_IPC->ResumeGpuOrchestrator();
-
   return completed ? 0 : -2;
 }
 
@@ -1708,59 +1720,63 @@ static int run_cte_gpu_bench_bam_write(
     float *out_elapsed_ms) {
   CHI_IPC->PauseGpuOrchestrator();
 
-  bam::PageCacheConfig config;
-  config.page_size = page_size;
-  config.num_pages = cache_pages;
-  config.num_queues = 0;
-  config.queue_depth = 0;
-  config.backend = bam::BackendType::kHostMemory;
-  config.nvme_dev = nullptr;
+  bool completed;
+  {
+    bam::PageCacheConfig config;
+    config.page_size = page_size;
+    config.num_pages = cache_pages;
+    config.num_queues = 0;
+    config.queue_depth = 0;
+    config.backend = bam::BackendType::kHostMemory;
+    config.nvme_dev = nullptr;
 
-  bam::PageCache cache(config);
-  bam::Array<char> arr(total_bytes, cache);
+    bam::PageCache cache(config);
+    bam::Array<char> arr(total_bytes, cache);
 
-  // Zero-fill backing store
-  std::vector<char> host_data(total_bytes, 0);
-  arr.load_from_host(host_data.data(), total_bytes);
+    // Zero-fill backing store
+    std::vector<char> host_data(total_bytes, 0);
+    arr.load_from_host(host_data.data(), total_bytes);
 
-  chi::u32 total_threads = client_blocks * client_threads;
-  if (total_threads == 0) total_threads = 1;
+    chi::u32 total_threads = client_blocks * client_threads;
+    if (total_threads == 0) total_threads = 1;
 
-  int *d_done;
-  cudaMallocHost(&d_done, sizeof(int));
-  *d_done = 0;
+    int *d_done;
+    cudaMallocHost(&d_done, sizeof(int));
+    *d_done = 0;
 
-  void *stream = hshm::GpuApi::CreateStream();
-  cudaGetLastError();
+    void *stream = hshm::GpuApi::CreateStream();
+    cudaGetLastError();
 
-  auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-  gpu_bam_write_kernel<<<
-      client_blocks, client_threads, 0,
-      static_cast<cudaStream_t>(stream)>>>(
-      arr.device(), total_bytes, d_done);
+    gpu_bam_write_kernel<<<
+        client_blocks, client_threads, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+        arr.device(), total_bytes, d_done);
 
-  cudaError_t launch_err = cudaGetLastError();
-  if (launch_err != cudaSuccess) {
-    HLOG(kError, "BaM write kernel launch failed: {}", cudaGetErrorString(launch_err));
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+      HLOG(kError, "BaM write kernel launch failed: {}", cudaGetErrorString(launch_err));
+      cudaFreeHost(d_done);
+      hshm::GpuApi::DestroyStream(stream);
+      CHI_IPC->ResumeGpuOrchestrator();
+      return -1;
+    }
+
+    completed = PollDone(d_done, static_cast<int>(total_threads), 60000000);
+    hshm::GpuApi::Synchronize(stream);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_end - t_start).count();
+    *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
-    CHI_IPC->ResumeGpuOrchestrator();
-    return -1;
+    // BaM objects (arr, cache) destroyed here, before orchestrator resumes
   }
 
-  bool completed = PollDone(d_done, static_cast<int>(total_threads), 60000000);
-  hshm::GpuApi::Synchronize(stream);
-
-  auto t_end = std::chrono::high_resolution_clock::now();
-  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          t_end - t_start).count();
-  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
-
-  cudaFreeHost(d_done);
-  hshm::GpuApi::DestroyStream(stream);
   CHI_IPC->ResumeGpuOrchestrator();
-
   return completed ? 0 : -2;
 }
 #endif  // WRP_CORE_ENABLE_BAM_NVME

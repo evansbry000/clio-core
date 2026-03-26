@@ -109,6 +109,10 @@ extern "C" int run_gpu_bench_putblob(chi::PoolId cte_pool_id,
                                       chi::u64 total_bytes,
                                       bool to_cpu,
                                       float *out_elapsed_ms);
+extern "C" int run_gpu_bench_parallel_dispatch(chi::PoolId pool_id,
+                                                chi::u32 parallelism,
+                                                chi::u32 total_tasks,
+                                                float *out_elapsed_ms);
 #else
 extern "C" __attribute__((weak)) int run_gpu_bench_latency(
     chi::PoolId, chi::u32, chi::u32, chi::u32, chi::u32, chi::u32,
@@ -144,10 +148,14 @@ extern "C" __attribute__((weak)) int run_gpu_bench_putblob(
     chi::u32, chi::u32, chi::u64, bool, float *) {
   return -200;  // No GPU support compiled
 }
+extern "C" __attribute__((weak)) int run_gpu_bench_parallel_dispatch(
+    chi::PoolId, chi::u32, chi::u32, float *) {
+  return -200;  // No GPU support compiled
+}
 #endif
 
 /** Supported benchmark test cases */
-enum class TestCase { kLatency, kCoroutine, kAlloc, kAllocSerde, kSerde, kStringAlloc, kPutBlob, kPutBlobGpu };
+enum class TestCase { kLatency, kCoroutine, kAlloc, kAllocSerde, kSerde, kStringAlloc, kPutBlob, kPutBlobGpu, kParallelDispatch };
 
 /**
  * Configuration for the GPU runtime benchmark.
@@ -163,6 +171,7 @@ struct BenchmarkConfig {
   chi::u32 total_tasks = 100;   /**< Total tasks per GPU thread */
   chi::u32 subtasks = 1;        /**< Subtasks per coroutine task (coroutine test) */
   chi::u64 total_bytes = 64 * 1024 * 1024;  /**< Total I/O size in bytes (putblob test) */
+  chi::u32 parallelism = 32;  /**< GPU lane parallelism (parallel_dispatch test) */
 };
 
 /**
@@ -173,7 +182,9 @@ struct BenchmarkConfig {
 static void PrintHelp(const char *prog) {
   HIPRINT("Usage: {} [options]", prog);
   HIPRINT("Options:");
-  HIPRINT("  --test-case <case>     Test case: 'latency', 'coroutine', 'alloc', 'alloc_serde', 'serde', 'string_alloc', 'putblob', or 'putblob_gpu' (default: latency)");
+  HIPRINT("  --test-case <case>     Test case: 'latency', 'coroutine', 'alloc', 'alloc_serde',");
+  HIPRINT("                         'serde', 'string_alloc', 'putblob', 'putblob_gpu',");
+  HIPRINT("                         'parallel_dispatch' (default: latency)");
   HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
   HIPRINT("  --rt-threads <N>       GPU runtime orchestrator threads/block (default: 32)");
   HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
@@ -181,6 +192,7 @@ static void PrintHelp(const char *prog) {
   HIPRINT("  --batch-size <N>       Tasks per batch per GPU thread (default: 1)");
   HIPRINT("  --total-tasks <N>      Total tasks per GPU thread (default: 100)");
   HIPRINT("  --subtasks <N>         Subtasks per coroutine task (default: 1)");
+  HIPRINT("  --parallelism <N>      GPU lane parallelism (parallel_dispatch, default: 32)");
   HIPRINT("  --io-size <bytes>      Total I/O size in bytes (putblob test, default: 67108864)");
   HIPRINT("  --help, -h             Show this help");
 }
@@ -217,8 +229,10 @@ static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
         cfg.test_case = TestCase::kPutBlob;
       } else if (tc == "putblob_gpu") {
         cfg.test_case = TestCase::kPutBlobGpu;
+      } else if (tc == "parallel_dispatch") {
+        cfg.test_case = TestCase::kParallelDispatch;
       } else {
-        HLOG(kError, "Unknown test case '{}'; use 'latency', 'coroutine', 'alloc', 'alloc_serde', 'serde', 'string_alloc', 'putblob', or 'putblob_gpu'", tc);
+        HLOG(kError, "Unknown test case '{}'; use 'latency', 'coroutine', 'alloc', 'alloc_serde', 'serde', 'string_alloc', 'putblob', 'putblob_gpu', or 'parallel_dispatch'", tc);
         return false;
       }
     } else if (arg == "--rt-blocks" && i + 1 < argc) {
@@ -235,6 +249,8 @@ static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
       cfg.total_tasks = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--subtasks" && i + 1 < argc) {
       cfg.subtasks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--parallelism" && i + 1 < argc) {
+      cfg.parallelism = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--io-size" && i + 1 < argc) {
       cfg.total_bytes = static_cast<chi::u64>(std::stoull(argv[++i]));
     } else {
@@ -273,9 +289,14 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
   chi::u64 num_warps = (static_cast<chi::u64>(cfg.client_blocks) *
                          static_cast<chi::u64>(cfg.client_threads)) / 32;
   if (num_warps == 0) num_warps = 1;
-  chi::u64 total_ops = num_warps * static_cast<chi::u64>(cfg.total_tasks);
+  chi::u64 total_ops;
+  if (cfg.test_case == TestCase::kParallelDispatch) {
+    total_ops = static_cast<chi::u64>(cfg.total_tasks);
+  } else {
+    total_ops = num_warps * static_cast<chi::u64>(cfg.total_tasks);
+  }
   double throughput = (total_ops * 1000.0) / elapsed_ms;   // tasks/sec
-  double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task per warp
+  double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task
 
   const char *tc_name = (cfg.test_case == TestCase::kSerde) ? "serde" :
                          (cfg.test_case == TestCase::kAllocSerde) ? "alloc_serde" :
@@ -283,7 +304,8 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
                          (cfg.test_case == TestCase::kStringAlloc) ? "string_alloc" :
                          (cfg.test_case == TestCase::kCoroutine) ? "coroutine" :
                          (cfg.test_case == TestCase::kPutBlobGpu) ? "putblob_gpu" :
-                         (cfg.test_case == TestCase::kPutBlob) ? "putblob" : "latency";
+                         (cfg.test_case == TestCase::kPutBlob) ? "putblob" :
+                         (cfg.test_case == TestCase::kParallelDispatch) ? "parallel_dispatch" : "latency";
   HIPRINT("\n=== GPU Runtime Benchmark Results ===");
   HIPRINT("Test case:           {}", tc_name);
   HIPRINT("RT blocks:           {}", cfg.rt_blocks);
@@ -294,6 +316,9 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
   HIPRINT("Total tasks/warp:    {}", cfg.total_tasks);
   if (cfg.test_case == TestCase::kCoroutine) {
     HIPRINT("Subtasks/task:       {}", cfg.subtasks);
+  }
+  if (cfg.test_case == TestCase::kParallelDispatch) {
+    HIPRINT("Parallelism:         {}", cfg.parallelism);
   }
   if (cfg.test_case == TestCase::kPutBlob || cfg.test_case == TestCase::kPutBlobGpu) {
     HIPRINT("Total I/O size:      {} bytes ({} MB)", cfg.total_bytes,
@@ -336,7 +361,7 @@ static int RunBenchmark(const BenchmarkConfig &cfg) {
   }
   const chi::PoolId pool_id(9000, 0);
   float elapsed_ms = 0.0f;
-  int rc;
+  int rc = 0;
 
   if (cfg.test_case == TestCase::kStringAlloc) {
     // String alloc test doesn't need Chimaera runtime at all
@@ -384,6 +409,17 @@ static int RunBenchmark(const BenchmarkConfig &cfg) {
                                 cfg.rt_blocks, cfg.rt_threads,
                                 cfg.client_blocks, cfg.client_threads,
                                 cfg.total_bytes, to_cpu, &elapsed_ms);
+  } else if (cfg.test_case == TestCase::kParallelDispatch) {
+    // CPU→GPU parallel dispatch: submit GpuSubmit tasks from CPU with
+    // varying parallelism to benchmark single-warp vs cross-warp dispatch.
+    std::this_thread::sleep_for(1000ms);
+    if (!CreateBenchPool(pool_id)) {
+      chi::CHIMAERA_FINALIZE();
+      return 1;
+    }
+    std::this_thread::sleep_for(500ms);
+    rc = run_gpu_bench_parallel_dispatch(pool_id, cfg.parallelism,
+                                          cfg.total_tasks, &elapsed_ms);
   } else {
     // Runtime tests need pool + orchestrator stabilization
     std::this_thread::sleep_for(500ms);

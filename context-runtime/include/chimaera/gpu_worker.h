@@ -154,8 +154,8 @@ class Worker {
         TaskResume tmp = container->Run(ctx->method_id_, ctx->task_ptr_, *ctx);
         if (!tmp.get_handle()) {
           if (lane_id == 0) {
-            printf("[W%u] CORO ALLOC FAILED: method=%u\n", worker_id_,
-                   ctx->method_id_);
+            GPU_WORKER_DPRINTF("[W%u] CORO ALLOC FAILED: method=%u\n",
+                               worker_id_, ctx->method_id_);
           }
         } else {
           tmp.get_handle().promise().set_run_context(ctx);
@@ -206,10 +206,6 @@ class Worker {
     for (u32 i = 0; i < par; ++i) {
       if (ctx->task_coros_[i] != nullptr) {
         task_done = false;
-        if (ctx->method_id_ >= 12) {
-          printf("[EndTask] lane %u NOT done (method=%u par=%u)\n",
-                 i, ctx->method_id_, par);
-        }
         break;
       }
     }
@@ -493,8 +489,8 @@ class Worker {
                            is_copy_path, off, width);
       push_count++;
     }
-    printf("[CrossWarp] pushed %u sub-tasks for %u warps\n",
-           push_count, num_warps_needed);
+    GPU_WORKER_DPRINTF("[CrossWarp] pushed %u sub-tasks for %u warps\n",
+                       push_count, num_warps_needed);
     return rctx;
   }
 
@@ -545,7 +541,7 @@ class Worker {
     u32 lane = (range_off / 32) % num_lanes;
     auto &qlane = warp_group_queue_->GetLane(lane, 0);
     if (!qlane.Push(future)) {
-      printf("[CrossWarp] PUSH FAILED lane=%u\n", lane);
+      GPU_WORKER_DPRINTF("[CrossWarp] PUSH FAILED lane=%u\n", lane);
       ipc->gpu_alloc_->Free(desc_fp);
     }
   }

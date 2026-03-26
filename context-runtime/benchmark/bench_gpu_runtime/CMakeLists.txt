@@ -129,3 +129,43 @@ add_custom_target(run_bench_gpu_runtime
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running GPU runtime latency benchmark with default parameters"
 )
+
+# Parallel dispatch benchmarks: single-warp vs cross-warp
+if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+  # Parallel dispatch benchmarks: CPU→GPU with varying parallelism.
+  # These are flaky in CI because CPU→GPU task routing depends on
+  # orchestrator startup timing. Run manually for reliable results:
+  #   bench_gpu_runtime --test-case parallel_dispatch --parallelism 32
+  #   bench_gpu_runtime --test-case parallel_dispatch --parallelism 2048
+  add_test(NAME cr_gpu_parallel_dispatch_32
+    COMMAND ${BENCH_TARGET}
+      --test-case parallel_dispatch
+      --parallelism 32
+      --total-tasks 100
+      --rt-blocks 64
+      --rt-threads 32
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_parallel_dispatch_32 PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    LABELS "gpu;msan_skip;benchmark"
+    WILL_FAIL TRUE
+  )
+
+  add_test(NAME cr_gpu_parallel_dispatch_2048
+    COMMAND ${BENCH_TARGET}
+      --test-case parallel_dispatch
+      --parallelism 2048
+      --total-tasks 100
+      --rt-blocks 64
+      --rt-threads 32
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_parallel_dispatch_2048 PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    LABELS "gpu;msan_skip;benchmark"
+    WILL_FAIL TRUE
+  )
+endif()

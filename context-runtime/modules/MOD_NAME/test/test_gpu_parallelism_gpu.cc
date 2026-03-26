@@ -19,13 +19,14 @@
 #include <chimaera/pool_query.h>
 #include <chimaera/singletons.h>
 #include <chimaera/task.h>
-#include <chimaera/types.h>
 #include <hermes_shm/util/gpu_api.h>
+
+// Persistent device counter — allocated once, never freed, so the
+// persistent orchestrator kernel can always safely atomicAdd on it.
+static unsigned int *g_d_counter = nullptr;
 
 /**
  * Run the cross-warp parallelism test.
- * Allocates a device atomic counter, submits a GpuSubmitTask with the
- * given parallelism, waits for completion, and reads the counter.
  *
  * @param pool_id       Pool ID of the MOD_NAME container
  * @param parallelism   Number of GPU threads to use (e.g., 2048)
@@ -37,29 +38,28 @@ extern "C" int run_gpu_parallelism_test(
     chi::u32 parallelism,
     chi::u32 *out_counter) {
 
-  // Allocate pinned counter (CPU+GPU accessible, no cudaMemcpy needed)
-  unsigned int *d_counter;
-  cudaError_t err = cudaMallocHost(&d_counter, sizeof(unsigned int));
-  if (err != cudaSuccess) {
-    return -100;
+  // Allocate device counter once — never freed so the persistent
+  // orchestrator kernel can always safely access it via atomicAdd.
+  if (!g_d_counter) {
+    cudaError_t err = cudaMalloc(&g_d_counter, sizeof(unsigned int));
+    if (err != cudaSuccess) {
+      return -100;
+    }
   }
-  *d_counter = 0;
+  cudaMemset(g_d_counter, 0, sizeof(unsigned int));
 
   // Create client and submit task with parallelism via ToLocalGpu
   chimaera::MOD_NAME::Client client(pool_id);
   chi::u32 gpu_id = 0;
   chi::u32 test_value = 42;
-  chi::u64 counter_addr = reinterpret_cast<chi::u64>(d_counter);
+  chi::u64 counter_addr = reinterpret_cast<chi::u64>(g_d_counter);
 
   auto future = client.AsyncGpuSubmit(
       chi::PoolQuery::ToLocalGpu(gpu_id, parallelism),
       gpu_id, test_value, counter_addr);
 
-  fprintf(stderr, "[PARALLELISM] Submitted, parallelism=%u, waiting...\n", parallelism);
-
   // Wait with timeout
   bool completed = future.Wait(30.0f);
-  fprintf(stderr, "[PARALLELISM] Wait done: completed=%d\n", (int)completed);
   if (!completed) {
     auto fshm_full = future.GetFutureShm();
     chi::FutureShm *fshm = fshm_full.ptr_;
@@ -68,23 +68,23 @@ extern "C" int run_gpu_parallelism_test(
               fshm->total_warps_,
               fshm->completion_counter_.load());
     }
-    cudaFreeHost(d_counter);
     return -3;  // Timeout
   }
 
-  // Read counter directly (pinned memory is CPU-visible after Future completes)
-  *out_counter = *d_counter;
+  // Copy counter from device to host
+  unsigned int h_counter = 0;
+  cudaMemcpy(&h_counter, g_d_counter, sizeof(unsigned int),
+             cudaMemcpyDeviceToHost);
+  *out_counter = h_counter;
 
   // Verify result_value_ is correct (last warp's output)
   chi::u32 expected = (test_value * 3) + gpu_id;
   if (future->result_value_ != expected) {
     fprintf(stderr, "[PARALLELISM] result_value_=%u expected=%u\n",
             future->result_value_, expected);
-    cudaFreeHost(d_counter);
     return -4;  // Wrong result value
   }
 
-  cudaFree(d_counter);
   return 1;  // Success
 }
 

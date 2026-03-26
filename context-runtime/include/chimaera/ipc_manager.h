@@ -310,6 +310,9 @@ class IpcManager {
   void ClientInitGpu(IpcManagerGpuInfo &gpu_info, int num_threads,
                      int num_blocks = 1) {
 #if !HSHM_IS_HOST
+    // Clear stale is_gpu_runtime_ from previous kernel's __shared__ memory.
+    // CHIMAERA_GPU_ORCHESTRATOR_INIT overrides this to true after this call.
+    is_gpu_runtime_ = false;
 #endif
     // Store queue pointers
     gpu2gpu_queue_ = gpu_info.gpu2gpu_queue;
@@ -2129,6 +2132,19 @@ class IpcManager {
     auto &lane = cpu2gpu_queues_[gpu_id].ptr_->GetLane(0, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
     lane.Push(task_future);
+
+    // Flush the queue lane's tail pointer to DRAM so the GPU sees the push.
+    // The FutureShm data was flushed above; this covers the queue header
+    // which the GPU polls via system-scope loads.
+#if defined(__x86_64__) || defined(__i386__)
+    {
+      const char *q_base = reinterpret_cast<const char *>(&lane);
+      for (const char *cl = q_base; cl < q_base + sizeof(lane); cl += 64) {
+        _mm_clflush(cl);
+      }
+      _mm_sfence();
+    }
+#endif
 
     return future;
 #else

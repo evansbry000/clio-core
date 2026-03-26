@@ -38,6 +38,10 @@
  * Uses the chi::gpu::TaskResume / chi::gpu::yield() API for GPU-side
  * coroutines.
  *
+ * Each test kernel initializes the IPC manager via
+ * CHIMAERA_GPU_ORCHESTRATOR_INIT so that CHI_PRIV_ALLOC is available
+ * for coroutine frame allocation.
+ *
  * Tests verify:
  * 1. Basic coroutine creation and completion
  * 2. Yielding with co_await chi::gpu::yield()
@@ -47,6 +51,8 @@
  */
 
 #include <chimaera/gpu_coroutine.h>
+#include <chimaera/ipc_manager.h>
+#include <hermes_shm/memory/backend/gpu_shm_mmap.h>
 #include <cstdio>
 
 using chi::gpu::RunContext;
@@ -61,7 +67,9 @@ __device__ TaskResume basic_coro(RunContext &ctx) {
   co_return;
 }
 
-__global__ void test_basic(int *result) {
+__global__ void test_basic(chi::IpcManagerGpuInfo gpu_info,
+                           int num_blocks, int *result) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
   RunContext ctx;
   auto c = basic_coro(ctx);
   c.resume();
@@ -81,7 +89,9 @@ __device__ TaskResume yielding_coro(RunContext &ctx, int *counter) {
   co_return;
 }
 
-__global__ void test_yield(int *result) {
+__global__ void test_yield(chi::IpcManagerGpuInfo gpu_info,
+                           int num_blocks, int *result) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
   int counter = 0;
   RunContext ctx;
   auto c = yielding_coro(ctx, &counter);
@@ -117,7 +127,9 @@ __device__ TaskResume outer_sync(RunContext &ctx, int *counter) {
   co_return;
 }
 
-__global__ void test_nested_sync(int *result) {
+__global__ void test_nested_sync(chi::IpcManagerGpuInfo gpu_info,
+                                 int num_blocks, int *result) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
   int counter = 0;
   RunContext ctx;
   auto c = outer_sync(ctx, &counter);
@@ -137,7 +149,9 @@ __device__ TaskResume spin_coro(RunContext &ctx, int *counter) {
   co_return;
 }
 
-__global__ void test_scheduler(int *result) {
+__global__ void test_scheduler(chi::IpcManagerGpuInfo gpu_info,
+                               int num_blocks, int *result) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
   int counter = 0;
   RunContext ctx;
   CoroutineScheduler sched;
@@ -181,7 +195,9 @@ __device__ TaskResume multi_coro(RunContext &ctx, int *val, int increment) {
   co_return;
 }
 
-__global__ void test_multi_suspended(int *result) {
+__global__ void test_multi_suspended(chi::IpcManagerGpuInfo gpu_info,
+                                     int num_blocks, int *result) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
   int val_a = 0, val_b = 0;
   RunContext ctx_a, ctx_b;
   CoroutineScheduler sched;
@@ -215,13 +231,16 @@ __global__ void test_multi_suspended(int *result) {
 // Test runner
 // ============================================================================
 
-__host__ static bool run_test(const char *name,
-                               void (*kernel)(int *), int expected) {
+using KernelFn = void (*)(chi::IpcManagerGpuInfo, int, int *);
+
+__host__ static bool run_test(const char *name, KernelFn kernel,
+                               chi::IpcManagerGpuInfo &gpu_info,
+                               int expected) {
   int *d_result;
   cudaMallocManaged(&d_result, sizeof(int));
   *d_result = 0;
 
-  kernel<<<1, 1>>>(d_result);
+  kernel<<<1, 32>>>(gpu_info, 1, d_result);
   cudaError_t err = cudaDeviceSynchronize();
 
   if (err != cudaSuccess) {
@@ -239,15 +258,29 @@ __host__ static bool run_test(const char *name,
 }
 
 __host__ int main() {
+  // Set GPU stack size for coroutine frames + IPC init
+  cudaDeviceSetLimit(cudaLimitStackSize, 8192);
+
+  // Create a GPU memory backend for the allocator
+  constexpr size_t kBackendSize = 10u * 1024u * 1024u;  // 10 MB
+  hipc::GpuShmMmap backend;
+  hipc::MemoryBackendId backend_id(99, 0);
+  if (!backend.shm_init(backend_id, kBackendSize,
+                        "/test_gpu_coroutine", 0)) {
+    fprintf(stderr, "FATAL: Failed to create GPU memory backend\n");
+    return 1;
+  }
+  chi::IpcManagerGpuInfo gpu_info(backend, nullptr);
+
   fprintf(stderr, "GPU Coroutine Tests\n");
   fprintf(stderr, "===================\n");
 
   int failures = 0;
-  if (!run_test("basic_coroutine", test_basic, 1)) ++failures;
-  if (!run_test("yield_twice", test_yield, 1)) ++failures;
-  if (!run_test("nested_sync", test_nested_sync, 1)) ++failures;
-  if (!run_test("scheduler_spin", test_scheduler, 1)) ++failures;
-  if (!run_test("multi_suspended", test_multi_suspended, 1)) ++failures;
+  if (!run_test("basic_coroutine", test_basic, gpu_info, 1)) ++failures;
+  if (!run_test("yield_twice", test_yield, gpu_info, 1)) ++failures;
+  if (!run_test("nested_sync", test_nested_sync, gpu_info, 1)) ++failures;
+  if (!run_test("scheduler_spin", test_scheduler, gpu_info, 1)) ++failures;
+  if (!run_test("multi_suspended", test_multi_suspended, gpu_info, 1)) ++failures;
 
   fprintf(stderr, "===================\n");
   if (failures == 0) {

@@ -84,9 +84,6 @@ TEST_CASE("gpu_cross_warp_parallelism_2048", "[gpu][parallelism][cross_warp]") {
   REQUIRE(result == 1);
   REQUIRE(counter == parallelism);
 
-  fprintf(stderr,
-          "[TEST PASS] gpu_cross_warp_parallelism_2048: counter=%u expected=%u\n",
-          counter, parallelism);
 }
 
 /**
@@ -124,9 +121,6 @@ TEST_CASE("gpu_single_warp_parallelism_32", "[gpu][parallelism][single_warp]") {
   REQUIRE(result == 1);
   REQUIRE(counter == parallelism);
 
-  fprintf(stderr,
-          "[TEST PASS] gpu_single_warp_parallelism_32: counter=%u expected=%u\n",
-          counter, parallelism);
 }
 
 SIMPLE_TEST_MAIN()

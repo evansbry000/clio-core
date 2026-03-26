@@ -207,8 +207,5 @@ else()
   message(STATUS "Skipping wrp_cte_gpu_bench - CUDA not enabled")
 endif()
 
-# GPU workload benchmarks (PageRank, GNN features, Gray-Scott)
-add_subdirectory(gpu)
-
 # NOTE: Compression benchmark (wrp_cte_compress_bench) has been moved to
 # context-transfer-engine/compressor/test/

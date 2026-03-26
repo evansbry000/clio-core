@@ -1851,4 +1851,49 @@ extern "C" int run_gpu_bench_putblob(
   return completed ? 0 : -4;
 }
 
+/**
+ * CPU→GPU parallel dispatch benchmark.
+ *
+ * Submits GpuSubmit tasks from the CPU to the GPU orchestrator via
+ * PoolQuery::ToLocalGpu with the given parallelism. Measures round-trip
+ * latency for single-warp (parallelism=32) vs cross-warp (parallelism=2048)
+ * dispatch.
+ *
+ * Must be compiled with HSHM_ENABLE_CUDA so that Send() routes ToLocalGpu
+ * tasks to SendToGpu() instead of falling through to the CPU path.
+ */
+extern "C" int run_gpu_bench_parallel_dispatch(
+    chi::PoolId pool_id,
+    chi::u32 parallelism,
+    chi::u32 total_tasks,
+    float *out_elapsed_ms) {
+  chimaera::MOD_NAME::Client client(pool_id);
+  chi::u32 gpu_id = 0;
+
+  // Warmup: first task may take longer while orchestrator registers the pool
+  for (chi::u32 i = 0; i < 10; ++i) {
+    auto future = client.AsyncGpuSubmit(
+        chi::PoolQuery::ToLocalGpu(gpu_id, parallelism),
+        gpu_id, i);
+    if (!future.Wait(30.0f)) {
+      return -2;
+    }
+  }
+
+  auto t_start = std::chrono::high_resolution_clock::now();
+  for (chi::u32 i = 0; i < total_tasks; ++i) {
+    auto future = client.AsyncGpuSubmit(
+        chi::PoolQuery::ToLocalGpu(gpu_id, parallelism),
+        gpu_id, i);
+    if (!future.Wait(30.0f)) {
+      return -4;
+    }
+  }
+  auto t_end = std::chrono::high_resolution_clock::now();
+  *out_elapsed_ms = static_cast<float>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          t_end - t_start).count() / 1e6);
+  return 0;
+}
+
 #endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
