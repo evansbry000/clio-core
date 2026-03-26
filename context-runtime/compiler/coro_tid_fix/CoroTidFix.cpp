@@ -52,14 +52,17 @@ static bool replaceTidXWithAsm(Function &F) {
 
   if (TidCalls.empty()) return false;
 
-  // Create inline asm type: () -> i32, with side effects to prevent CSE
   auto *I32Ty = Type::getInt32Ty(F.getContext());
   auto *AsmFTy = FunctionType::get(I32Ty, false);
-  auto *AsmVal = InlineAsm::get(
-      AsmFTy, "mov.u32 $0, %tid.x;", "=r",
-      /*hasSideEffects=*/true);
 
   for (auto *CI : TidCalls) {
+    // Create a unique InlineAsm per call site to prevent CSE
+    auto *AsmVal = InlineAsm::get(
+        AsmFTy, "mov.u32 $0, %tid.x;", "=r,~{memory}",
+        /*hasSideEffects=*/true,
+        /*isAlignStack=*/false,
+        InlineAsm::AD_ATT,
+        /*canThrow=*/false);
     IRBuilder<> Builder(CI);
     auto *AsmCall = Builder.CreateCall(AsmFTy, AsmVal, {}, "tid.x.asm");
     CI->replaceAllUsesWith(AsmCall);
@@ -118,7 +121,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "CoroTidFix", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
-            // Run at multiple points to catch tid.x reads at all stages
+            // Run at pipeline start AND optimizer last.
+            // PipelineStart catches intrinsics before inlining.
+            // After inlining, cloned volatile asm should prevent CSE.
+            // OptimizerLast catches any intrinsics re-introduced by opts.
             PB.registerPipelineStartEPCallback(
                 [](ModulePassManager &MPM, OptimizationLevel) {
                   MPM.addPass(CoroTidFixPass());

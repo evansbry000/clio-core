@@ -93,33 +93,67 @@ int main(int argc, char **argv) {
   std::this_thread::sleep_for(200ms);
   printf("CTE pool created: %u.%u\n", pool_id.major_, pool_id.minor_);
 
-  // Register pinned target (CPU + GPU)
-  chi::PoolId bdev_pool_id(800, 0);
-  auto reg_task = cte_client.AsyncRegisterTarget(
-      "pinned::tiered_test_target",
-      chimaera::bdev::BdevType::kPinned,
-      256ULL * 1024 * 1024,
-      chi::PoolQuery::Local(), bdev_pool_id);
-  reg_task.Wait();
-  if (reg_task->GetReturnCode() != 0) {
-    fprintf(stderr, "ERROR: RegisterTarget (CPU) failed: %d\n",
-            reg_task->GetReturnCode());
-    return 1;
-  }
-  std::this_thread::sleep_for(200ms);
+  // Register HBM target (CPU + GPU)
+  chi::PoolId hbm_bdev_pool_id(800, 0);
+  {
+    auto reg = cte_client.AsyncRegisterTarget(
+        "hbm::tiered_test_hbm",
+        chimaera::bdev::BdevType::kHbm,
+        50ULL * 1024 * 1024,
+        chi::PoolQuery::Local(), hbm_bdev_pool_id);
+    reg.Wait();
+    if (reg->GetReturnCode() != 0) {
+      fprintf(stderr, "ERROR: RegisterTarget HBM (CPU) failed: %d\n",
+              reg->GetReturnCode());
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
 
-  auto gpu_reg = cte_client.AsyncRegisterTarget(
-      "pinned::tiered_test_target",
-      chimaera::bdev::BdevType::kPinned,
-      256ULL * 1024 * 1024,
-      chi::PoolQuery::Local(), bdev_pool_id,
-      chi::PoolQuery::LocalGpuBcast());
-  gpu_reg.Wait();
-  if (gpu_reg->GetReturnCode() != 0) {
-    fprintf(stderr, "ERROR: RegisterTarget (GPU) failed: %d\n",
-            gpu_reg->GetReturnCode());
-    return 1;
+    auto gpu_reg = cte_client.AsyncRegisterTarget(
+        "hbm::tiered_test_hbm",
+        chimaera::bdev::BdevType::kHbm,
+        50ULL * 1024 * 1024,
+        chi::PoolQuery::Local(), hbm_bdev_pool_id,
+        chi::PoolQuery::LocalGpuBcast());
+    gpu_reg.Wait();
+    if (gpu_reg->GetReturnCode() != 0) {
+      fprintf(stderr, "ERROR: RegisterTarget HBM (GPU) failed: %d\n",
+              gpu_reg->GetReturnCode());
+      return 1;
+    }
   }
+  printf("HBM target registered.\n");
+
+  // Register Pinned target (CPU + GPU)
+  chi::PoolId pinned_bdev_pool_id(801, 0);
+  {
+    auto reg = cte_client.AsyncRegisterTarget(
+        "pinned::tiered_test_pinned",
+        chimaera::bdev::BdevType::kPinned,
+        400ULL * 1024 * 1024,
+        chi::PoolQuery::Local(), pinned_bdev_pool_id);
+    reg.Wait();
+    if (reg->GetReturnCode() != 0) {
+      fprintf(stderr, "ERROR: RegisterTarget Pinned (CPU) failed: %d\n",
+              reg->GetReturnCode());
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    auto gpu_reg = cte_client.AsyncRegisterTarget(
+        "pinned::tiered_test_pinned",
+        chimaera::bdev::BdevType::kPinned,
+        400ULL * 1024 * 1024,
+        chi::PoolQuery::Local(), pinned_bdev_pool_id,
+        chi::PoolQuery::LocalGpuBcast());
+    gpu_reg.Wait();
+    if (gpu_reg->GetReturnCode() != 0) {
+      fprintf(stderr, "ERROR: RegisterTarget Pinned (GPU) failed: %d\n",
+              gpu_reg->GetReturnCode());
+      return 1;
+    }
+  }
+  printf("Pinned target registered.\n");
   std::this_thread::sleep_for(200ms);
   printf("Target registered.\n");
 
