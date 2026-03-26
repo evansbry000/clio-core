@@ -105,22 +105,26 @@ u32 AliquemDedicatedSched::RuntimeMapTask(Worker *worker,
 
   // --- Phase 1: RCFS Edge Heuristic ---
   // Convert I/O bytes and compute microseconds into unified "Deficit Cost"
-  // Retrieve TaskStat from container for this method
-  uint64_t io_cost = 0;
-  uint64_t compute_cost = 0;
+  uint64_t total_task_cost = 1;  // Default cost for tasks without container stats
 
+  // Try to get telemetry from container if available
   if (container != nullptr) {
     TaskStat stat = container->GetTaskStats(task_ptr->method_);
     // Calibration: On Pi 4, transferring 100 bytes ≈ 1 microsecond of compute
-    io_cost = stat.io_size_ / 100;
-    compute_cost = stat.compute_;
-  }
+    uint64_t io_cost = stat.io_size_ / 100;
+    uint64_t compute_cost = stat.compute_;
+    total_task_cost = io_cost + compute_cost;
 
-  uint64_t total_task_cost = io_cost + compute_cost;
-
-  // Prevent zero-cost starvation - assign minimum cost of 1
-  if (total_task_cost == 0) {
-    total_task_cost = 1;
+    // Prevent zero-cost starvation - assign minimum cost of 1
+    if (total_task_cost == 0) {
+      total_task_cost = 1;
+    }
+  } else {
+    // For raw IPC tasks without container, use period_ns as lightweight cost proxy
+    // Tasks can optionally set period via SetPeriod() to indicate relative weight
+    if (task_ptr->period_ns_ > 0) {
+      total_task_cost = static_cast<uint64_t>(task_ptr->period_ns_ / 1000.0);  // Convert ns to approx µs cost
+    }
   }
 
   // --- Phase 2: Aliquem O(1) Routing ---

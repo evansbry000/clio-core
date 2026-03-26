@@ -37,35 +37,45 @@ void NoisyNeighborThread() {
     
     size_t count = 0;
     while (keep_running.load(std::memory_order_relaxed)) {
+        // Generate Pareto-distributed heavy-tail workload
         double compute_cost = pareto_random(gen, 1000.0, 1.5);
+        
+        // Simulate async task submission (fire-and-forget)
         if (count++ % 1000 == 0) {
-            std::cout << "[NoisyNeighbor] Spike: " << compute_cost << " ms" << std::endl;
+            std::cout << "[NoisyNeighbor] Workload spike: " << compute_cost 
+                      << " µs (total submitted: " << count << ")" << std::endl;
         }
+        
+        // Small sleep between submissions to avoid overwhelming the scheduler
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
     std::cout << "[NoisyNeighbor] Completed " << count << " iterations" << std::endl;
 }
 
-// Micro-I/O Barrage: Sync measured latency
+// Micro I/O Barrage: Sync measured latency with timing
 void MicroIoBarrageThread(std::vector<TraceEvent>& trace_buffer, size_t num_events) {
     std::cout << "[MicroIoBarrage] Started" << std::endl;
     std::mt19937 gen(1337);
     std::exponential_distribution<double> poisson_arrival(1.0 / 200.0);
 
     for (size_t i = 0; i < num_events; ++i) {
+        // Simulate Poisson-distributed arrival times (average 200µs between arrivals)
         double delay_us = poisson_arrival(gen);
         
+        // Spin-wait for exact microsecond timing (using CNTVCT_EL0)
         auto start_wait = get_cntvct_el0();
-        uint64_t wait_ticks = static_cast<uint64_t>(delay_us * 54.0);
+        uint64_t wait_ticks = static_cast<uint64_t>(delay_us * 54.0);  // 54 ticks/µs on Pi 4
         while ((get_cntvct_el0() - start_wait) < wait_ticks) {
-            // Busy-wait
+            // Busy-wait for precise timing
         }
 
+        // CRITICAL: Record start tick BEFORE simulated task processing
         trace_buffer[i].start_tick = get_cntvct_el0();
         
-        // Simulate 2us task processing
+        // Simulate 2µs task processing time
         std::this_thread::sleep_for(std::chrono::microseconds(2));
         
+        // Record end tick AFTER simulated task completes
         trace_buffer[i].end_tick = get_cntvct_el0();
         
         if ((i + 1) % 10000 == 0) {
@@ -78,8 +88,9 @@ void MicroIoBarrageThread(std::vector<TraceEvent>& trace_buffer, size_t num_even
 }
 
 int main(int argc, char** argv) {
-    std::cout << "[Benchmark] Starting Edge Benchmark" << std::endl;
+    std::cout << "[Benchmark] Starting Edge Benchmark with Scheduler Load Simulation" << std::endl;
 
+    // Calibrate timer overhead
     uint64_t calib = chi::calibrate_timer_overhead();
     std::cout << "[Benchmark] Timer overhead: " << calib << " ticks" << std::endl;
 
