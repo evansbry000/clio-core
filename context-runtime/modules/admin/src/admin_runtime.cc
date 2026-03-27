@@ -150,6 +150,7 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
        "ClientSend tasks");
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::PoolQuery Runtime::ScheduleTask(const hipc::FullPtr<chi::Task> &task) {
@@ -221,6 +222,7 @@ chi::TaskResume Runtime::GetOrCreatePool(
     HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task,
@@ -229,6 +231,7 @@ chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task,
   // DestroyTask is aliased to DestroyPoolTask, so delegate to DestroyPool
   CHI_CO_AWAIT(DestroyPool(task, rctx));
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
@@ -273,6 +276,7 @@ chi::TaskResume Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
     HLOG(kError, "Admin: Pool destruction failed with exception: {}", e.what());
   }
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
@@ -291,6 +295,7 @@ chi::TaskResume Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
   InitiateShutdown(task->grace_period_ms_);
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 void Runtime::InitiateShutdown(chi::u32 grace_period_ms) {
@@ -354,6 +359,7 @@ chi::TaskResume Runtime::Flush(hipc::FullPtr<FlushTask> task,
     HLOG(kError, "Admin: Flush failed with exception: {}", e.what());
   }
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 //===========================================================================
@@ -367,7 +373,6 @@ chi::TaskResume Runtime::Flush(hipc::FullPtr<FlushTask> task,
  */
 void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
                      chi::RunContext &rctx) {
-  CHI_TASK_BODY_BEGIN
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
 
@@ -710,6 +715,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
 
   task->SetReturnCode(0);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 /**
@@ -1022,6 +1028,7 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
   }
 
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 /**
@@ -1038,6 +1045,7 @@ chi::TaskResume Runtime::ClientConnect(hipc::FullPtr<ClientConnectTask> task,
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 /**
@@ -1148,6 +1156,7 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
   rctx.did_work_ = did_work;
   task->SetReturnCode(0);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 /**
@@ -1258,6 +1267,7 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
   rctx.did_work_ = did_work;
   task->SetReturnCode(0);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
@@ -1281,6 +1291,7 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
   }
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 void Runtime::MonitorWorkerStats(hipc::FullPtr<MonitorTask> task) {
@@ -1635,6 +1646,7 @@ chi::TaskResume Runtime::AnnounceShutdown(
   task->SetReturnCode(0);
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::MonitorBdevStats(hipc::FullPtr<MonitorTask> task) {
@@ -1773,6 +1785,7 @@ chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
 
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
@@ -1789,6 +1802,7 @@ chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
 
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::RestartContainers(
@@ -1854,6 +1868,7 @@ chi::TaskResume Runtime::RestartContainers(
   }
   (void)rctx;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::AddNode(hipc::FullPtr<AddNodeTask> task,
@@ -1886,6 +1901,7 @@ chi::TaskResume Runtime::AddNode(hipc::FullPtr<AddNodeTask> task,
   HLOG(kInfo, "Admin: AddNode complete, assigned node_id={}", new_node_id);
   task->SetReturnCode(0);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task,
@@ -1908,6 +1924,7 @@ chi::TaskResume Runtime::WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task,
 
   task->SetReturnCode(0);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::ChangeAddressTable(
@@ -1940,6 +1957,7 @@ chi::TaskResume Runtime::ChangeAddressTable(
     task->SetReturnCode(1);
   }
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::MigrateContainers(
@@ -2005,6 +2023,7 @@ chi::TaskResume Runtime::MigrateContainers(
   HLOG(kInfo, "Admin: MigrateContainers completed, {} migrated",
        task->num_migrated_);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 /**
@@ -2250,6 +2269,7 @@ chi::TaskResume Runtime::Heartbeat(hipc::FullPtr<HeartbeatTask> task,
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
@@ -2462,6 +2482,7 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
   rctx.did_work_ = did_work;
   task->SetReturnCode(0);
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskResume Runtime::ProbeRequest(hipc::FullPtr<ProbeRequestTask> task,
@@ -2490,6 +2511,7 @@ chi::TaskResume Runtime::ProbeRequest(hipc::FullPtr<ProbeRequestTask> task,
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 chi::TaskStat Runtime::GetTaskStats(chi::u32 method_id) const {
@@ -2642,6 +2664,7 @@ chi::TaskResume Runtime::RecoverContainers(
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 //===========================================================================
@@ -2691,6 +2714,7 @@ chi::TaskResume Runtime::SystemMonitor(hipc::FullPtr<SystemMonitorTask> task,
   rctx.did_work_ = true;
   (void)task;
   CHI_CO_RETURN;
+  CHI_TASK_BODY_END
 }
 
 //===========================================================================
