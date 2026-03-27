@@ -417,10 +417,11 @@ int run_workload_pagerank(const WorkloadConfig &cfg, const char *mode,
     // ======== BaM: Uses bam::ArrayDevice<uint32_t>::read() ========
     uint64_t edge_bytes = g.ne * sizeof(uint32_t);
     uint64_t eb_aligned = ((edge_bytes+cfg.bam_page_size-1)/cfg.bam_page_size)*cfg.bam_page_size;
-    uint32_t matched_pages = (uint32_t)(eb_aligned / cfg.bam_page_size);
+    uint32_t total_pages = (uint32_t)(eb_aligned / cfg.bam_page_size);
+    uint32_t cache_pages = std::max(1u, total_pages * cfg.hbm_cache_pct / 100);
 
     bam::PageCacheConfig pcfg;
-    pcfg.page_size=cfg.bam_page_size; pcfg.num_pages=matched_pages;
+    pcfg.page_size=cfg.bam_page_size; pcfg.num_pages=cache_pages;
     pcfg.num_queues=0; pcfg.queue_depth=0;
     pcfg.backend=bam::BackendType::kHostMemory; pcfg.nvme_dev=nullptr;
 
@@ -428,9 +429,9 @@ int run_workload_pagerank(const WorkloadConfig &cfg, const char *mode,
     bam::Array<uint32_t> edges(g.ne, cache);
     edges.load_from_host(g.edges.data(), g.ne);
 
-    HIPRINT("  BaM HBM cache: {} pages x {} B = {:.1f} MB (matched to CTE)",
-            matched_pages, cfg.bam_page_size,
-            (double)matched_pages*cfg.bam_page_size/(1024.0*1024.0));
+    HIPRINT("  BaM HBM cache: {} / {} pages ({}%) x {} B = {:.1f} MB",
+            cache_pages, total_pages, cfg.hbm_cache_pct, cfg.bam_page_size,
+            (double)cache_pages*cfg.bam_page_size/(1024.0*1024.0));
 
     auto t0=std::chrono::high_resolution_clock::now(); int iter;
     for(iter=0;iter<iters;iter++){

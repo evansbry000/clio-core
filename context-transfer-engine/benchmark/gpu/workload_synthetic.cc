@@ -134,13 +134,25 @@ __global__ void synthetic_direct_kernel(
 }
 
 // ================================================================
-// BaM kernel: warp-cooperative page cache
+// BaM kernel: warp-cooperative page cache (GIDS-style)
+//
+// Matches GIDS bam_ptr pattern: acquire page once, access elements via raw
+// pointer, only mark dirty — NO per-page DRAM flush during iteration.
+// Writeback is deferred (dirty pages flushed on eviction or at end).
+//
+// Each warp iterates over 64KB pages:
+//   1. Lane 0 calls warp_page_cache_acquire (1 atomicCAS)
+//   2. If cache miss: all 32 lanes cooperatively load page from DRAM
+//   3. All 32 lanes read/write the raw HBM page pointer directly
+//   4. Mark dirty (no flush) — like GIDS bam_ptr::operator[]
+//
+// This avoids per-element atomic overhead AND per-page PCIe flushes.
 // ================================================================
 
 #ifdef WRP_CORE_ENABLE_BAM
 __global__ void synthetic_bam_kernel(
-    bam::ArrayDevice<uint64_t> write_array,
-    bam::ArrayDevice<uint64_t> read_array,
+    bam::ArrayDevice<char> write_array,
+    bam::ArrayDevice<char> read_array,
     uint64_t warp_bytes,
     uint32_t total_warps,
     uint32_t iterations,
@@ -152,35 +164,115 @@ __global__ void synthetic_bam_kernel(
 
   if (warp_id >= total_warps) return;
 
-  uint64_t num_uint64s_per_warp = warp_bytes / sizeof(uint64_t);
-  uint64_t base_offset = warp_id * num_uint64s_per_warp;
+  uint32_t page_size = write_array.cache_state.page_size;
+  uint64_t warp_base = (uint64_t)warp_id * warp_bytes;
 
   for (uint32_t iter = 0; iter < iterations; iter++) {
-    uint64_t pattern = (((uint64_t)warp_id << 32) | iter);
+    uint32_t pat_lo = iter;
+    uint32_t pat_hi = warp_id;
 
-    // Write: all lanes cooperatively write to write_array through cache
-    for (uint64_t i = lane_id; i < num_uint64s_per_warp; i += 32) {
-      write_array.write(base_offset + i, pattern);
-    }
-    __syncwarp();
+    // === WRITE: iterate over pages in this warp's slice ===
+    for (uint64_t page_off = warp_base; page_off < warp_base + warp_bytes;
+         page_off += page_size) {
+      uint64_t bytes_left = (warp_base + warp_bytes) - page_off;
+      uint32_t this_page = (bytes_left < page_size) ? (uint32_t)bytes_left : page_size;
+      uint32_t this_uint4s = this_page / sizeof(uint4);
 
-    // Read: all lanes cooperatively read from write_array through cache
-    for (uint64_t i = lane_id; i < num_uint64s_per_warp; i += 32) {
-      uint64_t value = write_array.read(base_offset + i);
-      // Store in read_array (simulate round-trip)
-      read_array.write(base_offset + i, value);
-    }
-    __syncwarp();
+      // Acquire page — 1 atomicCAS per page, broadcast to all lanes
+      bool needs_load;
+      uint8_t *page = bam::warp_page_cache_acquire(
+          write_array.cache_state, page_off, &needs_load);
 
-    // Optional validation
-    if (validate) {
-      for (uint64_t i = lane_id; i < num_uint64s_per_warp; i += 32) {
-        uint64_t got = read_array.read(base_offset + i);
-        if (got != pattern) {
-          atomicAdd(d_errors, 1);
-        }
+      if (needs_load) {
+        bam::warp_host_read_page(page, write_array.host_base,
+                                  page_off, page_size);
+        bam::warp_page_cache_finish_load(write_array.cache_state, page_off);
+      }
+
+      // All 32 lanes write pattern into HBM cached page (coalesced uint4)
+      uint4 pat4;
+      pat4.x = pat_lo; pat4.y = pat_hi; pat4.z = pat_lo; pat4.w = pat_hi;
+      for (uint32_t i = lane_id; i < this_uint4s; i += 32) {
+        reinterpret_cast<uint4 *>(page)[i] = pat4;
       }
       __syncwarp();
+
+      // Mark dirty — NO flush to DRAM (deferred, like GIDS bam_ptr)
+      if (lane_id == 0) {
+        bam::page_cache_mark_dirty(write_array.cache_state, page_off);
+      }
+      __syncwarp();
+    }
+
+    // === READ: iterate over pages, copy from write cache to read cache ===
+    for (uint64_t page_off = warp_base; page_off < warp_base + warp_bytes;
+         page_off += page_size) {
+      uint64_t bytes_left = (warp_base + warp_bytes) - page_off;
+      uint32_t this_page = (bytes_left < page_size) ? (uint32_t)bytes_left : page_size;
+      uint32_t this_uint4s = this_page / sizeof(uint4);
+
+      // Acquire write_array page (cache hit — just wrote it)
+      bool needs_load_w;
+      uint8_t *w_page = bam::warp_page_cache_acquire(
+          write_array.cache_state, page_off, &needs_load_w);
+      if (needs_load_w) {
+        bam::warp_host_read_page(w_page, write_array.host_base,
+                                  page_off, page_size);
+        bam::warp_page_cache_finish_load(write_array.cache_state, page_off);
+      }
+
+      // Acquire read_array page
+      bool needs_load_r;
+      uint8_t *r_page = bam::warp_page_cache_acquire(
+          read_array.cache_state, page_off, &needs_load_r);
+      if (needs_load_r) {
+        bam::warp_host_read_page(r_page, read_array.host_base,
+                                  page_off, page_size);
+        bam::warp_page_cache_finish_load(read_array.cache_state, page_off);
+      }
+
+      // All 32 lanes copy HBM→HBM (coalesced uint4)
+      for (uint32_t i = lane_id; i < this_uint4s; i += 32) {
+        reinterpret_cast<uint4 *>(r_page)[i] =
+            reinterpret_cast<const uint4 *>(w_page)[i];
+      }
+      __syncwarp();
+
+      // Mark dirty — no flush
+      if (lane_id == 0) {
+        bam::page_cache_mark_dirty(read_array.cache_state, page_off);
+      }
+      __syncwarp();
+    }
+
+    // Optional validation (reads from HBM cache, no DRAM round-trip)
+    if (validate) {
+      for (uint64_t page_off = warp_base; page_off < warp_base + warp_bytes;
+           page_off += page_size) {
+        uint64_t bytes_left = (warp_base + warp_bytes) - page_off;
+        uint32_t this_page = (bytes_left < page_size) ? (uint32_t)bytes_left : page_size;
+        uint32_t this_uint4s = this_page / sizeof(uint4);
+
+        bool needs_load;
+        uint8_t *r_page = bam::warp_page_cache_acquire(
+            read_array.cache_state, page_off, &needs_load);
+        if (needs_load) {
+          bam::warp_host_read_page(r_page, read_array.host_base,
+                                    page_off, page_size);
+          bam::warp_page_cache_finish_load(read_array.cache_state, page_off);
+        }
+
+        uint4 pat4;
+        pat4.x = pat_lo; pat4.y = pat_hi; pat4.z = pat_lo; pat4.w = pat_hi;
+        for (uint32_t i = lane_id; i < this_uint4s; i += 32) {
+          uint4 got = reinterpret_cast<const uint4 *>(r_page)[i];
+          if (got.x != pat4.x || got.y != pat4.y ||
+              got.z != pat4.z || got.w != pat4.w) {
+            atomicAdd(d_errors, 1);
+          }
+        }
+        __syncwarp();
+      }
     }
   }
 }
@@ -472,31 +564,32 @@ int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
 
 #ifdef WRP_CORE_ENABLE_BAM
   else if (m == "bam") {
-    // ======== BaM: warp_page_cache_acquire ========
+    // ======== BaM: warp-cooperative page cache (GIDS-style) ========
 
     uint64_t fb_aligned = ((total_bytes + cfg.bam_page_size - 1) / cfg.bam_page_size) * cfg.bam_page_size;
-    uint32_t matched_pages = (uint32_t)(fb_aligned / cfg.bam_page_size);
+    uint32_t total_pages = (uint32_t)(fb_aligned / cfg.bam_page_size);
+    uint32_t cache_pages = std::max(1u, total_pages * cfg.hbm_cache_pct / 100);
 
     bam::PageCacheConfig pcfg;
     pcfg.page_size = cfg.bam_page_size;
-    pcfg.num_pages = matched_pages;
+    pcfg.num_pages = cache_pages;
     pcfg.num_queues = 0;
     pcfg.queue_depth = 0;
     pcfg.backend = bam::BackendType::kHostMemory;
     pcfg.nvme_dev = nullptr;
 
     bam::PageCache cache(pcfg);
-    bam::Array<uint64_t> write_array(total_bytes / sizeof(uint64_t), cache);
-    bam::Array<uint64_t> read_array(total_bytes / sizeof(uint64_t), cache);
+    bam::Array<char> write_array(total_bytes, cache);
+    bam::Array<char> read_array(total_bytes, cache);
 
     // Initialize arrays
-    std::vector<uint64_t> init_data(total_bytes / sizeof(uint64_t), 0);
+    std::vector<char> init_data(total_bytes, 0);
     write_array.load_from_host(init_data.data(), init_data.size());
     read_array.load_from_host(init_data.data(), init_data.size());
 
-    HIPRINT("  BaM HBM cache: {} pages x {} B = {:.1f} MB",
-            matched_pages, cfg.bam_page_size,
-            (double)matched_pages * cfg.bam_page_size / (1024.0 * 1024.0));
+    HIPRINT("  BaM HBM cache: {} / {} pages ({}%) x {} B = {:.1f} MB",
+            cache_pages, total_pages, cfg.hbm_cache_pct, cfg.bam_page_size,
+            (double)cache_pages * cfg.bam_page_size / (1024.0 * 1024.0));
 
     int *d_errors;
     cudaMallocHost(&d_errors, sizeof(int));

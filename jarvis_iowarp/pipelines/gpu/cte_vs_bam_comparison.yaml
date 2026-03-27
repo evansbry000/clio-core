@@ -1,21 +1,28 @@
 # CTE vs BaM GPU Benchmark Comparison
 #
-# Compares IOWarp CTE GPU data path against BaM page cache across:
-#   1. I/O sizes:   4k .. 16m
-#   2. Warp counts:  1 .. 32 warps (via client_blocks)
-#   3. Test cases:
-#      - bdev_read_write  : Raw bdev read/write (CTE storage layer only)
-#      - putblob_gpu      : Full CTE PutBlob path (GPU runtime)
-#      - putget_gpu       : Full CTE PutBlob + GetBlob roundtrip
-#      - bam_read         : BaM page cache read (DRAM -> HBM)
-#      - bam_write        : BaM page cache write (HBM -> DRAM)
-#      - cudamemcpy       : cudaMemcpyAsync baseline (PCIe ceiling)
-#      - direct           : GPU kernel direct pinned memory access
+# Compares IOWarp CTE against BaM across all workloads and modes:
+#
+# Workloads:
+#   synthetic    -- Pure I/O (put+get round-trip)
+#   pagerank     -- Graph analytics (edge-centric push)
+#   gnn          -- GNN neighbor feature gather
+#   gray_scott   -- 3D stencil simulation with checkpoint I/O
+#   llm_kvcache  -- LLM KV cache offload/restore
+#
+# Modes (workload_mode):
+#   cte    -- CTE AsyncPutBlob/AsyncGetBlob (GPU-local)
+#   bam    -- BaM warp-cooperative page cache (GIDS-style)
+#
+# HBM cache ratio (--hbm-cache):
+#   100 -- All data in HBM
+#   50  -- Half in HBM, half spills to pinned DRAM
+#   20  -- 20% in HBM, rest in DRAM
+#
+# Fixed: client_blocks=64, rt_blocks=16
 #
 # Requirements:
-#   - wrp_cte_gpu_bench in PATH
+#   - wrp_cte_gpu_bench in PATH (built with -DWRP_CORE_ENABLE_BAM=ON)
 #   - CUDA-capable GPU
-#   - BaM tests require -DWRP_CORE_ENABLE_BAM=ON
 #
 # Usage:
 #   jarvis pipeline test gpu/cte_vs_bam_comparison.yaml
@@ -25,41 +32,43 @@ config:
   pkgs:
     - pkg_type: jarvis_iowarp.wrp_cte_gpu_bench
       pkg_name: bench
-      test_case: "bdev_read_write"
-      client_blocks: 1
+      test_case: "synthetic"
+      workload_mode: "cte"
+      routing: "local"
+      client_blocks: 64
       client_threads: 32
-      rt_blocks: 1
+      rt_blocks: 16
       rt_threads: 32
       io_size: "128k"
-      iterations: 16
-      bdev_type: "hbm"
+      iterations: 64
+      hbm_cache: 100
       timeout: 120
 
 vars:
-  # --- Test cases to compare ---
-  # CTE paths vs BaM vs baselines
+  # --- Workloads ---
   bench.test_case:
-    - "bdev_read_write"
-    - "putblob_gpu"
-    - "putget_gpu"
-    - "bam_read"
-    - "bam_write"
-    - "cudamemcpy"
-    - "direct"
+    - "synthetic"
+    - "pagerank"
+    # - "gnn"
+    - "gray_scott"
+    - "llm_kvcache"
 
-  # --- I/O sizes (with iterations scaled to ~256MB total per warp) ---
-  bench.io_size:    ["4k",   "64k",  "256k", "1m",  "4m",  "16m"]
-  bench.iterations: [65536,  4096,   1024,   256,   64,    16   ]
+  # --- Modes: CTE (Local), CTE (ToLocalCpu), BaM ---
+  bench.workload_mode: ["cte",   "cte",    "bam"]
+  bench.routing:       ["local", "to_cpu", "local"]
 
-  # --- Warp scaling (client_blocks x 32 threads = warps) ---
-  # rt_blocks matches client_blocks for CTE paths
-  bench.client_blocks: [1, 4, 8, 16, 32]
-  bench.rt_blocks:     [1, 4, 8, 16, 32]
+  # --- I/O sizes (with iterations scaled to keep total work reasonable) ---
+  bench.io_size:    ["16k",  "128k", "16m"]
+  bench.iterations: [256,    64,     64   ]
+
+  # --- HBM cache ratio (unified for both CTE and BaM) ---
+  bench.hbm_cache: [100, 50, 20]
 
 loop:
   - [bench.test_case]
+  - [bench.workload_mode, bench.routing]
   - [bench.io_size, bench.iterations]
-  - [bench.client_blocks, bench.rt_blocks]
+  - [bench.hbm_cache]
 
 repeat: 3
 output: "${HOME}/cte_vs_bam_results"

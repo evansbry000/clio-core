@@ -45,14 +45,14 @@ struct WorkloadConfig {
   bool validate = false;
   std::string routing = "local";  // "local" or "to_cpu"
 
-  // BaM config
-  uint64_t bam_page_size = 65536;
-  uint32_t bam_cache_pages = 512;
+  // HBM cache ratio (0-100): controls both CTE bdev_type and BaM cache size
+  // 100 = all data in HBM; < 100 = spill to pinned DRAM
+  uint32_t hbm_cache_pct = 100;
+  uint64_t bam_page_size = 65536;  // BaM internal page size (not user-facing)
 
   // CTE config (set by main driver after Chimaera init)
   chi::PoolId cte_pool_id;
   wrp_cte::core::TagId tag_id;
-  std::string bdev_type = "pinned";
 
   // Workload-specific parameters (encoded as key=value strings)
   // Parsed by each workload's run function
@@ -95,6 +95,14 @@ int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode,
 
 int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
                             WorkloadResult *result);
+
+// CTE client overhead benchmark — measures AsyncPutBlob submission cost
+int run_cte_client_overhead(chi::PoolId cte_pool_id, wrp_cte::core::TagId tag_id,
+                            uint32_t rt_blocks, uint32_t rt_threads,
+                            uint32_t client_blocks, uint32_t client_threads,
+                            uint64_t warp_bytes, uint32_t iterations,
+                            bool to_cpu, int timeout_sec,
+                            float *out_elapsed_ms, float *out_avg_submit_us);
 
 #endif  // HSHM_IS_HOST
 #endif  // BENCH_GPU_WORKLOAD_H

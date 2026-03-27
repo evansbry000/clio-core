@@ -1,26 +1,32 @@
 """
 CTE GPU Benchmark Package
 
-Benchmarks GPU-initiated PutBlob operations through the Content Transfer
-Engine (CTE).  wrp_cte_gpu_bench is self-contained: it starts its own
-Chimaera runtime internally, so no wrp_runtime package is needed.
+Benchmarks GPU-initiated I/O operations through the Content Transfer
+Engine (CTE) and compares against BaM page cache and baselines.
+wrp_cte_gpu_bench is self-contained: it starts its own Chimaera runtime
+internally, so no wrp_runtime package is needed.
 
 Supported test cases:
-  putblob      -- GPU client -> CTE via GPU->CPU path (ToLocalCpu)
-  putblob_gpu  -- GPU client -> CTE via GPU-local path (Local)
-  direct       -- GPU kernel writes directly to pinned host memory (baseline)
-  cudamemcpy   -- cudaMemcpyAsync baseline (theoretical PCIe max)
-  alloc_test   -- Multi-block ThreadAllocator stress test
+  client_overhead      -- Measure AsyncPutBlob GPU-side submit cost (Local)
+  client_overhead_cpu  -- Same but via ToLocalCpu routing
+  synthetic            -- Synthetic I/O (modes: hbm, direct, bam, cte)
+  pagerank             -- PageRank workload
+  gnn                  -- GNN feature gather workload
+  gray_scott           -- Gray-Scott stencil simulation
+  llm_kvcache          -- LLM KV cache offloading
 
 Parameters:
-- test_case:      Benchmark mode (putblob, putblob_gpu, direct, cudamemcpy, alloc_test)
+- test_case:      Benchmark workload
+- workload_mode:  I/O mode (hbm, direct, bam, cte)
+- routing:        CTE task routing (local, to_cpu)
 - rt_blocks:      GPU runtime orchestrator block count
 - rt_threads:     GPU runtime orchestrator threads per block
 - client_blocks:  GPU client kernel blocks
 - client_threads: GPU client kernel threads per block
 - io_size:        Per-warp I/O size (supports k/m/g suffixes)
 - iterations:     Number of iterations per warp
-- output_dir:     Directory for benchmark result files
+- hbm_cache:      HBM cache ratio 0-100 (controls CTE bdev and BaM cache)
+- timeout:        PollDone timeout in seconds
 
 Assumes wrp_cte_gpu_bench is installed and available in PATH.
 """
@@ -38,8 +44,8 @@ class WrpCteGpuBench(Application):
     """
     CTE GPU Bandwidth Benchmark
 
-    Runs wrp_cte_gpu_bench to measure GPU-initiated CTE PutBlob throughput.
-    The benchmark is self-contained and starts its own Chimaera runtime.
+    Runs wrp_cte_gpu_bench to measure GPU-initiated CTE throughput
+    and compare against BaM page cache and baselines.
     """
 
     def _init(self):
@@ -49,15 +55,28 @@ class WrpCteGpuBench(Application):
         return [
             {
                 'name': 'test_case',
-                'msg': 'Benchmark test case',
+                'msg': 'Benchmark workload',
                 'type': str,
                 'choices': [
-                    'putblob', 'putblob_gpu', 'putget_gpu',
-                    'direct', 'cudamemcpy', 'managed',
-                    'alloc_test', 'bdev_alloc_free', 'bdev_read_write',
-                    'bam_read', 'bam_write',
+                    'client_overhead', 'client_overhead_cpu',
+                    'synthetic', 'pagerank', 'gnn',
+                    'gray_scott', 'llm_kvcache',
                 ],
-                'default': 'putblob_gpu',
+                'default': 'synthetic',
+            },
+            {
+                'name': 'workload_mode',
+                'msg': 'I/O mode (hbm, direct, bam, cte)',
+                'type': str,
+                'choices': ['hbm', 'direct', 'bam', 'cte'],
+                'default': 'hbm',
+            },
+            {
+                'name': 'routing',
+                'msg': 'CTE task routing (local or to_cpu)',
+                'type': str,
+                'choices': ['local', 'to_cpu'],
+                'default': 'local',
             },
             {
                 'name': 'rt_blocks',
@@ -96,11 +115,10 @@ class WrpCteGpuBench(Application):
                 'default': 16,
             },
             {
-                'name': 'bdev_type',
-                'msg': 'Storage backend type',
-                'type': str,
-                'choices': ['pinned', 'hbm', 'ram'],
-                'default': 'pinned',
+                'name': 'hbm_cache',
+                'msg': 'HBM cache ratio 0-100%',
+                'type': int,
+                'default': 100,
             },
             {
                 'name': 'timeout',
@@ -123,13 +141,15 @@ class WrpCteGpuBench(Application):
                  self.config['client_threads']) // 32
         self.log("CTE GPU benchmark configured")
         self.log(f"  Test case:      {self.config['test_case']}")
+        self.log(f"  Workload mode:  {self.config['workload_mode']}")
+        self.log(f"  Routing:        {self.config['routing']}")
         self.log(f"  RT config:      {self.config['rt_blocks']}b x "
                  f"{self.config['rt_threads']}t")
         self.log(f"  Client config:  {self.config['client_blocks']}b x "
                  f"{self.config['client_threads']}t ({warps} warps)")
         self.log(f"  IO/warp:        {self.config['io_size']}")
         self.log(f"  Iterations:     {self.config['iterations']}")
-        self.log(f"  Bdev type:      {self.config['bdev_type']}")
+        self.log(f"  HBM cache:      {self.config['hbm_cache']}%")
         self.log(f"  Timeout:        {self.config['timeout']}s")
 
     def _kill_stale_processes(self):
@@ -164,22 +184,32 @@ class WrpCteGpuBench(Application):
 
         Which('wrp_cte_gpu_bench', LocalExecInfo(env=self.mod_env)).run()
 
+        tc = self.config['test_case']
         output_file = os.path.join(
             self.config['output_dir'],
-            f"cte_gpu_{self.config['test_case']}.txt")
+            f"cte_gpu_{tc}.txt")
 
-        cmd = ' '.join([
+        # Build command with all parameters
+        cmd_parts = [
             'wrp_cte_gpu_bench',
-            f'--test-case {self.config["test_case"]}',
+            f'--test-case {tc}',
             f'--rt-blocks {self.config["rt_blocks"]}',
             f'--rt-threads {self.config["rt_threads"]}',
             f'--client-blocks {self.config["client_blocks"]}',
             f'--client-threads {self.config["client_threads"]}',
             f'--io-size {self.config["io_size"]}',
             f'--iterations {self.config["iterations"]}',
-            f'--bdev-type {self.config["bdev_type"]}',
+            f'--hbm-cache {self.config["hbm_cache"]}',
             f'--timeout {self.config["timeout"]}',
-        ])
+        ]
+
+        # Add workload-mode and routing for workload test cases
+        if tc in ('synthetic', 'pagerank', 'gnn', 'gray_scott', 'llm_kvcache'):
+            cmd_parts.append(
+                f'--workload-mode {self.config["workload_mode"]}')
+            cmd_parts.append(f'--routing {self.config["routing"]}')
+
+        cmd = ' '.join(cmd_parts)
 
         self.log(f"Running: {cmd}")
         self.exec = Exec(f'{cmd} 2>&1 | tee {output_file}',
@@ -191,33 +221,46 @@ class WrpCteGpuBench(Application):
         output = self.exec.stdout['localhost']
         pid = self.pkg_id
 
-        # Single-bandwidth tests (putblob_gpu, putget_gpu, direct, etc.)
-        bandwidth = re.search(r'Bandwidth:\s+([0-9.]+)\s+GB/s', output)
-        if bandwidth:
-            stat_dict[f'{pid}.bandwidth_gbps'] = float(bandwidth.group(1))
+        # --- Capture all package config variables ---
+        stat_dict[f'{pid}.test_case'] = self.config['test_case']
+        stat_dict[f'{pid}.workload_mode'] = self.config['workload_mode']
+        stat_dict[f'{pid}.routing'] = self.config['routing']
+        stat_dict[f'{pid}.rt_blocks'] = self.config['rt_blocks']
+        stat_dict[f'{pid}.rt_threads'] = self.config['rt_threads']
+        stat_dict[f'{pid}.client_blocks'] = self.config['client_blocks']
+        stat_dict[f'{pid}.client_threads'] = self.config['client_threads']
+        stat_dict[f'{pid}.io_size'] = self.config['io_size']
+        stat_dict[f'{pid}.iterations'] = self.config['iterations']
+        stat_dict[f'{pid}.hbm_cache'] = self.config['hbm_cache']
+        stat_dict[f'{pid}.warps'] = (
+            self.config['client_blocks'] * self.config['client_threads']) // 32
 
-        # Dual-bandwidth tests (bdev_read_write)
-        write_bw = re.search(r'Write:\s+[0-9.]+\s+ms\s+\(([0-9.]+)\s+GB/s\)', output)
-        read_bw = re.search(r'Read:\s+[0-9.]+\s+ms\s+\(([0-9.]+)\s+GB/s\)', output)
-        if write_bw:
-            stat_dict[f'{pid}.write_gbps'] = float(write_bw.group(1))
-        if read_bw:
-            stat_dict[f'{pid}.read_gbps'] = float(read_bw.group(1))
-        # For dual-bandwidth tests, use average as the unified bandwidth
-        if write_bw and read_bw and not bandwidth:
-            stat_dict[f'{pid}.bandwidth_gbps'] = (
-                float(write_bw.group(1)) + float(read_bw.group(1))) / 2.0
+        # --- Parse benchmark output ---
 
         # Elapsed time
-        elapsed = re.search(r'(?:Total )?[Ee]lapsed:\s+([0-9.]+)\s+ms', output)
+        elapsed = re.search(
+            r'(?:Wall )?[Ee]lapsed:\s+([0-9.]+)\s*ms', output)
         if elapsed:
             stat_dict[f'{pid}.elapsed_ms'] = float(elapsed.group(1))
 
-        stat_dict[f'{pid}.test_case'] = self.config['test_case']
-        stat_dict[f'{pid}.warps'] = (
-            self.config['client_blocks'] * self.config['client_threads']) // 32
-        stat_dict[f'{pid}.io_size'] = self.config['io_size']
-        stat_dict[f'{pid}.bdev_type'] = self.config['bdev_type']
+        # Bandwidth
+        bandwidth = re.search(
+            r'Bandwidth:\s+([0-9.]+)\s+GB/s', output)
+        if bandwidth:
+            stat_dict[f'{pid}.bandwidth_gbps'] = float(bandwidth.group(1))
+
+        # Client overhead (submit cost)
+        submit_cost = re.search(
+            r'Avg submit cost:\s+([0-9.]+)\s+us/call', output)
+        if submit_cost:
+            stat_dict[f'{pid}.submit_us'] = float(submit_cost.group(1))
+
+        # Workload-specific metric (e.g., putgets/sec, edges/sec, tokens/sec)
+        metric_match = re.search(
+            r'^(\S+/sec\S*)\s+([0-9.eE+-]+)', output, re.MULTILINE)
+        if metric_match:
+            stat_dict[f'{pid}.metric_name'] = metric_match.group(1)
+            stat_dict[f'{pid}.metric_value'] = float(metric_match.group(2))
 
     @staticmethod
     def _io_sort_key(s):
@@ -231,93 +274,109 @@ class WrpCteGpuBench(Application):
         mult = {'': 1, 'k': 1024, 'm': 1024**2, 'g': 1024**3, 't': 1024**4}
         return val * mult.get(suffix, 1)
 
-    def _plot(self, results_csv, output_dir):
+    def _plot(self, results_yaml, output_dir):
         try:
+            import yaml as _yaml
             import pandas as pd
             import matplotlib
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
         except ImportError:
-            self.log("Skipping plots: pandas or matplotlib not installed")
+            self.log("Skipping plots: pandas, pyyaml, or matplotlib not installed")
             return
 
-        df = pd.read_csv(results_csv)
+        # Load results from YAML
+        with open(results_yaml, 'r') as f:
+            data = _yaml.safe_load(f)
+
+        if not data or 'results' not in data:
+            return
+
+        # Flatten each result into a single row: variables + stats
+        rows = []
+        for result in data['results']:
+            row = {}
+            row.update(result.get('variables', {}))
+            row.update(result.get('stats', {}))
+            row['status'] = result.get('status', 'unknown')
+            row['runtime'] = result.get('runtime', None)
+            rows.append(row)
+
+        if not rows:
+            return
+
+        df = pd.DataFrame(rows)
 
         # Find columns for this package
-        bw_col = tc_col = warps_col = io_col = None
-        for col in df.columns:
-            if col.endswith('.bandwidth_gbps'):
-                bw_col = col
-            elif col.endswith('.test_case'):
-                tc_col = col
-            elif col.endswith('.warps'):
-                warps_col = col
-            elif col.endswith('.io_size'):
-                io_col = col
+        pid = self.pkg_id
+        bw_col = f'{pid}.bandwidth_gbps'
+        tc_col = f'{pid}.test_case'
+        mode_col = f'{pid}.workload_mode'
+        routing_col = f'{pid}.routing'
+        io_col = f'{pid}.io_size'
+        cache_col = f'{pid}.hbm_cache'
 
-        if not bw_col:
+        if bw_col not in df.columns:
             return
 
-        # --- Plot 1: Bandwidth vs I/O size, grouped by test case ---
-        if tc_col and io_col and len(df[io_col].dropna().unique()) > 1:
+        # Build a combined mode label: "cte_local", "cte_to_cpu", "bam", etc.
+        if mode_col in df.columns and routing_col in df.columns:
+            df['_mode_label'] = df.apply(
+                lambda r: f"{r[mode_col]}_{r[routing_col]}"
+                if r[mode_col] == 'cte' else str(r[mode_col]),
+                axis=1)
+        elif mode_col in df.columns:
+            df['_mode_label'] = df[mode_col]
+        else:
+            df['_mode_label'] = 'unknown'
+
+        # --- Plot 1: Bandwidth vs I/O size, grouped by mode ---
+        if io_col in df.columns and len(df[io_col].dropna().unique()) > 1:
             fig, ax = plt.subplots(figsize=(10, 6))
-            pivot = df.groupby([io_col, tc_col])[bw_col].mean().unstack()
-            # Sort I/O sizes numerically
+            pivot = df.groupby([io_col, '_mode_label'])[bw_col].mean().unstack()
             pivot = pivot.reindex(
                 sorted(pivot.index, key=self._io_sort_key))
             pivot.plot(kind='bar', ax=ax)
             ax.set_xlabel('I/O Size per Warp')
             ax.set_ylabel('Bandwidth (GB/s)')
-            ax.set_title('CTE vs BaM: Bandwidth by I/O Size')
-            ax.legend(title='Test Case', bbox_to_anchor=(1.02, 1),
+            ax.set_title('Bandwidth by I/O Size and Mode')
+            ax.legend(title='Mode', bbox_to_anchor=(1.02, 1),
                       loc='upper left', fontsize=8)
             fig.tight_layout()
             fig.savefig(os.path.join(output_dir,
-                                     'bandwidth_vs_iosize_by_testcase.png'),
+                                     'bandwidth_vs_iosize_by_mode.png'),
                         dpi=150)
             plt.close(fig)
 
-        # --- Plot 2: Bandwidth vs warp count, grouped by test case ---
-        if tc_col and warps_col and len(df[warps_col].dropna().unique()) > 1:
+        # --- Plot 2: Bandwidth vs HBM cache ratio, grouped by mode ---
+        if cache_col in df.columns and len(df[cache_col].dropna().unique()) > 1:
             fig, ax = plt.subplots(figsize=(10, 6))
-            pivot = df.groupby([warps_col, tc_col])[bw_col].mean().unstack()
+            pivot = df.groupby([cache_col, '_mode_label'])[bw_col].mean().unstack()
             pivot.plot(kind='bar', ax=ax)
-            ax.set_xlabel('Warp Count')
+            ax.set_xlabel('HBM Cache (%)')
             ax.set_ylabel('Bandwidth (GB/s)')
-            ax.set_title('CTE vs BaM: Bandwidth Scaling by Warps')
-            ax.legend(title='Test Case', bbox_to_anchor=(1.02, 1),
+            ax.set_title('Bandwidth by HBM Cache Ratio and Mode')
+            ax.legend(title='Mode', bbox_to_anchor=(1.02, 1),
                       loc='upper left', fontsize=8)
             fig.tight_layout()
             fig.savefig(os.path.join(output_dir,
-                                     'bandwidth_vs_warps_by_testcase.png'),
+                                     'bandwidth_vs_hbm_cache_by_mode.png'),
                         dpi=150)
             plt.close(fig)
 
-        # --- Plot 3: Simple bandwidth vs warps (single test case runs) ---
-        if warps_col and len(df[warps_col].dropna().unique()) > 1:
-            fig, ax = plt.subplots(figsize=(8, 5))
-            grouped = df.groupby(warps_col)[bw_col].mean()
-            grouped.plot(kind='bar', ax=ax)
-            ax.set_xlabel('Warps')
+        # --- Plot 3: Bandwidth vs workload, grouped by mode ---
+        if tc_col in df.columns and len(df[tc_col].dropna().unique()) > 1:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            pivot = df.groupby([tc_col, '_mode_label'])[bw_col].mean().unstack()
+            pivot.plot(kind='bar', ax=ax)
+            ax.set_xlabel('Workload')
             ax.set_ylabel('Bandwidth (GB/s)')
-            ax.set_title('GPU Bandwidth vs Warp Count')
+            ax.set_title('Bandwidth by Workload and Mode')
+            ax.legend(title='Mode', bbox_to_anchor=(1.02, 1),
+                      loc='upper left', fontsize=8)
             fig.tight_layout()
-            fig.savefig(os.path.join(output_dir, 'bandwidth_vs_warps.png'),
-                        dpi=150)
-            plt.close(fig)
-
-        # --- Plot 4: Simple bandwidth vs IO size (single test case runs) ---
-        if io_col and len(df[io_col].dropna().unique()) > 1:
-            fig, ax = plt.subplots(figsize=(8, 5))
-            grouped = df.groupby(io_col)[bw_col].mean()
-            grouped = grouped.reindex(
-                sorted(grouped.index, key=self._io_sort_key))
-            grouped.plot(kind='bar', ax=ax)
-            ax.set_xlabel('I/O Size per Warp')
-            ax.set_ylabel('Bandwidth (GB/s)')
-            ax.set_title('CTE GPU Bandwidth vs I/O Size')
-            fig.tight_layout()
-            fig.savefig(os.path.join(output_dir, 'bandwidth_vs_iosize.png'),
+            fig.savefig(os.path.join(output_dir,
+                                     'bandwidth_vs_workload_by_mode.png'),
                         dpi=150)
             plt.close(fig)
 

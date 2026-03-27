@@ -69,6 +69,8 @@ if(WRP_CORE_ENABLE_CUDA)
 
   add_cuda_executable(wrp_cte_gpu_bench TRUE
       wrp_cte_gpu_bench.cc
+      gpu/workload_cte_client_overhead.cc
+      gpu/workload_bdev.cc
       gpu/workload_pagerank.cc
       gpu/workload_gnn.cc
       gpu/workload_gray_scott.cc
