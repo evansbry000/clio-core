@@ -291,13 +291,27 @@ static void gs_init(float *u, float *v, int L) {
 
 int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
                             WorkloadResult *result) {
+  // Scale grid_size so that per-warp field data ≈ warp_bytes.
+  // Each warp stores 4 fields (u, v, u2, v2) × (total/total_warps) floats.
+  // Per-warp bytes = (L^3 / warps) * 4 * sizeof(float).
+  // Solve for L: L^3 = warps * warp_bytes / (4 * sizeof(float))
+  uint32_t est_warps = (cfg.client_blocks * cfg.client_threads) / 32;
+  if (est_warps == 0) est_warps = 1;
   int L = cfg.param_grid_size;
+  if (cfg.warp_bytes > 0) {
+    double target_total = (double)est_warps * cfg.warp_bytes / (4.0 * sizeof(float));
+    int target_L = (int)cbrt(target_total);
+    if (target_L < 4) target_L = 4;
+    L = target_L;
+  }
   int steps = cfg.param_steps;
-  uint32_t total = L*L*L;
+  uint32_t total = (uint32_t)L*L*L;
   size_t fb = total * sizeof(float);
   GSParams params;
   int threads = 256, blocks = (total+threads-1)/threads;
   std::string m(mode);
+
+  HIPRINT("  Gray-Scott: L={} ({} points), {} steps", L, total, steps);
 
   if (m == "cte") {
     // ======== CTE: Combined kernel with multi-warp I/O + compute ========
