@@ -292,16 +292,22 @@ static void gs_init(float *u, float *v, int L) {
 int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
                             WorkloadResult *result) {
   // Scale grid_size so that per-warp field data ≈ warp_bytes.
-  // Each warp stores 4 fields (u, v, u2, v2) × (total/total_warps) floats.
-  // Per-warp bytes = (L^3 / warps) * 4 * sizeof(float).
+  // Each warp stores 4 fields (u, v, u2, v2) × (L^3/warps) floats.
+  // Per-warp bytes = (L^3 / warps) * 4 * sizeof(float) ≈ warp_bytes.
   // Solve for L: L^3 = warps * warp_bytes / (4 * sizeof(float))
   uint32_t est_warps = (cfg.client_blocks * cfg.client_threads) / 32;
   if (est_warps == 0) est_warps = 1;
   int L = cfg.param_grid_size;
   if (cfg.warp_bytes > 0) {
+    // Per-warp data = L^3/warps * 4 fields * 4 bytes = warp_bytes
+    // L^3 = warps * warp_bytes / 16
     double target_total = (double)est_warps * cfg.warp_bytes / (4.0 * sizeof(float));
     int target_L = (int)cbrt(target_total);
     if (target_L < 4) target_L = 4;
+    // Cap to avoid OOM: total field data = L^3 * 4 * 4 bytes, keep under 32 MB
+    while ((double)target_L * target_L * target_L * 16.0 > 32.0 * 1024 * 1024 && target_L > 4) {
+      target_L--;
+    }
     L = target_L;
   }
   int steps = cfg.param_steps;
