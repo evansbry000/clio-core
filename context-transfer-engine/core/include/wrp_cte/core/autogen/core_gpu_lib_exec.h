@@ -123,8 +123,15 @@ HSHM_GPU_FUN chi::gpu::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> 
 HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
     chi::u32 method, chi::DefaultLoadArchive &archive) override;
 
+HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive) override;
+
 HSHM_GPU_FUN void LocalSaveTask(
     chi::u32 method, chi::DefaultSaveArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override;
+
+HSHM_GPU_FUN void LocalSaveTask(
+    chi::u32 method, chi::WrapSaveArchive &archive,
     const hipc::FullPtr<chi::Task> &task) override;
 
 HSHM_GPU_FUN void LocalLoadTaskOutput(

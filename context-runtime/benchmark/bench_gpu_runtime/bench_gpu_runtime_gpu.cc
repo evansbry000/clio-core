@@ -441,8 +441,8 @@ __global__ void gpu_bench_serde_kernel(
       hshm::lbm::LbmContext ctx;
       ctx.copy_space = fshm->copy_space;
       ctx.shm_info_ = &fshm->input_;
-      ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-      ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
+      { static __shared__ char s_meta[256]; ctx.meta_buf_ = s_meta; }
+      ctx.meta_buf_size_ = 256;
       ctx.warp_parallel_ = true;
       hshm::lbm::ShmTransport::SendDevice(mgr->save_ar_, ctx);
     }
@@ -473,8 +473,8 @@ __global__ void gpu_bench_serde_kernel(
       hshm::lbm::LbmContext out_ctx;
       out_ctx.copy_space = fshm->copy_space;
       out_ctx.shm_info_ = &fshm->output_;
-      out_ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-      out_ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
+      { static __shared__ char s_meta_out[256]; out_ctx.meta_buf_ = s_meta_out; }
+      out_ctx.meta_buf_size_ = 256;
       hshm::lbm::ShmTransport::SendDevice(out_save, out_ctx);
       hipc::threadfence();
       fshm->flags_.SetBits(chi::FutureShm::FUTURE_COMPLETE);
@@ -503,8 +503,8 @@ __global__ void gpu_bench_serde_kernel(
       hshm::lbm::LbmContext ctx;
       ctx.copy_space = fshm->copy_space;
       ctx.shm_info_ = &fshm->output_;
-      ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-      ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
+      { static __shared__ char s_meta[256]; ctx.meta_buf_ = s_meta; }
+      ctx.meta_buf_size_ = 256;
       ctx.warp_parallel_ = true;
       hshm::lbm::ShmTransport::RecvDevice(mgr->load_ar_, ctx);
     }
@@ -613,8 +613,8 @@ __global__ void gpu_bench_serde_kernel(
       hshm::lbm::LbmContext prep_ctx;
       prep_ctx.copy_space = fshm_sub->copy_space;
       prep_ctx.shm_info_ = &fshm_sub->input_;
-      prep_ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-      prep_ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
+      { static __shared__ char s_meta_prep[256]; prep_ctx.meta_buf_ = s_meta_prep; }
+      prep_ctx.meta_buf_size_ = 256;
       hshm::lbm::ShmTransport::SendDevice(mgr->save_ar_, prep_ctx);
       size_t written = fshm_sub->input_.total_written_.load();
 
@@ -640,8 +640,8 @@ __global__ void gpu_bench_serde_kernel(
         hshm::lbm::LbmContext ctx;
         ctx.copy_space = fshm_sub->copy_space;
         ctx.shm_info_ = &fshm_sub->input_;
-        ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-        ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
+        { static __shared__ char s_meta[256]; ctx.meta_buf_ = s_meta; }
+        ctx.meta_buf_size_ = 256;
 
         tc = clock64();
         hshm::lbm::ShmTransport::RecvDevice(mgr->load_ar_, ctx);

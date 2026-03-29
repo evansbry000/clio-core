@@ -100,6 +100,16 @@ class Container {
   }
 
   /**
+   * Allocate + deserialize from wrap_vector-backed archive (zero-copy GPU path).
+   * Task data is already in the FutureShm copy_space.
+   */
+  HSHM_GPU_FUN virtual hipc::FullPtr<Task> LocalAllocLoadTask(
+      u32 method, WrapLoadArchive &archive) {
+    (void)method; (void)archive;
+    return hipc::FullPtr<Task>::GetNull();
+  }
+
+  /**
    * Allocate + construct a task without deserializing (lane 0 only).
    * Used with LocalLoadTask for warp-parallel deserialization.
    */
@@ -126,6 +136,15 @@ class Container {
    */
   HSHM_GPU_FUN virtual void LocalSaveTask(
       u32 method, DefaultSaveArchive &archive,
+      const hipc::FullPtr<Task> &task) {
+    (void)method; (void)archive; (void)task;
+  }
+
+  /**
+   * Serialize task output via wrap_vector archive (zero-copy GPU path).
+   */
+  HSHM_GPU_FUN virtual void LocalSaveTask(
+      u32 method, WrapSaveArchive &archive,
       const hipc::FullPtr<Task> &task) {
     (void)method; (void)archive; (void)task;
   }

@@ -508,10 +508,9 @@ class Worker {
     long long _tc;
     auto *ipc = CHI_IPC;
 
-    // Phase 1 (lane 0): validate + set up LbmContext
+    // Phase 1 (lane 0): validate + read PreallocHeader
     int valid = 0;
-    unsigned long long ctx_cs = 0, ctx_si = 0, ctx_mb = 0;
-    unsigned long long load_ar_ull = 0;
+    PreallocHeader hdr;
 
     if (lane_id == 0) {
       auto *priv_alloc = CHI_PRIV_ALLOC;
@@ -523,60 +522,40 @@ class Worker {
         if (tw == 0 || tw > cs) {
           MarkComplete(fshm, is_gpu2gpu);
         } else {
-          char *mb = ipc->GetCachedMetaBuf();
-          if (!mb) {
-            MarkComplete(fshm, is_gpu2gpu);
-          } else {
-            ctx_cs = reinterpret_cast<unsigned long long>(fshm->copy_space);
-            ctx_si = reinterpret_cast<unsigned long long>(&fshm->input_);
-            ctx_mb = reinterpret_cast<unsigned long long>(mb);
-            load_ar_ull = reinterpret_cast<unsigned long long>(
-                ipc->GetLoadArchive());
-            valid = 1;
-          }
+          // Read PreallocHeader from copy_space
+          hshm::lbm::LbmContext in_ctx;
+          in_ctx.copy_space = fshm->copy_space;
+          in_ctx.shm_info_ = &fshm->input_;
+          hshm::lbm::ShmTransport::RecvDevicePrealloc(
+              reinterpret_cast<char*>(&hdr), sizeof(hdr), in_ctx);
+          valid = 1;
         }
       }
     }
 
-    // Broadcast
     valid = __shfl_sync(0xFFFFFFFF, valid, 0);
     if (!valid) return nullptr;
-    ctx_cs = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_cs, 0);
-    ctx_si = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_si, 0);
-    ctx_mb = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_mb, 0);
-    load_ar_ull = hipc::shfl_sync_u64(0xFFFFFFFF, load_ar_ull, 0);
 
-    // Phase 2 (all lanes): warp-parallel RecvDevice
     if (lane_id == 0) _tc = clock64();
-    auto *load_ar_ptr = reinterpret_cast<DefaultLoadArchive *>(load_ar_ull);
-    if (is_gpu2gpu) {
-      hshm::lbm::LbmContext in_ctx;
-      in_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
-      in_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
-      in_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
-      in_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
-      in_ctx.warp_parallel_ = true;
-      hshm::lbm::ShmTransport::RecvDevice(*load_ar_ptr, in_ctx);
-    } else if (lane_id == 0) {
-      hshm::lbm::LbmContext in_ctx;
-      in_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
-      in_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
-      in_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
-      in_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
-      hshm::lbm::ShmTransport::Recv(*load_ar_ptr, in_ctx);
-    }
-    __syncwarp();
-    if (lane_id == 0) {
-      prof_recv_device_ += clock64() - _tc;
-    }
 
-    // Phase 3 (lane 0): allocate task + deserialize + alloc context
+    // Phase 2 (lane 0): construct WrapLoadArchive pointing at task data
+    // in the client's copy_space (zero-copy — no memcpy needed)
     RunContext *result = nullptr;
     if (lane_id == 0) {
+      hipc::FullPtr<char> data_fp;
+      data_fp.ptr_ = fshm->copy_space + IpcManager::WarpIpcManager::kHeaderSize;
+      data_fp.shm_.alloc_id_.SetNull();
+      data_fp.shm_.off_ = reinterpret_cast<size_t>(data_fp.ptr_);
+      hshm::priv::wrap_vector recv_buf(data_fp, hdr.data_size);
+      recv_buf.resize(hdr.data_size);
+
+      WrapLoadArchive load_ar(recv_buf);
+      load_ar.SetMsgType(hdr.msg_type);
+      prof_recv_device_ += clock64() - _tc;
+
       _tc = clock64();
-      load_ar_ptr->SetMsgType(LocalMsgType::kSerializeIn);
       hipc::FullPtr<Task> task_ptr =
-          container->LocalAllocLoadTask(method_id, *load_ar_ptr);
+          container->LocalAllocLoadTask(method_id, load_ar);
       prof_alloc_task_ += clock64() - _tc;
 
       if (task_ptr.IsNull()) {
@@ -737,49 +716,48 @@ class Worker {
     long long _tc;
     auto *ipc = CHI_IPC;
 
-    // Phase 1 (lane 0): serialize task output + set up LbmContext
-    unsigned long long save_ar_ull = 0;
-    unsigned long long ctx_cs = 0, ctx_si = 0, ctx_mb = 0;
+    // Phase 1 (lane 0): serialize task output directly into copy_space
+    unsigned long long ctx_cs = 0, ctx_si = 0;
+    unsigned int data_size = 0;
 
     if (lane_id == 0) {
       _tc = clock64();
-      auto *save_ar_ptr = ipc->GetSaveArchive();
+      // Rebind buffer to CLIENT's copy_space and serialize output there
+      auto *mgr = ipc->GetWarpManager();
+      mgr->BindCopySpace(fshm->copy_space);
+      auto *save_ar_ptr = &mgr->save_ar_;
       save_ar_ptr->Reset(LocalMsgType::kSerializeOut);
       container->LocalSaveTask(method_id, *save_ar_ptr, task_ptr);
       prof_save_task_ += clock64() - _tc;
 
-      // SAC phase1 done
-      save_ar_ull = reinterpret_cast<unsigned long long>(save_ar_ptr);
       ctx_cs = reinterpret_cast<unsigned long long>(fshm->copy_space);
       ctx_si = reinterpret_cast<unsigned long long>(&fshm->output_);
-      ctx_mb = reinterpret_cast<unsigned long long>(ipc->GetCachedMetaBuf());
+      data_size = static_cast<unsigned int>(mgr->buffer_.size());
     }
 
-    // Broadcast for warp-parallel SendDevice
-    save_ar_ull = hipc::shfl_sync_u64(0xFFFFFFFF, save_ar_ull, 0);
+    // Broadcast for SendDevicePrealloc
     ctx_cs = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_cs, 0);
     ctx_si = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_si, 0);
-    ctx_mb = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_mb, 0);
+    data_size = __shfl_sync(0xFFFFFFFF, data_size, 0);
 
-    // Phase 2 (all lanes): warp-parallel SendDevice
+    // Phase 2: Write PreallocHeader + mark ready
     if (lane_id == 0) _tc = clock64();
-    auto *save_ar_ptr = reinterpret_cast<DefaultSaveArchive *>(save_ar_ull);
-    // SAC entering SendDevice
     if (is_gpu2gpu) {
+      PreallocHeader hdr;
+      hdr.msg_type = LocalMsgType::kSerializeOut;
+      hdr.data_size = data_size;
       hshm::lbm::LbmContext out_ctx;
       out_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
       out_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
-      out_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
-      out_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
-      out_ctx.warp_parallel_ = true;
-      hshm::lbm::ShmTransport::SendDevice(*save_ar_ptr, out_ctx);
+      hshm::lbm::ShmTransport::SendDevicePrealloc(
+          reinterpret_cast<const char*>(&hdr), sizeof(hdr),
+          hdr.data_size, out_ctx);
     } else if (lane_id == 0) {
+      auto *mgr = ipc->GetWarpManager();
       hshm::lbm::LbmContext out_ctx;
       out_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
       out_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
-      out_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
-      out_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
-      hshm::lbm::ShmTransport::Send(*save_ar_ptr, out_ctx);
+      hshm::lbm::ShmTransport::Send(mgr->save_ar_, out_ctx);
     }
     __syncwarp();
     if (lane_id == 0) {

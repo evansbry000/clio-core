@@ -40,6 +40,7 @@
 
 // Include LocalSerialize for serialization
 #include <hermes_shm/data_structures/priv/vector.h>
+#include <hermes_shm/data_structures/priv/wrap_vector.h>
 #include <hermes_shm/data_structures/serialization/local_serialize.h>
 #include <hermes_shm/lightbeam/lightbeam.h>
 
@@ -700,6 +701,19 @@ class LocalLoadTaskArchive : public LocalLbmBase {
 /** Default archive type aliases using chi::priv::vector<char> buffer */
 using DefaultSaveArchive = LocalSaveTaskArchive<chi::priv::vector<char>>;
 using DefaultLoadArchive = LocalLoadTaskArchive<chi::priv::vector<char>>;
+
+/** Wrap-vector archive aliases for zero-copy GPU transport */
+using WrapSaveArchive = LocalSaveTaskArchive<hshm::priv::wrap_vector>;
+using WrapLoadArchive = LocalLoadTaskArchive<hshm::priv::wrap_vector>;
+
+/**
+ * Header for the preallocated copy_space transport (SendDevicePrealloc).
+ * Stored at copy_space[0..sizeof(PreallocHeader)). Task data follows.
+ */
+struct PreallocHeader {
+  LocalMsgType msg_type;
+  u32 data_size;  /**< Bytes of serialized task data after this header */
+};
 
 }  // namespace chi
 

@@ -684,9 +684,25 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
 
-    // --- Virtual override: LocalAllocLoadTask (alloc + deserialize) ---
+    // --- Virtual override: LocalAllocLoadTask (DefaultLoadArchive) ---
     oss << "HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(\n";
     oss << "    chi::u32 method, chi::DefaultLoadArchive &archive) override {\n";
+    if (!gpu_methods.empty()) {
+      oss << "  hipc::FullPtr<chi::Task> task = LocalAllocTask(method);\n";
+      oss << "  if (task.IsNull()) return task;\n";
+      oss << "  archive.SetMsgType(chi::LocalMsgType::kSerializeIn);\n";
+      oss << "  LoadTaskTmpl(method, archive, task);\n";
+      oss << "  return task;\n";
+    } else {
+      oss << "  (void)method; (void)archive;\n";
+      oss << "  return hipc::FullPtr<chi::Task>::GetNull();\n";
+    }
+    oss << "}\n";
+    oss << "\n";
+
+    // --- Virtual override: LocalAllocLoadTask (WrapLoadArchive, zero-copy GPU) ---
+    oss << "HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(\n";
+    oss << "    chi::u32 method, chi::WrapLoadArchive &archive) override {\n";
     if (!gpu_methods.empty()) {
       oss << "  hipc::FullPtr<chi::Task> task = LocalAllocTask(method);\n";
       oss << "  if (task.IsNull()) return task;\n";

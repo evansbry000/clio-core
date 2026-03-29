@@ -86,6 +86,26 @@ class wrap_vector {
 
   HSHM_CROSS_FUN hipc::FullPtr<char> &GetFullPtr() { return data_; }
   HSHM_CROSS_FUN const hipc::FullPtr<char> &GetFullPtr() const { return data_; }
+
+  /** Serialize (save) — write size + data bytes */
+  template <class Archive>
+  HSHM_CROSS_FUN void save(Archive &ar) const {
+    ar << size_;
+    if (size_ > 0) {
+      ar.write_binary(data_.ptr_, size_);
+    }
+  }
+
+  /** Deserialize (load) — read size + data bytes into wrapped buffer */
+  template <class Archive>
+  HSHM_CROSS_FUN void load(Archive &ar) {
+    size_t sz = 0;
+    ar >> sz;
+    resize(sz);
+    if (sz > 0) {
+      ar.read_binary(data_.ptr_, sz);
+    }
+  }
 };
 
 }  // namespace hshm::priv

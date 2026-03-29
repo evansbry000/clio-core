@@ -20,43 +20,81 @@ HSHM_GPU_FUN chi::gpu::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> 
   co_return;
 }
 
-HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
-    chi::u32 method, chi::DefaultLoadArchive &archive) override {
+template <typename ArchiveT>
+HSHM_GPU_FUN void LoadTaskTmpl(
+    chi::u32 method, ArchiveT &archive,
+    const hipc::FullPtr<chi::Task> &task) {
   switch (method) {
     case Method::kGpuSubmit: {
-      auto *alloc = CHI_IPC->gpu_alloc_;
-      auto task = alloc->template AllocateObjs<GpuSubmitTask>(1);
-      if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
-      new (task.ptr_) GpuSubmitTask();
-      archive.SetMsgType(chi::LocalMsgType::kSerializeIn);
-      task.ptr_->SerializeIn(archive);
-      return task.template Cast<chi::Task>();
+      auto typed = task.template Cast<GpuSubmitTask>();
+      if (archive.GetMsgType() == chi::LocalMsgType::kSerializeIn) {
+        typed->SerializeIn(archive);
+      } else {
+        typed->SerializeOut(archive);
+      }
+      break;
     }
     case Method::kSubtaskTest: {
-      auto *alloc = CHI_IPC->gpu_alloc_;
-      auto task = alloc->template AllocateObjs<SubtaskTestTask>(1);
-      if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
-      new (task.ptr_) SubtaskTestTask();
-      archive.SetMsgType(chi::LocalMsgType::kSerializeIn);
-      task.ptr_->SerializeIn(archive);
-      return task.template Cast<chi::Task>();
+      auto typed = task.template Cast<SubtaskTestTask>();
+      if (archive.GetMsgType() == chi::LocalMsgType::kSerializeIn) {
+        typed->SerializeIn(archive);
+      } else {
+        typed->SerializeOut(archive);
+      }
+      break;
     }
-    default: return hipc::FullPtr<chi::Task>::GetNull();
+    default: break;
   }
+}
+
+template <typename ArchiveT>
+HSHM_GPU_FUN void SaveTaskTmpl(
+    chi::u32 method, ArchiveT &archive,
+    const hipc::FullPtr<chi::Task> &task) {
+  switch (method) {
+    case Method::kGpuSubmit: {
+      auto typed = task.template Cast<GpuSubmitTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    case Method::kSubtaskTest: {
+      auto typed = task.template Cast<SubtaskTestTask>();
+      typed->SerializeOut(archive);
+      break;
+    }
+    default: break;
+  }
+}
+
+HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
+    chi::u32 method, chi::DefaultLoadArchive &archive) override {
+  hipc::FullPtr<chi::Task> task = LocalAllocTask(method);
+  if (task.IsNull()) return task;
+  archive.SetMsgType(chi::LocalMsgType::kSerializeIn);
+  LoadTaskTmpl(method, archive, task);
+  return task;
+}
+
+HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive) override {
+  hipc::FullPtr<chi::Task> task = LocalAllocTask(method);
+  if (task.IsNull()) return task;
+  archive.SetMsgType(chi::LocalMsgType::kSerializeIn);
+  LoadTaskTmpl(method, archive, task);
+  return task;
 }
 
 HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocTask(
     chi::u32 method) override {
+  auto *alloc = CHI_IPC->gpu_alloc_;
   switch (method) {
     case Method::kGpuSubmit: {
-      auto *alloc = CHI_IPC->gpu_alloc_;
       auto task = alloc->template AllocateObjs<GpuSubmitTask>(1);
       if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
       new (task.ptr_) GpuSubmitTask();
       return task.template Cast<chi::Task>();
     }
     case Method::kSubtaskTest: {
-      auto *alloc = CHI_IPC->gpu_alloc_;
       auto task = alloc->template AllocateObjs<SubtaskTestTask>(1);
       if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
       new (task.ptr_) SubtaskTestTask();
@@ -70,35 +108,40 @@ HSHM_GPU_FUN void LocalLoadTask(
     chi::u32 method, chi::DefaultLoadArchive &archive,
     const hipc::FullPtr<chi::Task> &task) override {
   archive.SetMsgType(chi::LocalMsgType::kSerializeIn);
-  switch (method) {
-    case Method::kGpuSubmit: {
-      auto typed = task.template Cast<GpuSubmitTask>();
-      typed->SerializeIn(archive);
-      break;
-    }
-    case Method::kSubtaskTest: {
-      auto typed = task.template Cast<SubtaskTestTask>();
-      typed->SerializeIn(archive);
-      break;
-    }
-    default: break;
-  }
+  LoadTaskTmpl(method, archive, task);
 }
 
 HSHM_GPU_FUN void LocalSaveTask(
     chi::u32 method, chi::DefaultSaveArchive &archive,
     const hipc::FullPtr<chi::Task> &task) override {
+  SaveTaskTmpl(method, archive, task);
+}
+
+HSHM_GPU_FUN void LocalSaveTask(
+    chi::u32 method, chi::WrapSaveArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override {
+  SaveTaskTmpl(method, archive, task);
+}
+
+HSHM_GPU_FUN void LocalLoadTaskOutput(
+    chi::u32 method, chi::DefaultLoadArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override {
+  archive.SetMsgType(chi::LocalMsgType::kSerializeOut);
+  LoadTaskTmpl(method, archive, task);
+}
+
+HSHM_GPU_FUN void LocalDestroyTask(
+    chi::u32 method, hipc::FullPtr<chi::Task> &task) override {
+  if (task.IsNull()) return;
   switch (method) {
-    case Method::kGpuSubmit: {
-      auto typed = task.template Cast<GpuSubmitTask>();
-      typed->SerializeOut(archive);
+    case Method::kGpuSubmit:
+      task.template Cast<GpuSubmitTask>().ptr_->~GpuSubmitTask();
       break;
-    }
-    case Method::kSubtaskTest: {
-      auto typed = task.template Cast<SubtaskTestTask>();
-      typed->SerializeOut(archive);
+    case Method::kSubtaskTest:
+      task.template Cast<SubtaskTestTask>().ptr_->~SubtaskTestTask();
       break;
-    }
-    default: break;
+    default:
+      task.ptr_->~Task();
+      break;
   }
 }

@@ -764,7 +764,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::FlushData(
 //==============================================================================
 
 HSHM_GPU_FUN hipc::FullPtr<chi::Task> GpuRuntime::LocalAllocLoadTask(
-    chi::u32 method, chi::LocalLoadTaskArchive &archive) {
+    chi::u32 method, chi::DefaultLoadArchive &archive) {
   auto *ipc = CHI_IPC;
   hipc::FullPtr<chi::Task> task_ptr;
   switch (method) {
@@ -800,7 +800,7 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> GpuRuntime::LocalAllocLoadTask(
 }
 
 HSHM_GPU_FUN void GpuRuntime::LocalSaveTask(
-    chi::u32 method, chi::LocalSaveTaskArchive &archive,
+    chi::u32 method, chi::DefaultSaveArchive &archive,
     const hipc::FullPtr<chi::Task> &task) {
   switch (method) {
     case Method::kPutBlob: {
@@ -828,7 +828,7 @@ HSHM_GPU_FUN void GpuRuntime::LocalSaveTask(
 }
 
 HSHM_GPU_FUN void GpuRuntime::LocalLoadTaskOutput(
-    chi::u32 method, chi::LocalLoadTaskArchive &archive,
+    chi::u32 method, chi::DefaultLoadArchive &archive,
     const hipc::FullPtr<chi::Task> &task) {
   switch (method) {
     case Method::kPutBlob: {
@@ -875,6 +875,20 @@ HSHM_GPU_FUN void GpuRuntime::LocalDestroyTask(
       task.ptr_->~Task();
       break;
   }
+}
+
+HSHM_GPU_FUN hipc::FullPtr<chi::Task> GpuRuntime::LocalAllocLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive) {
+  // TODO: implement with template dispatch like DefaultLoadArchive version
+  (void)method; (void)archive;
+  return hipc::FullPtr<chi::Task>::GetNull();
+}
+
+HSHM_GPU_FUN void GpuRuntime::LocalSaveTask(
+    chi::u32 method, chi::WrapSaveArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) {
+  // TODO: implement with template dispatch like DefaultSaveArchive version
+  (void)method; (void)archive; (void)task;
 }
 
 }  // namespace wrp_cte::core

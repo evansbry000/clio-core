@@ -326,6 +326,55 @@ class ShmTransport
   }
 
   /**
+   * Preallocated Send: task data is already in copy_space (via wrap_vector).
+   * Lane 0 writes the PreallocHeader, fences, then marks total_written.
+   * No SPSC ring buffer, no metadata serialization, no meta_buf needed.
+   *
+   * @param data_size Bytes of task data in copy_space after the header
+   * @param header_size Size of the header (sizeof(PreallocHeader))
+   * @param ctx LbmContext with copy_space and shm_info_
+   */
+  HSHM_CROSS_FUN
+  static void SendDevicePrealloc(const char *header, size_t header_size,
+                                  size_t data_size,
+                                  const LbmContext &ctx) {
+#if HSHM_IS_GPU
+    uint32_t lane = threadIdx.x & 31;
+#else
+    uint32_t lane = 0;
+#endif
+    // Lane 0: write header and mark ready
+    if (lane == 0) {
+      memcpy(ctx.copy_space, header, header_size);
+      hshm::ipc::threadfence();
+      ctx.shm_info_->total_written_.store(header_size + data_size);
+    }
+  }
+
+  /**
+   * Preallocated Recv: task data is already in copy_space.
+   * Lane 0 reads the PreallocHeader and returns the data_size.
+   * Caller reconstructs wrap_vector from copy_space + header_size.
+   *
+   * @param header Output buffer for the header
+   * @param header_size Size of the header
+   * @param ctx LbmContext with copy_space and shm_info_
+   */
+  HSHM_CROSS_FUN
+  static void RecvDevicePrealloc(char *header, size_t header_size,
+                                  const LbmContext &ctx) {
+#if HSHM_IS_GPU
+    uint32_t lane = threadIdx.x & 31;
+#else
+    uint32_t lane = 0;
+#endif
+    if (lane == 0) {
+      hshm::ipc::threadfence();
+      memcpy(header, ctx.copy_space, header_size);
+    }
+  }
+
+  /**
    * Device-scope Recv for GPU→GPU on same device.
    * Uses pre-allocated array_vector scratch buffer (ctx.meta_buf_).
    * Warp-parallel when called by all lanes; single-lane safe too.
