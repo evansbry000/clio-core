@@ -31,3 +31,9 @@ HSHM_GPU_FUN void LocalSaveTask(
     const hipc::FullPtr<chi::Task> &task) override {
   (void)method; (void)archive; (void)task;
 }
+
+HSHM_GPU_FUN void LocalLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override {
+  (void)method; (void)archive; (void)task;
+}

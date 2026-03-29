@@ -90,12 +90,6 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
 }
 
 HSHM_GPU_FUN void LocalSaveTask(
-    chi::u32 method, chi::WrapSaveArchive &archive,
-    const hipc::FullPtr<chi::Task> &task) override {
-  (void)method; (void)archive; (void)task;
-}
-
-HSHM_GPU_FUN void LocalSaveTask(
     chi::u32 method, chi::DefaultSaveArchive &archive,
     const hipc::FullPtr<chi::Task> &task) override {
   switch (method) {
@@ -126,6 +120,12 @@ HSHM_GPU_FUN void LocalSaveTask(
     }
     default: break;
   }
+}
+
+HSHM_GPU_FUN void LocalSaveTask(
+    chi::u32 method, chi::WrapSaveArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override {
+  (void)method; (void)archive; (void)task;
 }
 
 HSHM_GPU_FUN void LocalLoadTaskOutput(
@@ -185,4 +185,10 @@ HSHM_GPU_FUN void LocalDestroyTask(
       task.ptr_->~Task();
       break;
   }
+}
+
+HSHM_GPU_FUN void LocalLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override {
+  (void)method; (void)archive; (void)task;
 }

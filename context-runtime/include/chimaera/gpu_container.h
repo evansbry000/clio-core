@@ -129,6 +129,15 @@ class Container {
   }
 
   /**
+   * Deserialize input into existing task via wrap_vector (warp-parallel, zero-copy).
+   */
+  HSHM_GPU_FUN virtual void LocalLoadTask(
+      u32 method, WrapLoadArchive &archive,
+      const hipc::FullPtr<Task> &task) {
+    (void)method; (void)archive; (void)task;
+  }
+
+  /**
    * Virtual dispatch for task serialization
    * @param method Method ID identifying the task type
    * @param archive DefaultSaveArchive to write output into

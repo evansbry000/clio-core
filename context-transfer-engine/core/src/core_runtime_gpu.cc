@@ -891,4 +891,11 @@ HSHM_GPU_FUN void GpuRuntime::LocalSaveTask(
   (void)method; (void)archive; (void)task;
 }
 
+HSHM_GPU_FUN void GpuRuntime::LocalLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) {
+  // TODO: implement with template dispatch like DefaultLoadArchive version
+  (void)method; (void)archive; (void)task;
+}
+
 }  // namespace wrp_cte::core

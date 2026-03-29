@@ -740,11 +740,19 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
 
-    // --- Virtual override: LocalLoadTask (deserialize into existing task) ---
+    // --- Virtual override: LocalLoadTask (DefaultLoadArchive) ---
     oss << "HSHM_GPU_FUN void LocalLoadTask(\n";
     oss << "    chi::u32 method, chi::DefaultLoadArchive &archive,\n";
     oss << "    const hipc::FullPtr<chi::Task> &task) override {\n";
     oss << "  archive.SetMsgType(chi::LocalMsgType::kSerializeIn);\n";
+    oss << "  LoadTaskTmpl(method, archive, task);\n";
+    oss << "}\n";
+    oss << "\n";
+
+    // --- Virtual override: LocalLoadTask (WrapLoadArchive, warp-parallel) ---
+    oss << "HSHM_GPU_FUN void LocalLoadTask(\n";
+    oss << "    chi::u32 method, chi::WrapLoadArchive &archive,\n";
+    oss << "    const hipc::FullPtr<chi::Task> &task) override {\n";
     oss << "  LoadTaskTmpl(method, archive, task);\n";
     oss << "}\n";
     oss << "\n";

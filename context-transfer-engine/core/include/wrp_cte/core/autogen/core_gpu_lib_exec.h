@@ -138,5 +138,9 @@ HSHM_GPU_FUN void LocalLoadTaskOutput(
     chi::u32 method, chi::DefaultLoadArchive &archive,
     const hipc::FullPtr<chi::Task> &task) override;
 
+HSHM_GPU_FUN void LocalLoadTask(
+    chi::u32 method, chi::WrapLoadArchive &archive,
+    const hipc::FullPtr<chi::Task> &task) override;
+
 HSHM_GPU_FUN void LocalDestroyTask(
     chi::u32 method, hipc::FullPtr<chi::Task> &task) override;

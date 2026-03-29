@@ -538,35 +538,76 @@ class Worker {
 
     if (lane_id == 0) _tc = clock64();
 
-    // Phase 2 (lane 0): construct WrapLoadArchive pointing at task data
-    // in the client's copy_space (zero-copy — no memcpy needed)
-    RunContext *result = nullptr;
-    if (lane_id == 0) {
-      hipc::FullPtr<char> data_fp;
-      data_fp.ptr_ = fshm->copy_space + IpcManager::WarpIpcManager::kHeaderSize;
-      data_fp.shm_.alloc_id_.SetNull();
-      data_fp.shm_.off_ = reinterpret_cast<size_t>(data_fp.ptr_);
-      hshm::priv::wrap_vector recv_buf(data_fp, hdr.data_size);
-      recv_buf.resize(hdr.data_size);
+    // Phase 2 (lane 0): read header, allocate task
+    unsigned long long data_ptr_ull = 0;
+    unsigned int data_size = 0;
+    unsigned long long task_ull = 0;
+    int alloc_ok = 0;
 
-      WrapLoadArchive load_ar(recv_buf);
-      load_ar.SetMsgType(hdr.msg_type);
+    if (lane_id == 0) {
+      char *data_ptr = fshm->copy_space + IpcManager::WarpIpcManager::kHeaderSize;
+      data_ptr_ull = reinterpret_cast<unsigned long long>(data_ptr);
+      data_size = hdr.data_size;
       prof_recv_device_ += clock64() - _tc;
 
+      // Allocate task (lane 0 only — BuddyAllocator is not thread-safe)
       _tc = clock64();
-      hipc::FullPtr<Task> task_ptr =
-          container->LocalAllocLoadTask(method_id, load_ar);
-      prof_alloc_task_ += clock64() - _tc;
-
-      if (task_ptr.IsNull()) {
-        MarkComplete(fshm, is_gpu2gpu);
-      } else {
-        _tc = clock64();
-        u32 parallelism = task_ptr.ptr_->pool_query_.GetParallelism();
-        result = AllocForParallelism(fshm, container, method_id, task_ptr,
-                                     is_gpu2gpu, true, parallelism);
-        prof_alloc_ctx_ += clock64() - _tc;
+      hipc::FullPtr<Task> task_ptr = container->LocalAllocTask(method_id);
+      if (!task_ptr.IsNull()) {
+        task_ull = reinterpret_cast<unsigned long long>(task_ptr.ptr_);
+        alloc_ok = 1;
       }
+    }
+
+    // Broadcast for warp-parallel deserialization
+    data_ptr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, data_ptr_ull, 0);
+    data_size = __shfl_sync(0xFFFFFFFF, data_size, 0);
+    task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
+    alloc_ok = __shfl_sync(0xFFFFFFFF, alloc_ok, 0);
+
+    if (!alloc_ok) {
+      if (lane_id == 0) MarkComplete(fshm, is_gpu2gpu);
+      return nullptr;
+    }
+
+    // Phase 3 (all lanes): warp-parallel SerializeIn
+    {
+      hipc::FullPtr<char> data_fp;
+      data_fp.ptr_ = reinterpret_cast<char *>(data_ptr_ull);
+      data_fp.shm_.alloc_id_.SetNull();
+      data_fp.shm_.off_ = data_ptr_ull;
+      hshm::priv::wrap_vector recv_buf(data_fp, data_size);
+      recv_buf.resize(data_size);
+
+      WrapLoadArchive load_ar(recv_buf);
+      load_ar.SetMsgType(LocalMsgType::kSerializeIn);
+      load_ar.SetWarpConverged(true);
+
+      hipc::FullPtr<Task> task_fp;
+      task_fp.ptr_ = reinterpret_cast<Task *>(task_ull);
+      task_fp.shm_.alloc_id_.SetNull();
+      task_fp.shm_.off_ = task_ull;
+      container->LocalLoadTask(method_id, load_ar, task_fp);
+    }
+    __syncwarp();
+
+    if (lane_id == 0) {
+      prof_alloc_task_ += clock64() - _tc;
+    }
+
+    // Phase 4 (lane 0): alloc context
+    RunContext *result = nullptr;
+    if (lane_id == 0) {
+      hipc::FullPtr<Task> task_ptr;
+      task_ptr.ptr_ = reinterpret_cast<Task *>(task_ull);
+      task_ptr.shm_.alloc_id_.SetNull();
+      task_ptr.shm_.off_ = task_ull;
+
+      _tc = clock64();
+      u32 parallelism = task_ptr.ptr_->pool_query_.GetParallelism();
+      result = AllocForParallelism(fshm, container, method_id, task_ptr,
+                                   is_gpu2gpu, true, parallelism);
+      prof_alloc_ctx_ += clock64() - _tc;
     }
     return result;
   }
