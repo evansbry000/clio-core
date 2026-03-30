@@ -945,11 +945,11 @@ extern "C" int run_gpu_bench_latency(
 
   void *stream = hshm::GpuApi::CreateStream();
 
-  // Pause orchestrator to free SMs, launch client kernel, then resume
+  // Pause orchestrator (triggers queue rebuild if block count changed)
   CHI_IPC->PauseGpuOrchestrator();
   cudaGetLastError();  // Clear any sticky CUDA errors
 
-  // Re-fetch gpu_info AFTER queue rebuild (SetGpuOrchestratorBlocks rebuilt it)
+  // Fetch gpu_info AFTER pause — queue was rebuilt by PauseGpuOrchestrator
   gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
@@ -969,7 +969,7 @@ extern "C" int run_gpu_bench_latency(
     return -3;
   }
 
-  // Resume orchestrator so it can process the GPU→GPU tasks
+  // Resume orchestrator AFTER client launch — both run concurrently
   CHI_IPC->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 

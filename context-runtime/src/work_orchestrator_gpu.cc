@@ -385,6 +385,7 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
   }
 
   is_launched_ = true;
+
   HLOG(kInfo, "GPU work orchestrator resumed with {} blocks, {} threads/block ({} warps)",
        blocks_, threads_per_block_, resume_info.gpu2gpu_num_lanes);
 }
