@@ -618,6 +618,22 @@ class basic_string {
   }
 
   /**
+   * Initialize this string by copying SSO data from another string.
+   * No allocator needed — copies the inline buffer directly.
+   * Only valid when the source is using SSO (size <= SSOSize).
+   */
+  HSHM_INLINE_CROSS_FUN
+  void InitFromSso(const basic_string &other) {
+    size_ = other.size_;
+    using_sso_ = true;
+    alloc_ = nullptr;
+    for (size_type i = 0; i <= size_ && i < SSOSize; ++i) {
+      storage_.buffer_[i] = other.storage_.buffer_[i];
+    }
+    data_ = storage_.buffer_;
+  }
+
+  /**
    * POD-safe state for SSO strings (no pointers).
    * Serialized as a flat memcpy-able struct via ar.range().
    */

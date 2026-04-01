@@ -3172,12 +3172,17 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
         int poll_count = 0;
 
         // Poll pinned-host FutureShm flags directly
-        while (!fshm->flags_.AnySystem(FutureShm::FUTURE_COMPLETE)) {
-          if (poll_count % 100 == 0) {
-            HLOG(kInfo, "GPU-POD Wait: poll#{} fshm={:x} flags_raw={}",
-                 poll_count, reinterpret_cast<uintptr_t>(fshm),
-                 (u32)fshm->flags_.bits_.load());
-          }
+        // Read flags via volatile pointer to bypass any CPU caching of pinned memory
+        volatile unsigned int *flags_ptr = reinterpret_cast<volatile unsigned int *>(
+            &fshm->flags_.bits_.x);
+        printf("[GPU-POD-WAIT] fshm=%p flags_ptr=%p flags_raw=%u\n",
+               (void*)fshm, (const void*)flags_ptr, *flags_ptr);
+        fflush(stdout);
+        while (!(*flags_ptr & FutureShm::FUTURE_COMPLETE)) {
+#if defined(__x86_64__) || defined(__i386__)
+          _mm_clflush(const_cast<unsigned int*>(flags_ptr));
+          _mm_mfence();
+#endif
           ++poll_count;
           HSHM_THREAD_MODEL->Yield();
           if (max_sec > 0) {

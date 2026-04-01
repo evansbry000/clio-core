@@ -171,22 +171,33 @@ HSHM_GPU_FUN void GpuRuntime::RegisterTarget(
     hipc::FullPtr<RegisterTargetTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
   if (!chi::IpcManager::IsWarpScheduler()) return;
+  printf("[GPU-RT] RegisterTarget: entering, bdev_id=(%u,%u) size=%llu\n",
+         task->bdev_id_.major_, task->bdev_id_.minor_,
+         (unsigned long long)task->total_size_);
+
   EnsureMetaInit();
+  printf("[GPU-RT] RegisterTarget: meta init done, meta=%p targets.size=%u\n",
+         (void*)meta_, (unsigned)meta_->targets_.size());
 
-  // Extract task fields
-  chi::priv::string target_name(CHI_PRIV_ALLOC, task->target_name_.data());
-  chi::PoolId bdev_id = task->bdev_id_;
-  chi::u64 total_size = task->total_size_;
-  chi::PoolQuery target_query = task->target_query_;
-
+  // Build TargetInfo directly — avoid string allocations that require
+  // the GPU allocator (may not be available in CPU→GPU CDP context).
   TargetInfo info;
-  info.target_name_ = target_name;
-  info.bdev_client_.Init(bdev_id);
-  info.target_query_ = target_query;
-  info.remaining_space_ = total_size;
+  printf("[GPU-RT] RegisterTarget: TargetInfo created\n");
+
+  // Use task's SSO string data directly (FixupAfterCopy already reseated data_)
+  info.target_name_.InitFromSso(task->target_name_);
+  printf("[GPU-RT] RegisterTarget: name copied from SSO\n");
+
+  info.bdev_client_.Init(task->bdev_id_);
+  info.target_query_ = task->target_query_;
+  info.remaining_space_ = task->total_size_;
+  printf("[GPU-RT] RegisterTarget: about to push_back\n");
 
   // Push to targets vector
   meta_->targets_.push_back(info);
+  printf("[GPU-RT] RegisterTarget: push_back done, targets.size=%u\n",
+         (unsigned)meta_->targets_.size());
+
   task->return_code_ = 0;
 }
 
