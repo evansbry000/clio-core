@@ -38,6 +38,68 @@
 //==============================================================================
 
 /**
+ * GPU-side setup kernel: register a CTE target and create a tag.
+ * Avoids CPU→GPU POD copy which can't handle priv::string fields.
+ * All lanes participate (warp-cooperative APIs).
+ */
+__global__ void gpu_cte_setup_kernel(
+    chi::IpcManagerGpu gpu_info,
+    chi::PoolId cte_pool_id,
+    chi::PoolId bdev_pool_id,
+    chi::u64 target_size,
+    int *d_result,
+    wrp_cte::core::TagId *d_tag_id) {
+  CHIMAERA_GPU_CLIENT_INIT(gpu_info, 1);
+
+  auto *ipc = CHI_IPC;
+
+  if (threadIdx.x == 0) {
+    printf("[GPU-SETUP] Submitting RegisterTarget...\n");
+  }
+  // Register target via NewTask directly (client wrapper uses std::string)
+  auto reg_task = ipc->NewTask<wrp_cte::core::RegisterTargetTask>(
+      chi::CreateTaskId(), cte_pool_id, chi::PoolQuery::Local(),
+      "bench_gpu_target",
+      chimaera::bdev::BdevType::kHbm,
+      target_size,
+      chi::PoolQuery::Local(), bdev_pool_id);
+  auto reg_future = ipc->Send(reg_task);
+  reg_future.Wait();
+
+  if (chi::IpcManager::IsWarpScheduler()) {
+    if (reg_future.IsNull() || reg_task->return_code_ != 0) {
+      printf("[GPU-SETUP] RegisterTarget failed rc=%d\n",
+             reg_future.IsNull() ? -999 : (int)reg_task->return_code_);
+      *d_result = -1;
+      return;
+    }
+    printf("[GPU-SETUP] RegisterTarget OK\n");
+  }
+  __syncwarp();
+
+  // Create tag via NewTask directly
+  auto tag_task = ipc->NewTask<wrp_cte::core::GetOrCreateTagTask<wrp_cte::core::CreateParams>>(
+      chi::CreateTaskId(), cte_pool_id, chi::PoolQuery::Local(),
+      "gpu_bench_tag",
+      wrp_cte::core::TagId::GetNull());
+  auto tag_future = ipc->Send(tag_task);
+  tag_future.Wait();
+
+  if (chi::IpcManager::IsWarpScheduler()) {
+    if (tag_future.IsNull() || tag_task->return_code_ != 0) {
+      printf("[GPU-SETUP] GetOrCreateTag failed rc=%d\n",
+             tag_future.IsNull() ? -999 : (int)tag_task->return_code_);
+      *d_result = -2;
+      return;
+    }
+    *d_tag_id = tag_task->tag_id_;
+    printf("[GPU-SETUP] GetOrCreateTag OK, tag_id=(%u,%u)\n",
+           d_tag_id->major_, d_tag_id->minor_);
+    *d_result = 1;
+  }
+}
+
+/**
  * Initialize a BuddyAllocator over device memory and allocate
  * a contiguous array of `total_bytes` bytes.  Returns the FullPtr via
  * pinned host memory so the CPU can read it.
@@ -430,6 +492,53 @@ int run_cte_client_overhead(
   hshm::GpuApi::DestroyStream(stream);
 
   return 0;
+}
+
+/**
+ * Host-callable wrapper: launch gpu_cte_setup_kernel to register a CTE target
+ * and create a tag on the GPU side, avoiding CPU→GPU POD copy.
+ */
+int run_gpu_cte_setup(chi::PoolId cte_pool_id, chi::PoolId bdev_pool_id,
+                       chi::u64 target_size, wrp_cte::core::TagId *out_tag_id) {
+  chi::IpcManagerGpu setup_gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  hipc::MemoryBackendId setup_bid(110, 0);
+  hipc::GpuMalloc setup_backend;
+  setup_backend.shm_init(setup_bid, 4 * 1024 * 1024, "", 0);
+  CHI_IPC->RegisterGpuAllocator(setup_bid, setup_backend.data_,
+                                 setup_backend.data_capacity_);
+  setup_gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  setup_gpu_info.backend = setup_backend;
+
+  int *d_result;
+  wrp_cte::core::TagId *d_tag_id;
+  cudaMallocHost(&d_result, sizeof(int));
+  cudaMallocHost(&d_tag_id, sizeof(wrp_cte::core::TagId));
+  *d_result = 0;
+
+  // Don't pause/resume — the setup kernel needs the orchestrator
+  // to process RegisterTarget and GetOrCreateTag tasks.
+
+  void *stream = hshm::GpuApi::CreateStream();
+  gpu_cte_setup_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+      setup_gpu_info, cte_pool_id, bdev_pool_id,
+      target_size, d_result, d_tag_id);
+
+  // Poll for completion (result != 0 means done)
+  int elapsed_us = 0;
+  while (*d_result == 0 && elapsed_us < 30000000) {
+    usleep(1000);
+    elapsed_us += 1000;
+  }
+  hshm::GpuApi::Synchronize(stream);
+  hshm::GpuApi::DestroyStream(stream);
+
+  int rc = *d_result;
+  if (rc == 1 && out_tag_id) {
+    *out_tag_id = *d_tag_id;
+  }
+  cudaFreeHost(d_result);
+  cudaFreeHost(d_tag_id);
+  return rc;
 }
 
 #endif  // HSHM_IS_HOST

@@ -548,16 +548,8 @@ int main(int argc, char **argv) {
       }
       std::this_thread::sleep_for(200ms);
 
-      auto gpu_reg_task = cte_client.AsyncRegisterTarget(
-          target_name, ts.bdev_type, ts.size_bytes,
-          chi::PoolQuery::Local(), bdev_pool_id,
-          chi::PoolQuery::LocalGpuBcast());
-      gpu_reg_task.Wait();
-      if (gpu_reg_task->GetReturnCode() != 0) {
-        HLOG(kError, "Failed to register GPU target {}: {}",
-             target_name, gpu_reg_task->GetReturnCode());
-        return 1;
-      }
+      // GPU-side registration is done below via gpu_cte_setup_kernel
+      // (avoids CPU→GPU POD copy which can't handle priv::string fields)
       std::this_thread::sleep_for(200ms);
     }
 
@@ -571,9 +563,16 @@ int main(int argc, char **argv) {
     }
     wrp_cte::core::TagId tag_id = tag_task->tag_id_;
 
-    auto gpu_tag_task = cte_client.AsyncGetOrCreateTag(
-        "gpu_bench_tag", tag_id, chi::PoolQuery::LocalGpuBcast());
-    gpu_tag_task.Wait();
+    // GPU-side setup: register target + create tag from GPU kernel
+    // (avoids CPU→GPU POD copy which can't handle priv::string fields)
+    int setup_rc = run_gpu_cte_setup(gpu_pool_id, bdev_pool_id,
+                                      targets[0].size_bytes, &tag_id);
+    if (setup_rc != 1) {
+      HLOG(kError, "GPU-side CTE setup failed: {}", setup_rc);
+      return 1;
+    }
+    HIPRINT("GPU-side CTE setup OK, tag_id=({},{})", tag_id.major_, tag_id.minor_);
+    std::this_thread::sleep_for(200ms);
     std::this_thread::sleep_for(200ms);
 
     HIPRINT("Pool ID: {}.{}", gpu_pool_id.major_, gpu_pool_id.minor_);

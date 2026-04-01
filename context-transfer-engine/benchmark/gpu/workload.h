@@ -122,5 +122,10 @@ int run_cte_client_overhead(chi::PoolId cte_pool_id, wrp_cte::core::TagId tag_id
                             bool to_cpu, int timeout_sec,
                             float *out_elapsed_ms, float *out_avg_submit_us);
 
+/** GPU-side CTE setup: register target + create tag from GPU kernel.
+ *  Avoids CPU→GPU POD copy which can't handle priv::string fields. */
+int run_gpu_cte_setup(chi::PoolId cte_pool_id, chi::PoolId bdev_pool_id,
+                       chi::u64 target_size, wrp_cte::core::TagId *out_tag_id);
+
 #endif  // HSHM_IS_HOST
 #endif  // BENCH_GPU_WORKLOAD_H
