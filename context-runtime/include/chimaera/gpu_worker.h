@@ -260,7 +260,10 @@ class Worker {
 
     size_t off = sptr.off_.load();
     FutureShm *fshm;
-    if (!is_gpu2gpu) {
+    if (sptr.alloc_id_ == hipc::AllocatorId::GetNull()) {
+      // Null alloc_id = raw device pointer (SendCpuToGpu or GPU→GPU)
+      fshm = reinterpret_cast<FutureShm *>(off);
+    } else if (!is_gpu2gpu) {
       fshm = reinterpret_cast<FutureShm *>(queue_backend_base_ + off);
     } else {
       fshm = reinterpret_cast<FutureShm *>(off);

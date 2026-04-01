@@ -1236,7 +1236,7 @@ class IpcManager {
         u32 gpu_id = (mode == RoutingMode::ToLocalGpu)
                          ? task_ptr->pool_query_.GetNodeId()
                          : 0;
-        return SendGpuCpuCopy(task_ptr, gpu_id);
+        return SendCpuToGpu(task_ptr, gpu_id);
       }
     }
 #endif
@@ -2170,6 +2170,7 @@ class IpcManager {
    * Helper: cudaMemcpy device→host for POD task output retrieval.
    */
   void CudaMemcpyToHost(void *host_dst, const void *device_src, size_t size);
+  void CudaMemcpyToDevice(void *device_dst, const void *host_src, size_t size);
 
   /**
    * Helper: cudaFree for POD task device buffer.
@@ -2182,61 +2183,64 @@ class IpcManager {
    * Replaces the old SendToGpu serialization path.
    */
   template <typename TaskT>
-  Future<TaskT> SendGpuCpuCopy(const hipc::FullPtr<TaskT> &task_ptr,
-                                u32 gpu_id = 0) {
-#if HSHM_IS_HOST
+  /**
+   * Send a task from CPU to GPU via POD cudaMemcpy.
+   *
+   * Allocates [TaskT | FutureShm] in device memory, copies the task H2D,
+   * initializes FutureShm, and pushes to cpu2gpu_queue. The GPU orchestrator
+   * pops and launches a CDP child kernel to execute the task.
+   *
+   * The Future stores the device buffer address. CPU polls completion via
+   * cudaMemcpy D2H of the FutureShm flags, then copies the full task back.
+   *
+   * @param task_ptr Host task to send
+   * @param gpu_id Target GPU device
+   * @return Future that resolves when GPU completes the task
+   */
+  Future<TaskT> SendCpuToGpu(const hipc::FullPtr<TaskT> &task_ptr,
+                              u32 gpu_id = 0) {
+#if HSHM_IS_HOST && (HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM)
     if (task_ptr.IsNull() || gpu_id >= cpu2gpu_queues_.size()) {
       return Future<TaskT>();
     }
 
     // 1. Allocate device buffer: [TaskT | FutureShm]
-    //    Only the task is copied; FutureShm is zero-init'd by cudaMalloc.
-    size_t device_buf_size = sizeof(TaskT) + sizeof(FutureShm);
+    size_t task_size = sizeof(TaskT);
+    size_t total_size = task_size + sizeof(FutureShm);
     void *device_buf = CudaMallocAndCopy(
-        static_cast<const void *>(task_ptr.ptr_), sizeof(TaskT),
-        device_buf_size);
+        static_cast<const void *>(task_ptr.ptr_), task_size, total_size);
     if (!device_buf) {
       return Future<TaskT>();
     }
 
-    // 2. Allocate pinned host FutureShm from cpu2gpu copy backend
-    size_t fshm_alloc_size = sizeof(FutureShm);
-    hipc::FullPtr<char> fshm_buf = AllocateGpuBuffer(fshm_alloc_size, gpu_id);
-    if (fshm_buf.IsNull()) {
-      CudaFreeDevice(device_buf);
-      return Future<TaskT>();
-    }
+    // 2. Initialize FutureShm in device memory (after the task)
+    FutureShm fshm;
+    memset(&fshm, 0, sizeof(fshm));
+    fshm.pool_id_ = task_ptr->pool_id_;
+    fshm.method_id_ = task_ptr->method_;
+    fshm.origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    fshm.client_task_vaddr_ = reinterpret_cast<uintptr_t>(device_buf);
+    fshm.task_device_ptr_ = reinterpret_cast<uintptr_t>(device_buf);
+    fshm.task_size_ = static_cast<u32>(task_size);
+    fshm.flags_.SetBits(FutureShm::FUTURE_POD_COPY);
+    CudaMemcpyToDevice(
+        static_cast<char *>(device_buf) + task_size,
+        &fshm, sizeof(FutureShm));
 
-    // 3. Construct FutureShm in pinned host memory
-    FutureShm *fshm = new (fshm_buf.ptr_) FutureShm();
-    fshm->pool_id_ = task_ptr->pool_id_;
-    fshm->method_id_ = task_ptr->method_;
-    fshm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
-    fshm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(device_buf);
-    fshm->task_device_ptr_ = reinterpret_cast<uintptr_t>(device_buf);
-    fshm->task_size_ = static_cast<u32>(sizeof(TaskT));
-    fshm->flags_.SetBits(FutureShm::FUTURE_POD_COPY);
-
-    // 4. Create Future pointing to pinned host FutureShm
-    hipc::ShmPtr<FutureShm> fshmptr = fshm_buf.shm_.template Cast<FutureShm>();
+    // 3. Create Future with device pointer as raw offset (null alloc_id)
+    //    The ShmPtr stores the device address of the FutureShm directly.
+    hipc::ShmPtr<FutureShm> fshmptr;
+    fshmptr.alloc_id_ = hipc::AllocatorId::GetNull();
+    fshmptr.off_ = reinterpret_cast<size_t>(
+        static_cast<char *>(device_buf) + task_size);
     Future<TaskT> future(fshmptr, task_ptr);
 
-    // 5. Flush FutureShm to DRAM for GPU visibility
-#if defined(__x86_64__) || defined(__i386__)
-    {
-      const char *base = reinterpret_cast<const char *>(fshm);
-      for (const char *cl = base; cl < base + fshm_alloc_size; cl += 64) {
-        _mm_clflush(cl);
-      }
-      _mm_sfence();
-    }
-#endif
-
-    // 6. Push to CPU→GPU queue
+    // 4. Push to CPU→GPU queue
     auto &lane = cpu2gpu_queues_[gpu_id].ptr_->GetLane(0, 0);
     Future<Task> task_future(future.GetFutureShmPtr());
     lane.Push(task_future);
 
+    // 5. Flush queue to DRAM for GPU visibility
 #if defined(__x86_64__) || defined(__i386__)
     {
       const char *q_base = reinterpret_cast<const char *>(&lane);
@@ -2252,7 +2256,14 @@ class IpcManager {
     (void)task_ptr;
     (void)gpu_id;
     return Future<TaskT>();
-#endif  // HSHM_IS_HOST
+#endif
+  }
+
+  // Legacy alias
+  template <typename TaskT>
+  Future<TaskT> SendGpuCpuCopy(const hipc::FullPtr<TaskT> &task_ptr,
+                                u32 gpu_id = 0) {
+    return SendCpuToGpu(task_ptr, gpu_id);
   }
 #endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
@@ -3139,33 +3150,29 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
       return true;
     }
 
-    // Convert ShmPtr to FullPtr to access flags_
-    hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
-    if (future_full.IsNull()) {
-      HLOG(kError, "Future::Wait: ToFullPtr returned null for future_shm_");
-      return false;
-    }
-
     // Determine path: client vs runtime
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
 
     if (is_runtime) {
-      // RUNTIME PATH: Wait for FUTURE_COMPLETE
-      hshm::abitfield32_t &flags = future_full->flags_;
-      auto start = std::chrono::steady_clock::now();
-      HLOG(kInfo, "Wait: fshm_ptr={:x} fshm_alloc=({},{}) fshm_off={} "
-           "resolved={:x} flags_raw={} POD={} COMPLETE={}",
-           reinterpret_cast<uintptr_t>(&future_shm_),
-           (u32)future_shm_.alloc_id_.major_, (u32)future_shm_.alloc_id_.minor_,
-           future_shm_.off_.load(),
-           reinterpret_cast<uintptr_t>(future_full.ptr_),
-           (u32)flags.bits_.load(),
-           flags.Any(FutureShm::FUTURE_POD_COPY) ? 1 : 0,
-           flags.Any(FutureShm::FUTURE_COMPLETE) ? 1 : 0);
-      if (flags.Any(FutureShm::FUTURE_POD_COPY)) {
-        // POD COPY PATH: poll with system-scope (FutureShm in pinned host,
-        // GPU sets FUTURE_COMPLETE with SetBitsSystem)
-        while (!flags.AnySystem(FutureShm::FUTURE_COMPLETE)) {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+      // Check if this is a CPU→GPU POD transfer (null alloc_id = device pointer)
+      if (future_shm_.alloc_id_ == hipc::AllocatorId::GetNull()) {
+        // CPU→GPU POD PATH: FutureShm is in device memory.
+        // Poll by cudaMemcpy D→H of just the flags field.
+        void *device_fshm = reinterpret_cast<void *>(future_shm_.off_.load());
+        void *device_task = reinterpret_cast<void *>(
+            future_shm_.off_.load() - sizeof(TaskT));
+        auto start = std::chrono::steady_clock::now();
+
+        // Poll flags via D→H copy
+        u32 flags_val = 0;
+        size_t flags_offset = offsetof(FutureShm, flags_);
+        while (!(flags_val & FutureShm::FUTURE_COMPLETE)) {
+          CHI_IPC->CudaMemcpyToHost(
+              &flags_val,
+              static_cast<char *>(device_fshm) + flags_offset,
+              sizeof(u32));
+          if (flags_val & FutureShm::FUTURE_COMPLETE) break;
           HSHM_THREAD_MODEL->Yield();
           if (max_sec > 0) {
             float elapsed = std::chrono::duration<float>(
@@ -3174,22 +3181,29 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
             if (elapsed >= max_sec) return false;
           }
         }
-        // Copy output from device task back to host task
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-        if (future_full->task_device_ptr_ != 0 && task_ptr_.ptr_) {
+
+        // Copy full task back from device to host
+        if (task_ptr_.ptr_) {
           CHI_IPC->CudaMemcpyToHost(
-              task_ptr_.ptr_,
-              reinterpret_cast<void *>(future_full->task_device_ptr_),
-              future_full->task_size_);
-          // Fix up internal pointers (e.g., priv::vector SVO) after memcpy
+              task_ptr_.ptr_, device_task, sizeof(TaskT));
           task_ptr_->FixupAfterCopy();
         }
-        // Free device buffer
-        CHI_IPC->CudaFreeDevice(
-            reinterpret_cast<void *>(future_full->task_device_ptr_));
-        future_full->task_device_ptr_ = 0;
+
+        // Free device buffer (task + FutureShm)
+        CHI_IPC->CudaFreeDevice(device_task);
+        return true;
+      }
 #endif
-      } else {
+
+      // RUNTIME PATH (non-GPU): Wait for FUTURE_COMPLETE
+      hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
+      if (future_full.IsNull()) {
+        HLOG(kError, "Future::Wait: ToFullPtr returned null");
+        return false;
+      }
+      hshm::abitfield32_t &flags = future_full->flags_;
+      auto start = std::chrono::steady_clock::now();
+      {
         // Non-POD path: poll locally
         while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
           HSHM_THREAD_MODEL->Yield();

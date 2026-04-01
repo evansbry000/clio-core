@@ -963,6 +963,16 @@ void IpcManager::CudaMemcpyToHost(void *host_dst, const void *device_src,
 #endif
 }
 
+void IpcManager::CudaMemcpyToDevice(void *device_dst, const void *host_src,
+                                      size_t size) {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  hshm::GpuApi::Memcpy(static_cast<char *>(device_dst),
+                        static_cast<const char *>(host_src), size);
+#else
+  (void)device_dst; (void)host_src; (void)size;
+#endif
+}
+
 void IpcManager::CudaFreeDevice(void *device_ptr) {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (device_ptr) {
