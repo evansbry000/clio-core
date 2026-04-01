@@ -525,9 +525,11 @@ int run_gpu_cte_setup(chi::PoolId cte_pool_id, chi::PoolId bdev_pool_id,
 
   // Poll for completion (result != 0 means done)
   int elapsed_us = 0;
-  while (*d_result == 0 && elapsed_us < 30000000) {
-    usleep(100000);  // 100ms
-    elapsed_us += 100000;
+  while (*d_result == 0 && elapsed_us < 15000000) {
+    usleep(1000000);  // 1s
+    elapsed_us += 1000000;
+    printf("[HOST-SETUP] poll: elapsed=%ds result=%d\n",
+           elapsed_us / 1000000, (int)*d_result);
     printf("[HOST] gpu_cte_setup poll: elapsed=%dms result=%d\n",
            elapsed_us / 1000, (int)*d_result);
   }

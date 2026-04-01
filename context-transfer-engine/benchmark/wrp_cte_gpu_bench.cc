@@ -502,74 +502,51 @@ int main(int argc, char **argv) {
     // CTE client overhead benchmark — measure AsyncPutBlob submission cost
     bool to_cpu = (cfg.test_case == TestCase::kClientOverheadCpu);
 
-    chi::PoolId gpu_pool_id(wrp_cte::core::kCtePoolId.major_ + 1,
-                             wrp_cte::core::kCtePoolId.minor_);
+    // Use the compose-created CTE pool directly (avoids creating a second pool
+    // which triggers nested coroutine issues with FlushData).
+    chi::PoolId gpu_pool_id = wrp_cte::core::kCtePoolId;
     wrp_cte::core::Client cte_client(gpu_pool_id);
-    wrp_cte::core::CreateParams params;
-    auto create_task = cte_client.AsyncCreate(
-        chi::PoolQuery::Dynamic(),
-        "cte_gpu_bench_pool", gpu_pool_id, params);
-    create_task.Wait();
-    if (create_task->GetReturnCode() != 0) {
-      HLOG(kError, "Failed to create CTE GPU pool: {}", create_task->GetReturnCode());
-      return 1;
+    HIPRINT("Using compose CTE pool: ({},{})", gpu_pool_id.major_, gpu_pool_id.minor_);
+
+    // Compose creates CTE before the GPU orchestrator launches, so the CTE
+    // GPU container is never registered. Register it now manually.
+    {
+      bool did_pause = CHI_IPC->PauseGpuOrchestrator();
+      if (did_pause) {
+        void *gpu_cte = CHI_IPC->AllocGpuContainer(gpu_pool_id, 0, "wrp_cte_core");
+        if (gpu_cte) {
+          CHI_IPC->RegisterGpuOrchestratorContainer(gpu_pool_id, gpu_cte);
+          HIPRINT("Registered CTE GPU container for pool ({},{})",
+                  gpu_pool_id.major_, gpu_pool_id.minor_);
+        }
+        CHI_IPC->ResumeGpuOrchestrator();
+      }
     }
     std::this_thread::sleep_for(200ms);
 
-    chi::u64 data_footprint = cfg.warp_bytes * client_warps;
-    chi::u64 default_bdev_size = std::max(data_footprint + 64ULL * 1024 * 1024,
-                                           256ULL * 1024 * 1024);
-
-    // Build target list: use --target specs, or default to HBM
-    std::vector<TargetSpec> targets = cfg.targets;
-    if (targets.empty()) {
-      TargetSpec ts;
-      ts.bdev_type = chimaera::bdev::BdevType::kHbm;
-      ts.label = "hbm";
-      ts.size_bytes = default_bdev_size;
-      targets.push_back(ts);
-    }
-
-    // Register each storage target (CPU + GPU)
+    // Create HBM bdev pool from CPU (compose has empty storage to avoid hang)
     chi::PoolId bdev_pool_id(800, 0);
-    for (size_t ti = 0; ti < targets.size(); ti++) {
-      const auto &ts = targets[ti];
-      std::string target_name = ts.label + "::bench_target_" + std::to_string(ti);
-      HIPRINT("  Registering target: {} ({} bytes)", target_name, ts.size_bytes);
-
-      auto reg_task = cte_client.AsyncRegisterTarget(
-          target_name, ts.bdev_type, ts.size_bytes,
-          chi::PoolQuery::Local(), bdev_pool_id);
-      reg_task.Wait();
-      if (reg_task->GetReturnCode() != 0) {
-        HLOG(kError, "Failed to register target {}: {}",
-             target_name, reg_task->GetReturnCode());
+    chi::u64 target_size = 64ULL * 1024 * 1024;
+    if (!cfg.targets.empty()) target_size = cfg.targets[0].size_bytes;
+    {
+      chimaera::bdev::Client bdev_client(bdev_pool_id);
+      auto bdev_create = bdev_client.AsyncCreate(
+          chi::PoolQuery::Dynamic(), "gpu_bench_hbm_bdev",
+          bdev_pool_id, chimaera::bdev::BdevType::kHbm, target_size);
+      bdev_create.Wait();
+      if (bdev_create->return_code_ != 0) {
+        HLOG(kError, "Failed to create HBM bdev: {}", bdev_create->return_code_);
         return 1;
       }
-      std::this_thread::sleep_for(200ms);
-
-      // GPU-side registration is done below via gpu_cte_setup_kernel
-      // (avoids CPU→GPU POD copy which can't handle priv::string fields)
+      HIPRINT("Created HBM bdev pool ({},{}) size={}", bdev_pool_id.major_,
+              bdev_pool_id.minor_, target_size);
       std::this_thread::sleep_for(200ms);
     }
 
-    printf("[BENCH] Creating CPU-side tag...\n");
-    auto tag_task = cte_client.AsyncGetOrCreateTag(
-        "gpu_bench_tag", wrp_cte::core::TagId::GetNull(),
-        chi::PoolQuery::Local());
-    printf("[BENCH] Waiting for CPU-side tag...\n");
-    tag_task.Wait();
-    printf("[BENCH] CPU-side tag created OK\n");
-    if (tag_task->GetReturnCode() != 0) {
-      HLOG(kError, "Failed to create tag");
-      return 1;
-    }
-    wrp_cte::core::TagId tag_id = tag_task->tag_id_;
-
-    // GPU-side setup: register target + create tag from GPU kernel
-    // (avoids CPU→GPU POD copy which can't handle priv::string fields)
+    wrp_cte::core::TagId tag_id;
+    HIPRINT("Running GPU-side CTE setup (register target + create tag)...");
     int setup_rc = run_gpu_cte_setup(gpu_pool_id, bdev_pool_id,
-                                      targets[0].size_bytes, &tag_id);
+                                      target_size, &tag_id);
     if (setup_rc != 1) {
       HLOG(kError, "GPU-side CTE setup failed: {}", setup_rc);
       return 1;
