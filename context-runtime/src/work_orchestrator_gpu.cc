@@ -109,7 +109,7 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
       if (found > 0) {
         printf("[ORCH] poll#%llu found %d tasks\n", poll_count, found);
       }
-      if (poll_count == 1 || poll_count % 1000000 == 0) {
+      if (poll_count == 1 || poll_count % 100000 == 0) {
         printf("[ORCH] poll#%llu alive, queues: g2g=%p int=%p c2g=%p\n",
                poll_count,
                (void*)worker.gpu2gpu_queue_,

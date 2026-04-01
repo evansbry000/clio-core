@@ -553,10 +553,13 @@ int main(int argc, char **argv) {
       std::this_thread::sleep_for(200ms);
     }
 
+    printf("[BENCH] Creating CPU-side tag...\n");
     auto tag_task = cte_client.AsyncGetOrCreateTag(
         "gpu_bench_tag", wrp_cte::core::TagId::GetNull(),
         chi::PoolQuery::Local());
+    printf("[BENCH] Waiting for CPU-side tag...\n");
     tag_task.Wait();
+    printf("[BENCH] CPU-side tag created OK\n");
     if (tag_task->GetReturnCode() != 0) {
       HLOG(kError, "Failed to create tag");
       return 1;
