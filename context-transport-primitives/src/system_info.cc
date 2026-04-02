@@ -36,6 +36,13 @@
 
 #include "hermes_shm/introspect/system_info.h"
 
+#include <climits>
+#ifdef __linux__
+#include <linux/limits.h>  // PATH_MAX on some Linux toolchains
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
+#endif
 #include <cstdlib>
 #include <string>
 

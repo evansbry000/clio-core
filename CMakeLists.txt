@@ -967,12 +967,15 @@ if(WRP_CORE_ENABLE_TESTS)
         endforeach()
     endfunction()
 
-    foreach(_component_dir
-            context-runtime
-            context-transfer-engine
-            context-assimilation-engine
-            context-exploration-engine)
-        if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+    foreach(_component_dir_pair
+            "context-runtime:WRP_CORE_ENABLE_RUNTIME"
+            "context-transfer-engine:WRP_CORE_ENABLE_CTE"
+            "context-assimilation-engine:WRP_CORE_ENABLE_CAE"
+            "context-exploration-engine:WRP_CORE_ENABLE_CEE")
+        string(REPLACE ":" ";" _pair "${_component_dir_pair}")
+        list(GET _pair 0 _component_dir)
+        list(GET _pair 1 _component_flag)
+        if(${_component_flag} AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
             _chimaera_lock_tests_recursive(
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
                 "${_lsan_opts}")
