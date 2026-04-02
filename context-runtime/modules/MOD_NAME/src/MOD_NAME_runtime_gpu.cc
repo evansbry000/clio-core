@@ -56,7 +56,7 @@ HSHM_GPU_FUN void GpuRuntime::SubtaskTest(
     auto sub = ipc->NewTask<GpuSubmitTask>(
         chi::CreateTaskId(), pool_id_, chi::PoolQuery::Local(),
         /*gpu_id=*/chi::u32(0), task->test_value_);
-    auto future = ipc->SendGpuDirect(sub);
+    auto future = ipc->Send(sub);
     // All lanes must enter Wait (RecvGpu uses __syncwarp)
     future.Wait();
     if (chi::gpu::IpcManager::IsWarpScheduler()) {

@@ -2072,7 +2072,7 @@ template <typename TaskT, typename AllocT>
 HSHM_GPU_FUN bool Future<TaskT, AllocT>::WaitGpu2Gpu(float max_sec,
                                                       bool reuse_task) {
   (void)max_sec;
-  CHI_IPC->RecvGpu(*this, task_ptr_.ptr_);
+  CHI_IPC->Recv(*this, task_ptr_.ptr_);
   if (gpu::IpcManager::IsWarpScheduler()) {
     if (reuse_task) {
       task_ptr_.SetNull();
