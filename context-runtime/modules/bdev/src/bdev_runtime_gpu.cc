@@ -25,9 +25,6 @@ HSHM_GPU_FUN void GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
   bdev_type_   = task->bdev_type_;
   alignment_   = (task->alignment_ > 0) ? task->alignment_ : 4096;
   gpu_heap_ = 0;
-  printf("[BDEV-GPU Update] total_size=%llu bdev_type=%u hbm=%p pinned=%p this=%p\n",
-         (unsigned long long)total_size_, (unsigned)bdev_type_,
-         (void*)hbm_ptr_, (void*)pinned_ptr_, (void*)this);
   num_warps_ = chi::gpu::IpcManager::GetNumWarps();
   if (num_warps_ == 0) num_warps_ = 1;
   warp_caches_.clear();
@@ -131,6 +128,15 @@ HSHM_GPU_FUN void GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
                                      chi::gpu::RunContext &rctx) {
   (void)rctx;
   chi::u32 lane = threadIdx.x % 32;
+  if (lane == 0) {
+    auto *ipc_tmp = CHI_IPC;
+    auto dp = ipc_tmp->ToFullPtr(task->data_).template Cast<char>();
+    char *db = reinterpret_cast<char*>((bdev_type_ == 2) ? hbm_ptr_ : pinned_ptr_);
+    printf("[BDEV-WRITE] len=%llu src=%p dst_base=%p blk0_off=%llu first_src=%02x\n",
+           (unsigned long long)task->length_, (void*)dp.ptr_, (void*)db,
+           (unsigned long long)(task->blocks_.size() > 0 ? task->blocks_[0].offset_ : 0),
+           (unsigned)(dp.ptr_ ? (unsigned char)dp.ptr_[0] : 0));
+  }
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
   static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
@@ -200,6 +206,8 @@ HSHM_GPU_FUN void GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
   if (lane == 0) {
     task->bytes_written_ = data_off;
     task->return_code_ = 0;
+    printf("[BDEV-WRITE] done bytes=%llu rc=%d\n",
+           (unsigned long long)data_off, (int)task->return_code_);
   }
 }
 
@@ -232,6 +240,11 @@ HSHM_GPU_FUN void GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *dst = data_ptr.ptr_;
+  if (lane == 0) {
+    printf("[BDEV-READ] len=%llu src_base=%p dst=%p blk0_off=%llu\n",
+           (unsigned long long)task->length_, (void*)src_base, (void*)dst,
+           (unsigned long long)(task->blocks_.size() > 0 ? task->blocks_[0].offset_ : 0));
+  }
 
   chi::u32 num_lanes = chi::gpu::kWarpSize;
 

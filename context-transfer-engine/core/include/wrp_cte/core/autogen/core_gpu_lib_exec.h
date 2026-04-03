@@ -177,6 +177,9 @@ static HSHM_GPU_FUN void FixupTaskImpl(
     case Method::kRegisterTarget:
       task.template Cast<RegisterTargetTask>().ptr_->FixupAfterCopy();
       break;
+    case Method::kGetOrCreateTag:
+      task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>().ptr_->FixupAfterCopy();
+      break;
     case Method::kPutBlob:
       task.template Cast<PutBlobTask>().ptr_->FixupAfterCopy();
       break;

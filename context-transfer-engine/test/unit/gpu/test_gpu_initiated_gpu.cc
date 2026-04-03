@@ -77,43 +77,41 @@ __global__ void gpu_putblob_getblob_kernel(
   __threadfence_system();
   CHIMAERA_GPU_INIT(gpu_info);
 
-  wrp_cte::core::Client client(pool_id);
+  auto *ipc = CHI_IPC;
 
-  // PutBlob
-  auto put_future = client.AsyncPutBlob(
-      tag_id, "gpu_initiated_blob",
-      /*offset=*/chi::u64(0), blob_size,
-      hipc::ShmPtr<>::FromRaw(blob_data), /*score=*/0.5f,
-      wrp_cte::core::Context(),
-      /*flags=*/chi::u32(0),
-      chi::PoolQuery::Local());
-  if (put_future.IsNull()) {
+  // PutBlob — direct NewTask/Send (client Async* is host-only)
+  auto put_task = ipc->NewTask<wrp_cte::core::PutBlobTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
+      tag_id, "gpu_initiated_blob", chi::u64(0), blob_size,
+      hipc::ShmPtr<>::FromRaw(blob_data), 0.5f,
+      wrp_cte::core::Context(), chi::u32(0));
+  if (put_task.IsNull()) {
     *d_result = -2;
     __threadfence_system();
     return;
   }
+  auto put_future = ipc->Send(put_task);
   put_future.Wait();
-  chi::u32 put_rc = put_future->GetReturnCode();
+  chi::u32 put_rc = put_task->GetReturnCode();
   if (put_rc != 0) {
     *d_result = -10 - (int)put_rc;
     __threadfence_system();
     return;
   }
 
-  // GetBlob into out_data
-  auto get_future = client.AsyncGetBlob(
-      tag_id, "gpu_initiated_blob",
-      /*offset=*/chi::u64(0), blob_size,
-      /*flags=*/chi::u32(0),
-      hipc::ShmPtr<>::FromRaw(out_data),
-      chi::PoolQuery::Local());
-  if (get_future.IsNull()) {
+  // GetBlob into out_data — direct NewTask/Send
+  auto get_task = ipc->NewTask<wrp_cte::core::GetBlobTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
+      tag_id, "gpu_initiated_blob", chi::u64(0), blob_size,
+      chi::u32(0), hipc::ShmPtr<>::FromRaw(out_data));
+  if (get_task.IsNull()) {
     *d_result = -3;
     __threadfence_system();
     return;
   }
+  auto get_future = ipc->Send(get_task);
   get_future.Wait();
-  chi::u32 get_rc = get_future->GetReturnCode();
+  chi::u32 get_rc = get_task->GetReturnCode();
   if (get_rc != 0) {
     *d_result = -20 - (int)get_rc;
     __threadfence_system();

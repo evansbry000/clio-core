@@ -175,9 +175,11 @@ __global__ void gnn_cte_kernel(
         shm.alloc_id_ = data_alloc_id;
         shm.off_.exchange(data_ptr.shm_.off_.load() + c_offset);
 
-        auto get_future = cte_client.AsyncGetBlob(
+        auto get_task = CHI_IPC->NewTask<wrp_cte::core::GetBlobTask>(
+            chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
             tag_id, name_buf, (chi::u64)0, c_size,
-            (chi::u32)0, shm, chi::PoolQuery::Local());
+            (chi::u32)0, shm);
+        auto get_future = CHI_IPC->Send(get_task);
         if (!get_future.GetFutureShmPtr().IsNull()) {
           get_future.Wait();
         } else {

@@ -171,32 +171,22 @@ HSHM_GPU_FUN void GpuRuntime::RegisterTarget(
     hipc::FullPtr<RegisterTargetTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
   if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
-  printf("[GPU-RT] RegisterTarget: entering, bdev_id=(%u,%u) size=%llu\n",
-         task->bdev_id_.major_, task->bdev_id_.minor_,
-         (unsigned long long)task->total_size_);
 
   EnsureMetaInit();
-  printf("[GPU-RT] RegisterTarget: meta init done, meta=%p targets.size=%u\n",
-         (void*)meta_, (unsigned)meta_->targets_.size());
 
   // Build TargetInfo directly — avoid string allocations that require
   // the GPU allocator (may not be available in CPU→GPU CDP context).
   TargetInfo info;
-  printf("[GPU-RT] RegisterTarget: TargetInfo created\n");
 
   // Use task's SSO string data directly (FixupAfterCopy already reseated data_)
   info.target_name_.InitFromSso(task->target_name_);
-  printf("[GPU-RT] RegisterTarget: name copied from SSO\n");
 
   info.bdev_client_.Init(task->bdev_id_);
   info.target_query_ = task->target_query_;
   info.remaining_space_ = task->total_size_;
-  printf("[GPU-RT] RegisterTarget: about to push_back\n");
 
   // Push to targets vector
   meta_->targets_.push_back(info);
-  printf("[GPU-RT] RegisterTarget: push_back done, targets.size=%u\n",
-         (unsigned)meta_->targets_.size());
 
   task->return_code_ = 0;
 }
@@ -229,11 +219,10 @@ HSHM_GPU_FUN void GpuRuntime::EnsureMetaInit() {
   if (m != nullptr) return;
   hipc::FullPtr<GpuMetadata> ptr =
       CHI_IPC->NewObj<GpuMetadata>();
+  ptr->targets_.reserve(16);
   __threadfence();
   meta_ = ptr.ptr_;
   __threadfence();
-  printf("[META] W%u init meta=%p\n",
-         chi::gpu::IpcManager::GetWarpId(), (void*)meta_);
 }
 
 //==============================================================================
@@ -460,23 +449,28 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
   }
 
   // Allocate blocks via bdev (outside locks)
-  auto alloc_task = target_info.bdev_client_.AsyncAllocateBlocks(
+  // Direct NewTask/Send — client Async* methods are host-only
+  auto alloc_task_ptr = CHI_IPC->NewTask<chimaera::bdev::AllocateBlocksTask>(
+      chi::CreateTaskId(), target_info.bdev_client_.pool_id_,
       target_info.target_query_, size);
-  alloc_task.Wait();
+  auto alloc_future = CHI_IPC->Send(alloc_task_ptr);
+  alloc_future.Wait();
 
-  if (alloc_task->blocks_.empty()) {
+  if (alloc_task_ptr->blocks_.empty()) {
     task->return_code_ = 8;  // Allocation failed
     return;
   }
 
-  // Copy data to allocated blocks via bdev (full-warp parallelism)
+  // Copy data to allocated blocks via bdev
   chi::PoolQuery warp_query = target_info.target_query_;
   warp_query.SetParallelism(32);
-  auto write_task = target_info.bdev_client_.AsyncWrite(
-      warp_query, alloc_task->blocks_, task->blob_data_, size);
-  write_task.Wait();
+  auto write_task_ptr = CHI_IPC->NewTask<chimaera::bdev::WriteTask>(
+      chi::CreateTaskId(), target_info.bdev_client_.pool_id_,
+      warp_query, alloc_task_ptr->blocks_, task->blob_data_, size);
+  auto write_future = CHI_IPC->Send(write_task_ptr);
+  write_future.Wait();
 
-  if (write_task->return_code_ != 0) {
+  if (write_task_ptr->return_code_ != 0) {
     task->return_code_ = 9;  // Write failed
     return;
   }
@@ -495,9 +489,9 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
 
     // Create BlobBlock structs from allocated blocks
     entry->blocks_.clear();
-    for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
+    for (size_t i = 0; i < alloc_task_ptr->blocks_.size(); ++i) {
       BlobBlock blk(target_info.bdev_client_, target_info.target_query_,
-                    alloc_task->blocks_[i].offset_, alloc_task->blocks_[i].size_);
+                    alloc_task_ptr->blocks_[i].offset_, alloc_task_ptr->blocks_[i].size_);
       entry->blocks_.push_back(blk);
     }
 
@@ -603,11 +597,14 @@ HSHM_GPU_FUN void GpuRuntime::GetBlob(
   // Read the single block via bdev (full-warp parallelism)
   chi::PoolQuery warp_query = blocks[0].target_query_;
   warp_query.SetParallelism(32);
-  auto read_task = blocks[0].bdev_client_.AsyncRead(
+  // Direct NewTask/Send — client Async* methods are host-only
+  auto read_task_ptr = CHI_IPC->NewTask<chimaera::bdev::ReadTask>(
+      chi::CreateTaskId(), blocks[0].bdev_client_.pool_id_,
       warp_query, read_blocks, task->blob_data_, size);
-  read_task.Wait();
+  auto read_future = CHI_IPC->Send(read_task_ptr);
+  read_future.Wait();
 
-  if (read_task->return_code_ != 0) {
+  if (read_task_ptr->return_code_ != 0) {
     task->return_code_ = 4;  // Read failed
     return;
   }
@@ -616,7 +613,7 @@ HSHM_GPU_FUN void GpuRuntime::GetBlob(
   chi::u64 can_read = (offset < blob_size) ? (blob_size - offset) : 0;
   chi::u64 expected_read = (can_read < size) ? can_read : size;
 
-  task->return_code_ = (read_task->bytes_read_ == expected_read) ? 0 : 1;
+  task->return_code_ = (read_task_ptr->bytes_read_ == expected_read) ? 0 : 1;
 }
 
 //==============================================================================

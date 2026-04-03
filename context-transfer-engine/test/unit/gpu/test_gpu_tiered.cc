@@ -1,25 +1,20 @@
 /**
- * test_gpu_tiered.cc — CTE GPU unit test with two-tier storage
+ * test_gpu_tiered.cc — CTE GPU unit test with two-tier storage (host side)
  *
  * Tests GPU-initiated PutBlob (200MB) and GetBlob (100MB) with:
  *   - HBM tier: 50MB (fills first, then spills to pinned)
  *   - Pinned host DRAM tier: 400MB (overflow)
  *
- * Uses 1 client warp (32 threads) and 1 runtime warp.
+ * This file is compiled by g++ (not nvcc) so CHI_IPC resolves correctly.
+ * The GPU kernel is in test_gpu_tiered_gpu.cc, compiled by nvcc.
  */
-
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
 #include <wrp_cte/core/core_client.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/gpu_api.h>
-#include <hermes_shm/lightbeam/transport_factory_impl.h>
-
-#if HSHM_IS_HOST
 
 #include <cstdio>
 #include <cstring>
@@ -62,8 +57,8 @@ int main(int argc, char **argv) {
   printf("Config:    %s\n", config_path.c_str());
   printf("HBM tier:  50 MB\n");
   printf("Pinned:    400 MB\n");
-  printf("Put:       200 MB (4 x 50MB blobs)\n");
-  printf("Get:       100 MB (2 x 50MB blobs)\n");
+  printf("Put:       50 MB (50 x 1MB blobs)\n");
+  printf("Get:       50 MB (50 x 1MB blobs)\n");
   printf("Client:    1 warp (32 threads)\n");
   printf("Runtime:   1 warp\n");
   printf("------------------------------------------------------------\n\n");
@@ -196,6 +191,3 @@ int main(int argc, char **argv) {
 
   return (result == 1) ? 0 : 1;
 }
-
-#endif  // HSHM_IS_HOST
-#endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM

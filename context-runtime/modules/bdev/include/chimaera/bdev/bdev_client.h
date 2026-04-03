@@ -96,7 +96,7 @@ class Client : public chi::ContainerClient {
    * @param size Requested total size to allocate
    * @return Future for the allocation task
    */
-  HSHM_CROSS_FUN chi::Future<AllocateBlocksTask> AsyncAllocateBlocks(
+  chi::Future<AllocateBlocksTask> AsyncAllocateBlocks(
       const chi::PoolQuery& pool_query,
       chi::u64 size) {
     auto* ipc_manager = CHI_IPC;
@@ -115,7 +115,6 @@ class Client : public chi::ContainerClient {
       const std::vector<Block>& blocks) {
     auto* ipc_manager = CHI_IPC;
 
-    // Create task with std::vector constructor (constructor parameter uses std::vector)
     auto task = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>(
         chi::CreateTaskId(), pool_id_, pool_query, blocks);
 
@@ -123,9 +122,9 @@ class Client : public chi::ContainerClient {
   }
 
   /**
-   * Free multiple blocks - asynchronous (GPU-compatible, priv::vector)
+   * Free multiple blocks - asynchronous (priv::vector)
    */
-  HSHM_CROSS_FUN chi::Future<chimaera::bdev::FreeBlocksTask> AsyncFreeBlocks(
+  chi::Future<chimaera::bdev::FreeBlocksTask> AsyncFreeBlocks(
       const chi::PoolQuery& pool_query,
       const chi::priv::vector<Block>& blocks) {
     auto* ipc_manager = CHI_IPC;
@@ -144,7 +143,7 @@ class Client : public chi::ContainerClient {
    * @param length Size of data to write
    * @return Future for the write task
    */
-  HSHM_CROSS_FUN chi::Future<chimaera::bdev::WriteTask> AsyncWrite(
+  chi::Future<chimaera::bdev::WriteTask> AsyncWrite(
       const chi::PoolQuery& pool_query,
       const chi::priv::vector<Block>& blocks, hipc::ShmPtr<> data, size_t length) {
     auto* ipc_manager = CHI_IPC;
@@ -163,7 +162,7 @@ class Client : public chi::ContainerClient {
    * @param buffer_size Size of the output buffer
    * @return Future for the read task
    */
-  HSHM_CROSS_FUN chi::Future<chimaera::bdev::ReadTask> AsyncRead(
+  chi::Future<chimaera::bdev::ReadTask> AsyncRead(
       const chi::PoolQuery& pool_query,
       const chi::priv::vector<Block>& blocks, hipc::ShmPtr<> data,
       size_t buffer_size) {

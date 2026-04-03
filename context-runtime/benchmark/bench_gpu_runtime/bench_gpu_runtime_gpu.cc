@@ -255,10 +255,11 @@ __global__ void gpu_bench_coroutine_kernel(
     chi::u32 total_warps) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  // All lanes call AsyncSubtaskTest — internally guarded by warp leader.
-  chimaera::MOD_NAME::Client client(pool_id);
+  auto *ipc = CHI_IPC;
   for (chi::u32 i = 0; i < total_tasks; ++i) {
-    auto future = client.AsyncSubtaskTest(chi::PoolQuery::Local(), i, subtasks);
+    auto task = ipc->NewTask<chimaera::MOD_NAME::SubtaskTestTask>(
+        chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(), i, subtasks);
+    auto future = ipc->Send(task);
     future.Wait();
   }
 
@@ -1449,19 +1450,21 @@ __global__ void gpu_bench_parallel_kernel(
     chi::u32 total_warps) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chimaera::MOD_NAME::Client client(pool_id);
+  auto *ipc = CHI_IPC;
   chi::u32 errors = 0;
 
   for (chi::u32 i = 0; i < total_tasks; ++i) {
-    auto future = client.AsyncGpuSubmit(
+    auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        chi::CreateTaskId(), pool_id,
         chi::PoolQuery::Local(parallelism), (chi::u32)0, (chi::u32)7);
+    auto future = ipc->Send(task);
     future.Wait();
 
     if (chi::gpu::IpcManager::IsWarpScheduler()) {
-      if (!future.IsNull() && future->result_value_ != 21) {
+      if (!future.IsNull() && task->result_value_ != 21) {
         if (errors == 0) {
           printf("[PARALLEL ERROR] blk=%u task %u: expected=21, got=%u\n",
-                 blockIdx.x, i, (unsigned)future->result_value_);
+                 blockIdx.x, i, (unsigned)task->result_value_);
         }
         ++errors;
       }
@@ -1586,20 +1589,22 @@ __global__ void gpu_bench_bdev_kernel(
     chi::u32 total_warps) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chimaera::bdev::Client bdev_client(bdev_pool_id);
+  auto *ipc = CHI_IPC;
   chi::u32 errors = 0;
 
   for (chi::u32 i = 0; i < total_tasks; ++i) {
-    auto future = bdev_client.AsyncAllocateBlocks(
+    auto task = ipc->NewTask<chimaera::bdev::AllocateBlocksTask>(
+        chi::CreateTaskId(), bdev_pool_id,
         chi::PoolQuery::Local(), alloc_size);
+    auto future = ipc->Send(task);
     future.Wait();
 
     if (chi::gpu::IpcManager::IsWarpScheduler()) {
-      if (future.IsNull() || future->return_code_ != 0) {
+      if (future.IsNull() || task->return_code_ != 0) {
         if (errors == 0) {
           printf("[BDEV ERROR] blk=%u task %u: alloc failed (rc=%d)\n",
                  blockIdx.x, i,
-                 future.IsNull() ? -999 : (int)future->return_code_);
+                 future.IsNull() ? -999 : (int)task->return_code_);
         }
         ++errors;
       }
@@ -1716,7 +1721,7 @@ __global__ void gpu_bench_bdev_full_kernel(
     int *d_result) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chimaera::bdev::Client bdev_client(bdev_pool_id);
+  auto *ipc = CHI_IPC;
   int rc = 0;
 
   // Step 1: AllocateBlocks
@@ -1724,25 +1729,27 @@ __global__ void gpu_bench_bdev_full_kernel(
     printf("[BDEV-FULL] Step 1: AllocateBlocks(%llu bytes)\n",
            (unsigned long long)io_size);
   }
-  auto alloc_future = bdev_client.AsyncAllocateBlocks(
+  auto alloc_task = ipc->NewTask<chimaera::bdev::AllocateBlocksTask>(
+      chi::CreateTaskId(), bdev_pool_id,
       chi::PoolQuery::Local(), io_size);
+  auto alloc_future = ipc->Send(alloc_task);
   alloc_future.Wait();
 
   if (chi::gpu::IpcManager::IsWarpScheduler()) {
-    if (alloc_future.IsNull() || alloc_future->return_code_ != 0) {
+    if (alloc_future.IsNull() || alloc_task->return_code_ != 0) {
       printf("[BDEV-FULL] FAIL: AllocateBlocks rc=%d null=%d\n",
-             alloc_future.IsNull() ? -999 : (int)alloc_future->return_code_,
+             alloc_future.IsNull() ? -999 : (int)alloc_task->return_code_,
              (int)alloc_future.IsNull());
       rc = -1;
-    } else if (alloc_future->blocks_.size() == 0) {
+    } else if (alloc_task->blocks_.size() == 0) {
       printf("[BDEV-FULL] FAIL: AllocateBlocks returned 0 blocks (rc=%d)\n",
-             (int)alloc_future->return_code_);
+             (int)alloc_task->return_code_);
       rc = -1;
     } else {
       printf("[BDEV-FULL] AllocateBlocks OK, %u blocks, offset=%llu size=%llu\n",
-             (unsigned)alloc_future->blocks_.size(),
-             (unsigned long long)alloc_future->blocks_[0].offset_,
-             (unsigned long long)alloc_future->blocks_[0].size_);
+             (unsigned)alloc_task->blocks_.size(),
+             (unsigned long long)alloc_task->blocks_[0].offset_,
+             (unsigned long long)alloc_task->blocks_[0].size_);
     }
   }
   // Broadcast rc to all lanes
@@ -1753,7 +1760,7 @@ __global__ void gpu_bench_bdev_full_kernel(
   // We need to copy blocks to a local variable accessible by all lanes
   chi::priv::vector<chimaera::bdev::Block> blocks;
   if (chi::gpu::IpcManager::IsWarpScheduler()) {
-    blocks = alloc_future->blocks_;
+    blocks = alloc_task->blocks_;
   }
 
   // Step 2: Write — fill a buffer with known pattern and write it
@@ -1784,14 +1791,16 @@ __global__ void gpu_bench_bdev_full_kernel(
   hipc::ShmPtr<> write_data_shm;
   write_data_shm.off_ = write_buf.shm_.off_.load();
   write_data_shm.alloc_id_ = write_buf.shm_.alloc_id_;
-  auto write_future = bdev_client.AsyncWrite(
+  auto write_task = ipc->NewTask<chimaera::bdev::WriteTask>(
+      chi::CreateTaskId(), bdev_pool_id,
       chi::PoolQuery::Local(), blocks, write_data_shm, io_size);
+  auto write_future = ipc->Send(write_task);
   write_future.Wait();
 
   if (chi::gpu::IpcManager::IsWarpScheduler()) {
-    if (write_future.IsNull() || write_future->return_code_ != 0) {
+    if (write_future.IsNull() || write_task->return_code_ != 0) {
       printf("[BDEV-FULL] FAIL: Write rc=%d\n",
-             write_future.IsNull() ? -999 : (int)write_future->return_code_);
+             write_future.IsNull() ? -999 : (int)write_task->return_code_);
       rc = -3;
     } else {
       printf("[BDEV-FULL] Write OK\n");
@@ -1824,14 +1833,16 @@ __global__ void gpu_bench_bdev_full_kernel(
   hipc::ShmPtr<> read_data_shm;
   read_data_shm.off_ = read_buf.shm_.off_.load();
   read_data_shm.alloc_id_ = read_buf.shm_.alloc_id_;
-  auto read_future = bdev_client.AsyncRead(
+  auto read_task = ipc->NewTask<chimaera::bdev::ReadTask>(
+      chi::CreateTaskId(), bdev_pool_id,
       chi::PoolQuery::Local(), blocks, read_data_shm, io_size);
+  auto read_future = ipc->Send(read_task);
   read_future.Wait();
 
   if (chi::gpu::IpcManager::IsWarpScheduler()) {
-    if (read_future.IsNull() || read_future->return_code_ != 0) {
+    if (read_future.IsNull() || read_task->return_code_ != 0) {
       printf("[BDEV-FULL] FAIL: Read rc=%d\n",
-             read_future.IsNull() ? -999 : (int)read_future->return_code_);
+             read_future.IsNull() ? -999 : (int)read_task->return_code_);
       rc = -5;
     } else {
       printf("[BDEV-FULL] Read OK\n");
@@ -2541,8 +2552,8 @@ __global__ void gpu_putblob_kernel(
     }
     __syncwarp();
 
-    // All lanes call AsyncPutBlob — internally guarded by warp leader
-    wrp_cte::core::Client cte_client(cte_pool_id);
+    // All lanes call via NewTask/Send — internally guarded by warp leader
+    auto *ipc = CHI_IPC;
 
     // Build ShmPtr referencing the data allocator backend
     hipc::ShmPtr<> blob_shm;
@@ -2564,14 +2575,15 @@ __global__ void gpu_putblob_kernel(
     for (int d = nd - 1; d >= 0; --d) name_buf[pos++] = digits[d];
     name_buf[pos] = '\0';
 
-    auto future = cte_client.AsyncPutBlob(
-        tag_id, name_buf,
-        /*offset=*/0, /*size=*/slice_size,
-        blob_shm, /*score=*/-1.0f,
-        wrp_cte::core::Context(), /*flags=*/0,
+    auto task = ipc->NewTask<wrp_cte::core::PutBlobTask>(
+        chi::CreateTaskId(), cte_pool_id,
         to_cpu ? chi::PoolQuery::ToLocalCpu()
-               : chi::PoolQuery::Local());
-
+               : chi::PoolQuery::Local(),
+        tag_id, name_buf,
+        /*offset=*/(chi::u64)0, /*size=*/slice_size,
+        blob_shm, /*score=*/-1.0f,
+        wrp_cte::core::Context(), /*flags=*/(chi::u32)0);
+    auto future = ipc->Send(task);
     future.Wait();
   }
 

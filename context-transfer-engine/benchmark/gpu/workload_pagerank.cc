@@ -143,9 +143,11 @@ __global__ void pr_cte_kernel(
       shm.alloc_id_ = data_alloc_id;
       shm.off_.exchange(data_ptr.shm_.off_.load() + my_edge_offset);
 
-      auto get_future = cte_client.AsyncGetBlob(
+      auto get_task = CHI_IPC->NewTask<wrp_cte::core::GetBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
           tag_id, name_buf, (chi::u64)0, my_edge_bytes,
-          (chi::u32)0, shm, chi::PoolQuery::Local());
+          (chi::u32)0, shm);
+      auto get_future = CHI_IPC->Send(get_task);
       if (!get_future.GetFutureShmPtr().IsNull()) {
         get_future.Wait();
       } else {
@@ -181,10 +183,11 @@ __global__ void pr_cte_kernel(
       shm.alloc_id_ = data_alloc_id;
       shm.off_.exchange(data_ptr.shm_.off_.load() + my_edge_offset);
 
-      auto put_future = cte_client.AsyncPutBlob(
+      auto put_task = CHI_IPC->NewTask<wrp_cte::core::PutBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
           tag_id, name_buf, (chi::u64)0, my_edge_bytes,
-          shm, -1.0f, wrp_cte::core::Context(), (chi::u32)0,
-          chi::PoolQuery::Local());
+          shm, -1.0f, wrp_cte::core::Context(), (chi::u32)0);
+      auto put_future = CHI_IPC->Send(put_task);
       if (!put_future.GetFutureShmPtr().IsNull()) {
         put_future.Wait();
       }

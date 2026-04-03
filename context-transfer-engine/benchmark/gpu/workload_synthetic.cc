@@ -358,9 +358,11 @@ __global__ void synthetic_cte_kernel(
       shm.alloc_id_ = data_alloc_id;
       shm.off_.exchange(array_ptr.shm_.off_.load() + warp_id * warp_bytes);
 
-      auto put_future = cte_client.AsyncPutBlob(
+      auto put_task = CHI_IPC->NewTask<wrp_cte::core::PutBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, pool_query,
           tag_id, name_buf, offset, warp_bytes,
-          shm, -1.0f, wrp_cte::core::Context(), (chi::u32)0, pool_query);
+          shm, -1.0f, wrp_cte::core::Context(), (chi::u32)0);
+      auto put_future = CHI_IPC->Send(put_task);
       if (!put_future.GetFutureShmPtr().IsNull()) {
         put_future.Wait();
       } else {
@@ -376,9 +378,11 @@ __global__ void synthetic_cte_kernel(
       shm.alloc_id_ = data_alloc_id;
       shm.off_.exchange(read_ptr.shm_.off_.load() + warp_id * warp_bytes);
 
-      auto get_future = cte_client.AsyncGetBlob(
+      auto get_task = CHI_IPC->NewTask<wrp_cte::core::GetBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, pool_query,
           tag_id, name_buf, offset, warp_bytes,
-          (chi::u32)0, shm, pool_query);
+          (chi::u32)0, shm);
+      auto get_future = CHI_IPC->Send(get_task);
       if (!get_future.GetFutureShmPtr().IsNull()) {
         get_future.Wait();
       } else {

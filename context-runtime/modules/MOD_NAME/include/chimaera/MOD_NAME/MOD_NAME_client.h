@@ -196,7 +196,6 @@ class Client : public chi::ContainerClient {
    * Submit SubtaskTest task (asynchronous)
    * GPU implementation co_awaits GpuSubmit on itself to test coroutine yielding.
    */
-  HSHM_CROSS_FUN
   chi::Future<SubtaskTestTask> AsyncSubtaskTest(const chi::PoolQuery& pool_query,
                                                 chi::u32 test_value,
                                                 chi::u32 num_subtasks = 1) {
@@ -206,7 +205,6 @@ class Client : public chi::ContainerClient {
     return ipc_manager->Send(task);
   }
 
-  HSHM_CROSS_FUN
   chi::Future<GpuSubmitTask> AsyncGpuSubmit(const chi::PoolQuery& pool_query,
                                             chi::u32 gpu_id,
                                             chi::u32 test_value,

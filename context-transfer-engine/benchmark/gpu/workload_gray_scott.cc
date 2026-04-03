@@ -164,9 +164,11 @@ __global__ void gs_cte_kernel(
       hipc::ShmPtr<> shm_u;
       shm_u.alloc_id_ = data_alloc_id;
       shm_u.off_.exchange(data_ptr.shm_.off_.load() + my_field_offset);
-      auto get_u = cte_client.AsyncGetBlob(
+      auto get_u_task = CHI_IPC->NewTask<wrp_cte::core::GetBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
           tag_id, name_u, (chi::u64)0, half_bytes,
-          (chi::u32)0, shm_u, chi::PoolQuery::Local());
+          (chi::u32)0, shm_u);
+      auto get_u = CHI_IPC->Send(get_u_task);
       if (!get_u.GetFutureShmPtr().IsNull()) {
         get_u.Wait();
       } else {
@@ -178,9 +180,11 @@ __global__ void gs_cte_kernel(
         hipc::ShmPtr<> shm_v;
         shm_v.alloc_id_ = data_alloc_id;
         shm_v.off_.exchange(data_ptr.shm_.off_.load() + my_field_offset + half_bytes);
-        auto get_v = cte_client.AsyncGetBlob(
+        auto get_v_task = CHI_IPC->NewTask<wrp_cte::core::GetBlobTask>(
+            chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
             tag_id, name_v, (chi::u64)0, half_bytes,
-            (chi::u32)0, shm_v, chi::PoolQuery::Local());
+            (chi::u32)0, shm_v);
+        auto get_v = CHI_IPC->Send(get_v_task);
         if (!get_v.GetFutureShmPtr().IsNull()) {
           get_v.Wait();
         } else {
@@ -227,10 +231,11 @@ __global__ void gs_cte_kernel(
       hipc::ShmPtr<> shm_u2;
       shm_u2.alloc_id_ = data_alloc_id;
       shm_u2.off_.exchange(data_ptr.shm_.off_.load() + my_field_offset + 2*half_bytes);
-      auto put_u2 = cte_client.AsyncPutBlob(
+      auto put_u2_task = CHI_IPC->NewTask<wrp_cte::core::PutBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
           tag_id, name_u, (chi::u64)0, half_bytes,
-          shm_u2, -1.0f, wrp_cte::core::Context(), (chi::u32)0,
-          chi::PoolQuery::Local());
+          shm_u2, -1.0f, wrp_cte::core::Context(), (chi::u32)0);
+      auto put_u2 = CHI_IPC->Send(put_u2_task);
       if (!put_u2.GetFutureShmPtr().IsNull()) {
         put_u2.Wait();
       }
@@ -239,10 +244,11 @@ __global__ void gs_cte_kernel(
       hipc::ShmPtr<> shm_v2;
       shm_v2.alloc_id_ = data_alloc_id;
       shm_v2.off_.exchange(data_ptr.shm_.off_.load() + my_field_offset + 3*half_bytes);
-      auto put_v2 = cte_client.AsyncPutBlob(
+      auto put_v2_task = CHI_IPC->NewTask<wrp_cte::core::PutBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, chi::PoolQuery::Local(),
           tag_id, name_v, (chi::u64)0, half_bytes,
-          shm_v2, -1.0f, wrp_cte::core::Context(), (chi::u32)0,
-          chi::PoolQuery::Local());
+          shm_v2, -1.0f, wrp_cte::core::Context(), (chi::u32)0);
+      auto put_v2 = CHI_IPC->Send(put_v2_task);
       if (!put_v2.GetFutureShmPtr().IsNull()) {
         put_v2.Wait();
       }

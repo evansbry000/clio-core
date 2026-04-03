@@ -206,13 +206,15 @@ __global__ void gpu_client_overhead_kernel(
       auto pool_query = to_cpu ? chi::PoolQuery::ToLocalCpu()
                                : chi::PoolQuery::Local();
 
-      // === TIMED: AsyncPutBlob submission (all lanes enter) ===
+      // === TIMED: PutBlob submission (direct NewTask/Send) ===
       long long t0 = clock64();
-      auto future = cte_client.AsyncPutBlob(
+      auto put_task = CHI_IPC->NewTask<wrp_cte::core::PutBlobTask>(
+          chi::CreateTaskId(), cte_client.pool_id_, pool_query,
           tag_id, name_buf,
           (chi::u64)0, warp_bytes,
           blob_shm, -1.0f,
-          wrp_cte::core::Context(), (chi::u32)0, pool_query);
+          wrp_cte::core::Context(), (chi::u32)0);
+      auto future = CHI_IPC->Send(put_task);
       long long t1 = clock64();
       if (lane_id == 0) submit_acc += (t1 - t0);
 

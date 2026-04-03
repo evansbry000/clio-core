@@ -64,41 +64,34 @@ if(WRP_CORE_ENABLE_CUDA)
   add_cuda_library(test_gpu_initiated_kernels STATIC TRUE
       gpu/test_gpu_initiated_gpu.cc
       gpu/test_gpu_coroutine_gpu.cc
+      gpu/test_gpu_tiered_gpu.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/MOD_NAME/include
+          ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
       LINK_LIBS hshm::cuda_cxx chimaera_cxx_gpu
   )
   target_link_libraries(test_gpu_initiated_kernels hshm::cuda_cxx)
 
   # GPU-tiered test: PutBlob 200MB + GetBlob 100MB with HBM+pinned tiers
-  # Single executable via add_cuda_executable (clang-cuda dual-pass)
-  set(_TIERED_EXTRA_INCLUDES "")
-  foreach(_dep yaml-cpp::yaml-cpp ZeroMQ::libzmq)
-    if(TARGET "${_dep}")
-      get_target_property(_dep_incs "${_dep}" INTERFACE_INCLUDE_DIRECTORIES)
-      if(_dep_incs)
-        list(APPEND _TIERED_EXTRA_INCLUDES ${_dep_incs})
-      endif()
-    endif()
-  endforeach()
-
-  add_cuda_executable(test_gpu_tiered TRUE
+  # GPU kernel compiled by nvcc, host code compiled by g++ (avoids CHI_IPC
+  # macro resolving to gpu::GetGpuIpcManager() which is nullptr on host).
+  add_executable(test_gpu_tiered
       gpu/test_gpu_tiered.cc
-      gpu/test_gpu_tiered_gpu.cc
-      INCLUDE_DIRS
-          ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
-          ${CMAKE_SOURCE_DIR}/context-runtime/include
-          ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
-          ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
-          ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
-          ${_TIERED_EXTRA_INCLUDES}
-      LINK_LIBS
-          wrp_cte::core_client
-          chimaera::cxx
-          hshm::cuda_cxx
+  )
+  set_target_properties(test_gpu_tiered PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON
+      LINKER_LANGUAGE CUDA
+      POSITION_INDEPENDENT_CODE ON
   )
   install(TARGETS test_gpu_tiered RUNTIME DESTINATION bin)
+
+  # Copy config yaml next to the source (where __FILE__ resolves)
+  add_custom_command(TARGET test_gpu_tiered POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${CMAKE_CURRENT_SOURCE_DIR}/gpu/test_gpu_tiered_config.yaml
+      ${CMAKE_CURRENT_BINARY_DIR}/gpu/test_gpu_tiered_config.yaml
+  )
 
   add_test(NAME cte_gpu_tiered_test COMMAND test_gpu_tiered)
   set_tests_properties(cte_gpu_tiered_test PROPERTIES
@@ -193,6 +186,15 @@ target_include_directories(test_gpu_core PRIVATE
 
 target_include_directories(test_gpu_create PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_gpu_tiered PRIVATE
+  ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+  ${CMAKE_SOURCE_DIR}/context-runtime/include
+  ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+  ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+  ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+  ${CMAKE_SOURCE_DIR}/build/context-transport-primitives/src/include
 )
 
 # Link against required libraries using simple_test.h framework (NOT Catch2)
@@ -352,6 +354,25 @@ target_link_libraries(test_gpu_create
     hermes_shm_cuda              # HermesShm CUDA library (for GPU kernels)
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
+
+# Link test_gpu_tiered - split compilation (host g++, kernel nvcc)
+target_link_libraries(test_gpu_tiered
+    wrp_cte_core_runtime         # CTE core runtime library
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    chimaera::bdev_client        # Bdev client for BdevType enum
+    hshm::cxx                    # HermesShm library (CPU)
+    hermes_shm_cuda              # HermesShm CUDA library (for GPU kernels)
+    $<$<BOOL:${WRP_CORE_ENABLE_CUDA}>:test_gpu_initiated_kernels>
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+  find_package(CUDAToolkit QUIET)
+  set_property(TARGET test_gpu_tiered APPEND PROPERTY
+    LINK_LIBRARIES "CUDA::cudart")
+endif()
 
 # Note: Include directories are provided automatically via linked ChiMod targets
 # wrp_cte_core_client provides ${WRP_CTE_ROOT}/core/include via transitive includes

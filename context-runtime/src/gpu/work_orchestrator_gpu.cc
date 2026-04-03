@@ -102,13 +102,16 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
     worker.gpu_info_ptr_ = d_gpu_info;
 
     // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
-    // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
     int loop_count = 0;
+    printf("[ORCH] START gpu2gpu=%p internal=%p cpu2gpu=%p\n",
+           (void*)worker.gpu2gpu_queue_,
+           (void*)worker.internal_queue_,
+           (void*)worker.cpu2gpu_queue_);
     while (worker.is_running_ && !control->exit_flag) {
       int g2g = worker.PollGpu2Gpu();
       worker.PollCpu2Gpu();
       if (g2g > 0) {
-        printf("[ORCH-POLL] Found %d tasks (loop %d)\n", g2g, loop_count);
+        printf("[ORCH] loop=%d g2g=%d\n", loop_count, g2g);
       }
       ++loop_count;
     }
@@ -162,11 +165,11 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   hshm::GpuApi::Memcpy(d_pm, &host_pm, sizeof(gpu::PoolManager));
 
   // Set GPU limits for CDP
-  cudaDeviceSetLimit(cudaLimitStackSize, 32768);
-  cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024);
-  cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 8192);
-  cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 16);  // Allow nested CDP
-  cudaDeviceSetLimit(cudaLimitMallocHeapSize, 32 * 1024 * 1024);  // 32MB device heap
+  cudaDeviceSetLimit(cudaLimitStackSize, 16384);
+  cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 4 * 1024 * 1024);
+  cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 256);
+  cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 4);
+  cudaDeviceSetLimit(cudaLimitMallocHeapSize, 8 * 1024 * 1024);
 
   // Create dedicated stream
   stream_ = hshm::GpuApi::CreateStream();

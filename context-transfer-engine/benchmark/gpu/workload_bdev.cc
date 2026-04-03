@@ -62,18 +62,21 @@ __global__ void gpu_bdev_alloc_free_kernel(
       __threadfence_system();
 
       // Allocate
-      auto alloc_future = bdev_client.AsyncAllocateBlocks(pool_query, alloc_size);
-      if (alloc_future.GetFutureShmPtr().IsNull()) {
+      auto alloc_task = CHI_IPC->NewTask<chimaera::bdev::AllocateBlocksTask>(
+          chi::CreateTaskId(), bdev_client.pool_id_, pool_query, alloc_size);
+      if (alloc_task.IsNull()) {
         d_progress[warp_id] = -(1000 + static_cast<int>(iter));
         __threadfence_system();
         break;
       }
+      auto alloc_future = CHI_IPC->Send(alloc_task);
       alloc_future.Wait();
 
       // Free
-      auto free_future = bdev_client.AsyncFreeBlocks(
-          pool_query, alloc_future->blocks_);
-      if (!free_future.GetFutureShmPtr().IsNull()) {
+      auto free_task = CHI_IPC->NewTask<chimaera::bdev::FreeBlocksTask>(
+          chi::CreateTaskId(), bdev_client.pool_id_, pool_query, alloc_task->blocks_);
+      if (!free_task.IsNull()) {
+        auto free_future = CHI_IPC->Send(free_task);
         free_future.Wait();
       }
     }
@@ -129,11 +132,13 @@ __global__ void gpu_bdev_read_write_kernel(
       long long write_acc = 0, read_acc = 0;
 
       // Allocate blocks once
-      auto alloc_future = bdev_client.AsyncAllocateBlocks(pool_query, warp_bytes);
-      if (alloc_future.GetFutureShmPtr().IsNull()) {
+      auto alloc_task = CHI_IPC->NewTask<chimaera::bdev::AllocateBlocksTask>(
+          chi::CreateTaskId(), bdev_client.pool_id_, pool_query, warp_bytes);
+      if (alloc_task.IsNull()) {
         d_progress[warp_id] = -1000;
         __threadfence_system();
       } else {
+        auto alloc_future = CHI_IPC->Send(alloc_task);
         alloc_future.Wait();
 
         d_progress[warp_id] = 2;
@@ -159,13 +164,15 @@ __global__ void gpu_bdev_read_write_kernel(
 
           // Write (timed)
           long long t0 = clock64();
-          auto write_future = bdev_client.AsyncWrite(
-              pool_query_parallel, alloc_future->blocks_, data_shm, warp_bytes);
-          if (write_future.GetFutureShmPtr().IsNull()) {
+          auto write_task = CHI_IPC->NewTask<chimaera::bdev::WriteTask>(
+              chi::CreateTaskId(), bdev_client.pool_id_,
+              pool_query_parallel, alloc_task->blocks_, data_shm, warp_bytes);
+          if (write_task.IsNull()) {
             d_progress[warp_id] = -(2000 + static_cast<int>(iter));
             __threadfence_system();
             break;
           }
+          auto write_future = CHI_IPC->Send(write_task);
           write_future.Wait();
           long long t1 = clock64();
           write_acc += (t1 - t0);
@@ -179,22 +186,25 @@ __global__ void gpu_bdev_read_write_kernel(
 
           // Read (timed)
           long long t2 = clock64();
-          auto read_future = bdev_client.AsyncRead(
-              pool_query_parallel, alloc_future->blocks_, data_shm, warp_bytes);
-          if (read_future.GetFutureShmPtr().IsNull()) {
+          auto read_task = CHI_IPC->NewTask<chimaera::bdev::ReadTask>(
+              chi::CreateTaskId(), bdev_client.pool_id_,
+              pool_query_parallel, alloc_task->blocks_, data_shm, warp_bytes);
+          if (read_task.IsNull()) {
             d_progress[warp_id] = -(3000 + static_cast<int>(iter));
             __threadfence_system();
             break;
           }
+          auto read_future = CHI_IPC->Send(read_task);
           read_future.Wait();
           long long t3 = clock64();
           read_acc += (t3 - t2);
         }
 
         // Free blocks
-        auto free_future = bdev_client.AsyncFreeBlocks(
-            pool_query, alloc_future->blocks_);
-        if (!free_future.GetFutureShmPtr().IsNull()) {
+        auto free_task = CHI_IPC->NewTask<chimaera::bdev::FreeBlocksTask>(
+            chi::CreateTaskId(), bdev_client.pool_id_, pool_query, alloc_task->blocks_);
+        if (!free_task.IsNull()) {
+          auto free_future = CHI_IPC->Send(free_task);
           free_future.Wait();
         }
 

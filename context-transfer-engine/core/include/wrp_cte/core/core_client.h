@@ -218,7 +218,6 @@ class Client : public chi::ContainerClient {
 
     return ipc_manager->Send(task);
   }
-#endif  // HSHM_IS_HOST
 
   /**
    * Asynchronous put blob with optional compression context - returns immediately
@@ -232,7 +231,6 @@ class Client : public chi::ContainerClient {
    * @param flags Operation flags
    * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  HSHM_CROSS_FUN
   chi::Future<PutBlobTask> AsyncPutBlob(
       const TagId &tag_id,
       const char *blob_name,
@@ -250,8 +248,7 @@ class Client : public chi::ContainerClient {
     return ipc_manager->Send(task);
   }
 
-#if HSHM_IS_HOST
-  /** std::string overload for backward compatibility (host-only) */
+  /** std::string overload */
   chi::Future<PutBlobTask> AsyncPutBlob(
       const TagId &tag_id,
       const std::string &blob_name,
@@ -263,7 +260,6 @@ class Client : public chi::ContainerClient {
     return AsyncPutBlob(tag_id, blob_name.c_str(), offset, size,
                         blob_data, score, context, flags, pool_query);
   }
-#endif  // HSHM_IS_HOST
 
   /**
    * Asynchronous get blob - returns immediately
@@ -275,7 +271,6 @@ class Client : public chi::ContainerClient {
    * @param blob_data Shared memory pointer for output
    * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  HSHM_CROSS_FUN
   chi::Future<GetBlobTask> AsyncGetBlob(
       const TagId &tag_id,
       const char *blob_name,
@@ -292,8 +287,7 @@ class Client : public chi::ContainerClient {
     return ipc_manager->Send(task);
   }
 
-#if HSHM_IS_HOST
-  /** std::string overload for backward compatibility (host-only) */
+  /** std::string overload */
   chi::Future<GetBlobTask> AsyncGetBlob(
       const TagId &tag_id,
       const std::string &blob_name,

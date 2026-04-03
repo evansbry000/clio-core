@@ -1539,6 +1539,10 @@ HSHM_CROSS_FUN inline IpcManager *GetGpuIpcManager() {
 }  // namespace gpu
 }  // namespace chi
 
+// CHI_IPC returns gpu::IpcManager* in GPU compiler TUs.
+// On device: GetBlockIpcManager() (__shared__ singleton)
+// On host: nullptr (used only for name resolution, never called at runtime)
+// Use CHI_CPU_IPC for host-side operations in nvcc TUs.
 #undef CHI_IPC
 #define CHI_IPC (::chi::gpu::GetGpuIpcManager())
 #undef CHI_CPU_IPC
@@ -1875,17 +1879,10 @@ HSHM_CROSS_FUN void Future<TaskT, AllocT>::WaitPoll(float max_sec,
                                                      bool reuse_task) {
   (void)max_sec; (void)reuse_task;
 #if HSHM_IS_GPU
-  u32 lane = gpu::IpcManager::GetLaneId();
-  // Broadcast FutureShm pointer from lane 0
-  unsigned long long fshm_ull = 0;
-  if (lane == 0) {
-    auto fshm_full = GetFutureShm();
-    if (!fshm_full.IsNull())
-      fshm_ull = reinterpret_cast<unsigned long long>(fshm_full.ptr_);
-  }
-  fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
-  if (fshm_ull == 0) return;
-  auto *fshm = reinterpret_cast<FutureShm *>(fshm_ull);
+  if (threadIdx.x != 0) return;
+  auto fshm_full = GetFutureShm();
+  if (fshm_full.IsNull()) return;
+  auto *fshm = fshm_full.ptr_;
 
   // Spin-wait on FUTURE_COMPLETE (device-scope atomics)
   while (!fshm->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
@@ -1900,33 +1897,14 @@ HSHM_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
                                                      bool reuse_task) {
   (void)max_sec; (void)reuse_task;
 #if HSHM_IS_GPU
-  u32 lane = gpu::IpcManager::GetLaneId();
-  // Broadcast FutureShm pointer from lane 0
-  unsigned long long fshm_ull = 0;
-  if (lane == 0) {
-    auto fshm_full = GetFutureShm();
-    if (!fshm_full.IsNull())
-      fshm_ull = reinterpret_cast<unsigned long long>(fshm_full.ptr_);
-  }
-  fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
-  if (fshm_ull == 0) return;
-  auto *fshm = reinterpret_cast<FutureShm *>(fshm_ull);
+  if (threadIdx.x != 0) return;
+  auto fshm_full = GetFutureShm();
+  if (fshm_full.IsNull()) return;
+  auto *fshm = fshm_full.ptr_;
 
   // Read output if any was written
-  unsigned long long task_ull = 0;
-  int has_output = 0;
-  if (lane == 0) {
-    size_t output_written = fshm->output_.total_written_.load_device();
-    if (output_written > 0) {
-      task_ull = reinterpret_cast<unsigned long long>(task_ptr_.ptr_);
-      has_output = 1;
-    }
-  }
-  task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
-  has_output = __shfl_sync(0xFFFFFFFF, has_output, 0);
-
-  if (lane == 0 && has_output) {
-    size_t data_size = fshm->output_.total_written_.load_device();
+  size_t output_written = fshm->output_.total_written_.load_device();
+  if (output_written > 0) {
     hipc::threadfence();
 
     // Inline deserialization: create local buffer + archive
@@ -1935,19 +1913,17 @@ HSHM_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
     fp.shm_.alloc_id_.SetNull();
     fp.shm_.off_ = reinterpret_cast<size_t>(fp.ptr_);
     hshm::priv::wrap_vector buffer;
-    buffer.set(fp, data_size);
-    buffer.resize(data_size);
+    buffer.set(fp, output_written);
+    buffer.resize(output_written);
     GpuLoadTaskArchive load_ar(buffer);
     load_ar.SetMsgType(LocalMsgType::kSerializeOut);
     task_ptr_.ptr_->SerializeOut(load_ar);
   }
 
   // Cleanup
-  if (gpu::IpcManager::IsWarpScheduler()) {
-    Destroy(true);
-    if (reuse_task) {
-      task_ptr_.SetNull();
-    }
+  Destroy(true);
+  if (reuse_task) {
+    task_ptr_.SetNull();
   }
 #endif
 }

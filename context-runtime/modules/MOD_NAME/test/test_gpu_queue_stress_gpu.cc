@@ -75,12 +75,14 @@ __global__ void gpu_queue_stress_kernel(
 
   d_progress[warp_id] = 1;  // running
 
-  chimaera::MOD_NAME::Client client(pool_id);
+  auto *ipc = CHI_IPC;
 
   for (chi::u32 i = 0; i < iterations; ++i) {
     chi::u32 test_value = warp_id * 1000 + i;
-    auto future = client.AsyncGpuSubmit(
-        chi::PoolQuery::Local(), 0, test_value);
+    auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
+        chi::u32(0), test_value);
+    auto future = ipc->Send(task);
     future.Wait();
   }
 

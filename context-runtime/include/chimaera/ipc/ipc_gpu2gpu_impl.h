@@ -17,12 +17,15 @@ namespace gpu {
 
 #if HSHM_IS_GPU_COMPILER
 
+/**
+ * GPU→GPU ClientSend: thread 0 enqueues task to gpu2gpu_queue.
+ * Only thread 0 allocates and pushes. No warp-level primitives.
+ */
 template <typename TaskT>
 HSHM_GPU_FUN Future<TaskT> IpcGpu2Gpu::ClientSend(
     IpcManager *ipc, const hipc::FullPtr<TaskT> &task_ptr) {
-  u32 lane = IpcManager::GetLaneId();
   Future<TaskT> future;
-  if (lane == 0) {
+  if (threadIdx.x == 0) {
     if (!task_ptr.IsNull() && ipc->gpu_info_.gpu2gpu_queue) {
       FutureShm *fshm = reinterpret_cast<FutureShm *>(
           reinterpret_cast<char *>(task_ptr.ptr_) + sizeof(TaskT));
@@ -45,42 +48,35 @@ HSHM_GPU_FUN Future<TaskT> IpcGpu2Gpu::ClientSend(
       qlane.PushSystem(task_future);
     }
   }
-  __syncwarp();
   return future;
 }
 
+/**
+ * GPU→GPU ClientRecv: thread 0 polls FutureShm for FUTURE_COMPLETE.
+ * No warp-level primitives — works in both client and runtime contexts.
+ */
 template <typename TaskT>
 HSHM_GPU_FUN void IpcGpu2Gpu::ClientRecv(
     IpcManager *ipc, Future<TaskT> &future, TaskT *task_ptr) {
-  (void)ipc;
-  u32 lane = IpcManager::GetLaneId();
-  unsigned long long fshm_ull = 0;
-  if (lane == 0) {
-    hipc::FullPtr<FutureShm> fshm_full = future.GetFutureShm();
-    if (!fshm_full.IsNull())
-      fshm_ull = reinterpret_cast<unsigned long long>(fshm_full.ptr_);
+  (void)ipc; (void)task_ptr;
+  if (threadIdx.x != 0) return;
+
+  hipc::FullPtr<FutureShm> fshm_full = future.GetFutureShm();
+  if (fshm_full.IsNull()) return;
+  FutureShm *fshm = fshm_full.ptr_;
+  // Poll FUTURE_COMPLETE via system-scope atomic read
+  while (!(atomicAdd_system(reinterpret_cast<unsigned int*>(&fshm->flags_.bits_.x), 0u)
+           & FutureShm::FUTURE_COMPLETE)) {
+    HSHM_THREAD_MODEL->Yield();
   }
-  fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
-  if (fshm_ull == 0) return;
-  FutureShm *fshm = reinterpret_cast<FutureShm *>(fshm_ull);
-  if (lane == 0) {
-    int spin_count = 0;
-    while (!fshm->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
-      HSHM_THREAD_MODEL->Yield();
-      if (++spin_count == 1000000) {
-        printf("[RECV-STUCK] blk=%u waiting FUTURE_COMPLETE spin=%d\n",
-               blockIdx.x, spin_count);
-        spin_count = 0;
-      }
-    }
-    hipc::threadfence();
-  }
-  __syncwarp();
-  if (lane == 0) {
-    future.Destroy(true);
-  }
+  hipc::threadfence();
+  future.Destroy(true);
 }
 
+/**
+ * GPU→Self ClientSend: thread 0 enqueues task to internal_queue.
+ * No warp-level primitives.
+ */
 template <typename TaskT>
 HSHM_GPU_FUN Future<TaskT> IpcGpu2Self::ClientSend(
     IpcManager *ipc, const hipc::FullPtr<TaskT> &task_ptr) {

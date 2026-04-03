@@ -141,10 +141,12 @@ __global__ void gpu_full_runtime_kernel(chi::IpcManagerGpu gpu_info,
                                          chi::u32 *d_result_value) {
   *d_result = 0;
   CHIMAERA_GPU_INIT(gpu_info);
-  chimaera::MOD_NAME::Client client(pool_id);
-  auto future = client.AsyncGpuSubmit(chi::PoolQuery::Local(), 0, test_value);
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(), chi::u32(0), test_value);
+  auto future = ipc->Send(task);
   future.Wait();
-  *d_result_value = future->result_value_;
+  *d_result_value = task->result_value_;
   __threadfence_system();  // Ensure writes visible to CPU
   *d_result = 1;  // success
 }
@@ -286,12 +288,14 @@ __global__ void gpu_to_cpu_kernel(chi::IpcManagerGpu gpu_info,
   *d_result = 0;
   CHIMAERA_GPU_INIT(gpu_info);
 
-  chimaera::MOD_NAME::Client client(pool_id);
-  auto future = client.AsyncGpuSubmit(
-      chi::PoolQuery::ToLocalCpu(), 0, test_value);
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::ToLocalCpu(),
+      chi::u32(0), test_value);
+  auto future = ipc->Send(task);
   future.Wait();
 
-  *d_result_value = future->result_value_;
+  *d_result_value = task->result_value_;
   *d_result = 1;  // success
 }
 
@@ -426,12 +430,14 @@ __global__ void async_gpu_submit_to_local_cpu_kernel(
   *d_result = 0;
   CHIMAERA_GPU_INIT(gpu_info);
 
-  chimaera::MOD_NAME::Client client(pool_id);
-  auto future = client.AsyncGpuSubmit(
-      chi::PoolQuery::ToLocalCpu(), 0, test_value);
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::ToLocalCpu(),
+      chi::u32(0), test_value);
+  auto future = ipc->Send(task);
   future.Wait();
 
-  *d_result_value = future->result_value_;
+  *d_result_value = task->result_value_;
   *d_result = 1;  // success
 }
 

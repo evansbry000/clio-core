@@ -965,6 +965,11 @@ struct GetOrCreateTagTask : public chi::Task {
     ar(tag_id_);
   }
 
+  /** Fix up priv::string SSO pointer after cudaMemcpy for CPU→GPU */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    tag_name_.FixupSsoPointer();
+  }
+
   /**
    * Copy from another GetOrCreateTagTask
    */

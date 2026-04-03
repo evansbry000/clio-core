@@ -22,10 +22,9 @@ namespace chi {
 template <typename TaskT>
 HSHM_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::ClientSend(
     gpu::IpcManager *ipc, const hipc::FullPtr<TaskT> &task_ptr) {
-  u32 lane = gpu::IpcManager::GetLaneId();
   gpu::Future<TaskT> future;
 
-  if (lane == 0) {
+  if (threadIdx.x == 0) {
     if (!task_ptr.IsNull() && ipc->gpu_info_.gpu2cpu_queue) {
       gpu::FutureShm *fshm = reinterpret_cast<gpu::FutureShm *>(
           reinterpret_cast<char *>(task_ptr.ptr_) + sizeof(TaskT));
@@ -45,7 +44,6 @@ HSHM_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::ClientSend(
       qlane.Push(task_future);
     }
   }
-  __syncwarp();
   return future;
 }
 #endif  // HSHM_IS_GPU_COMPILER

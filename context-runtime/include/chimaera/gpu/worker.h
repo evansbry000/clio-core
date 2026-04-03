@@ -89,15 +89,8 @@ __global__ void RunTask(Container *container, u32 method,
   // Initialize IpcManager for this CDP child kernel block.
   // Reattaches to the orchestrator's existing RoundRobinAllocator and
   // claims a partition for this block.
-  if (threadIdx.x == 0) {
-    printf("[RunTask] START method=%u task=%p fshm=%p gpu2gpu=%d\n",
-           method, (void*)task_raw, (void*)fshm, (int)is_gpu2gpu);
-  }
   chi::IpcManagerGpuInfo gpu_info = *gpu_info_ptr;
   CHIMAERA_GPU_SUBTASK_INIT(gpu_info, gridDim.x);
-  if (threadIdx.x == 0) {
-    printf("[RunTask] INIT DONE partition=%d\n", s_partition_id);
-  }
 
   // Reconstruct FullPtr from raw pointer + offset (avoids passing
   // user-defined-copy-ctor type to kernel)
@@ -121,16 +114,13 @@ __global__ void RunTask(Container *container, u32 method,
 
   // Execute the task method
   container->Run(method, task_ptr, rctx);
-  if (threadIdx.x == 0) {
-    printf("[RunTask] RUN DONE method=%u\n", method);
-  }
 
-  // Thread 0 marks task as complete
+  // Thread 0 marks task as complete (system-scope atomic for cross-kernel visibility)
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    __threadfence();
-    // Both gpu2gpu and cpu2gpu: FutureShm is in device memory.
-    // Use device-scope atomic for both cases.
-    fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+    __threadfence_system();
+    atomicOr_system(reinterpret_cast<unsigned int*>(&fshm->flags_.bits_.x),
+                    static_cast<unsigned int>(FutureShm::FUTURE_COMPLETE));
+    __threadfence_system();
   }
 }
 
@@ -240,8 +230,6 @@ class Worker {
         u32 old_val = *host_flags;
         *host_flags = old_val | FutureShm::FUTURE_COMPLETE;
         __threadfence_system();
-        printf("[RELAY] Completed task: dev_fshm=%p host_fshm=%p old=%u new=%u\n",
-               (void*)dev_fshm, (void*)host_fshm, old_val, old_val | FutureShm::FUTURE_COMPLETE);
         // Remove from pending (swap with last)
         --num_pending_;
         pending_device_fshm_[i] = pending_device_fshm_[num_pending_];
@@ -348,8 +336,6 @@ class Worker {
     // Look up the container from the pool
     PoolId pool_id = fshm->pool_id_;
     u32 method_id = fshm->method_id_;
-    printf("[TryPop] pool=(%u,%u) method=%u is_gpu2gpu=%d\n",
-           pool_id.major_, pool_id.minor_, method_id, (int)is_gpu2gpu);
     Container *container = pool_mgr_->GetContainer(pool_id);
     if (!container) {
       DbgNoContainer(pool_id.major_, pool_id.minor_);
@@ -371,6 +357,10 @@ class Worker {
     DbgTaskPopped();
     ++prof_task_count_;
 
+    printf("[POP] pool=(%u,%u) method=%u grid=%u is_gpu2gpu=%d task=%p fshm=%p\n",
+           pool_id.major_, pool_id.minor_, method_id, grid_dim,
+           (int)is_gpu2gpu, (void*)task_ptr.ptr_, (void*)fshm);
+
     // Launch CDP child kernel with fire-and-forget semantics
     // Launch CDP child on an explicit non-blocking stream so multiple
     // children can run concurrently (default stream serializes them).
@@ -383,6 +373,8 @@ class Worker {
     cudaError_t cdp_err = cudaGetLastError();
     if (cdp_err != cudaSuccess) {
       printf("[ORCH-CDP] RunTask launch FAILED: %d\n", (int)cdp_err);
+    } else {
+      printf("[POP] RunTask launched OK\n");
     }
 
     // Track CPU→GPU tasks for completion relay

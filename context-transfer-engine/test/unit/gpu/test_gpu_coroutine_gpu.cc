@@ -88,20 +88,13 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   cudaMallocHost(&d_result, sizeof(int));
   *d_result = 0;
 
-  printf("[CTE-TEST] gpu2gpu=%p gpu2gpu_lanes=%u\n",
-         (void*)gpu_info.gpu2gpu_queue,
-         gpu_info.gpu2gpu_num_lanes);
-  printf("[CTE-TEST] cpu2gpu=%p internal=%p backend.data=%p\n",
-         (void*)gpu_info.cpu2gpu_queue, (void*)gpu_info.internal_queue,
-         (void*)gpu_info.backend.data_);
-
   void *stream = hshm::GpuApi::CreateStream();
   gpu_leaf_task_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
       gpu_info, pool_id, d_result);
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    printf("[CTE-TEST] kernel launch failed: %s\n", cudaGetErrorString(launch_err));
+    fprintf(stderr, "kernel launch failed: %s\n", cudaGetErrorString(launch_err));
     CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     hshm::GpuApi::DestroyStream(stream);
     return -201;
@@ -109,27 +102,9 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
 
   CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
-  // Poll for completion (10s timeout), dump orchestrator state every 2s
-  chi::gpu::WorkOrchestrator *orch = nullptr;
-  int dump = 0;
+  // Poll for completion (10s timeout)
   for (int i = 0; i < 100000 && *d_result == 0; ++i) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
-    if (i % 20000 == 19999 && orch && orch->control_ && dump < 3) {
-      auto *ctrl = orch->control_;
-      printf("[CTE-DIAG] exit=%d running=%d d_result=%d\n",
-             ctrl->exit_flag, ctrl->running_flag, *d_result);
-      for (int w = 0; w < 4; ++w) {
-        printf("  W%d: polls=%llu popped=%u completed=%u qpops=%u nocont=%u "
-               "alloc_fail=%u tw=%llu cs=%llu\n",
-               w, (unsigned long long)ctrl->dbg_poll_count[w],
-               ctrl->dbg_tasks_popped[w], ctrl->dbg_tasks_completed[w],
-               ctrl->dbg_queue_pops[w], ctrl->dbg_no_container[w],
-               ctrl->dbg_alloc_failures[w],
-               (unsigned long long)ctrl->dbg_input_tw[w],
-               (unsigned long long)ctrl->dbg_input_cs[w]);
-      }
-      dump++;
-    }
   }
 
   int result = *d_result;
