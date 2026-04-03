@@ -46,6 +46,7 @@
 
 #include "hermes_shm/memory/backend/gpu_malloc.h"
 #include "hermes_shm/memory/backend/gpu_shm_mmap.h"
+#include "hermes_shm/memory/allocator/thread_allocator.h"
 
 namespace chi {
 namespace gpu {
@@ -432,6 +433,11 @@ class IpcManager {
 
   void ServerInitGpuQueues();
 
+  /** Initialize pre-allocated CPU→GPU send pools for a device. */
+  void InitCpu2GpuSendPools(u32 gpu_id,
+                             size_t task_pool_size = 64 * 1024 * 1024,
+                             size_t fshm_pool_size = 4 * 1024 * 1024);
+
   u64 GetCpu2GpuQueueOffset(u32 gpu_id) const;
   u64 GetGpu2CpuQueueOffset(u32 gpu_id) const;
   u64 GetGpu2GpuQueueOffset(u32 gpu_id) const;
@@ -492,6 +498,11 @@ class IpcManager {
     hipc::FullPtr<::chi::GpuTaskQueue> cpu2gpu_queue;
     std::unique_ptr<hipc::GpuShmMmap> client_gpu2cpu_backend;
     std::unique_ptr<hipc::GpuShmMmap> client_cpu2gpu_backend;
+
+    // --- CPU→GPU send pool (pinned host, GPU-accessible via UVM) ---
+    char *cpu2gpu_fshm_pool = nullptr;   ///< Pinned host pool for [Task|FutureShm]
+    size_t cpu2gpu_fshm_pool_size = 0;
+    size_t cpu2gpu_fshm_next = 0;        ///< Simple bump allocator offset
   };
 
   std::vector<GpuDeviceInfo> gpu_devices_;

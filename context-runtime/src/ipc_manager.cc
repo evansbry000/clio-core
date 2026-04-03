@@ -860,7 +860,35 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
 
   HLOG(kInfo, "GPU {} backends initialized (queue_depth={})", gpu_id,
        queue_depth);
+
+  // Initialize CPU→GPU send pools for this device
+  gpu_ipc_->InitCpu2GpuSendPools(gpu_id);
+
   return true;
+}
+
+void gpu::IpcManager::InitCpu2GpuSendPools(u32 gpu_id,
+                                             size_t task_pool_size,
+                                             size_t fshm_pool_size) {
+  auto &dev = gpu_devices_[gpu_id];
+  (void)task_pool_size;  // Not used — pinned host pool serves both
+
+  // Allocate a single pinned-host pool for [Task | FutureShm] pairs.
+  // Pinned host is GPU-accessible via UVM — no cudaMemcpy needed.
+  // The GPU orchestrator reads tasks directly from pinned host memory.
+  dev.cpu2gpu_fshm_pool =
+      hshm::GpuApi::MallocHost<char>(fshm_pool_size);
+  if (!dev.cpu2gpu_fshm_pool) {
+    HLOG(kError, "InitCpu2GpuSendPools: Failed to allocate {} bytes "
+         "pinned host memory for GPU {}", fshm_pool_size, gpu_id);
+    return;
+  }
+  memset(dev.cpu2gpu_fshm_pool, 0, fshm_pool_size);
+  dev.cpu2gpu_fshm_pool_size = fshm_pool_size;
+  dev.cpu2gpu_fshm_next = 0;
+
+  HLOG(kInfo, "GPU {} CPU→GPU send pool initialized ({}MB pinned host)",
+       gpu_id, fshm_pool_size / (1024*1024));
 }
 
 /**

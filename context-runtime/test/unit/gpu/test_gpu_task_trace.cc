@@ -170,25 +170,17 @@ TEST_CASE("cpu2gpu_trace", "[gpu][cpu2gpu][trace]") {
       std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr, "[TRACE] COMPLETE in %.2f ms\n", ms);
 
-  // D2H copy-back
-  auto *dev_task = reinterpret_cast<chimaera::MOD_NAME::GpuSubmitTask *>(
+  // Task lives on pinned host — read directly with memcpy (no CUDA API)
+  auto *pinned_task = reinterpret_cast<chimaera::MOD_NAME::GpuSubmitTask *>(
       host_fshm->task_device_ptr_);
   chimaera::MOD_NAME::GpuSubmitTask host_copy;
-  hshm::GpuApi::Memcpy(
-      reinterpret_cast<char *>(&host_copy),
-      reinterpret_cast<const char *>(dev_task),
-      sizeof(chimaera::MOD_NAME::GpuSubmitTask));
+  memcpy(&host_copy, pinned_task, sizeof(chimaera::MOD_NAME::GpuSubmitTask));
 
   chi::u32 expected = (test_value * 3) + 0;
   fprintf(stderr, "[TRACE] result=%u expected=%u\n",
           host_copy.result_value_, expected);
   REQUIRE(host_copy.result_value_ == expected);
-
-  // Cleanup: pause orchestrator so cudaFree won't block
-  ipc->GetGpuIpcManager()->PauseGpuOrchestrator();
-  hshm::GpuApi::Free(dev_task);
-  hshm::GpuApi::FreeHost(host_fshm);
-  ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
+  // No cleanup needed — pinned memory belongs to pre-allocated pool
 
   fprintf(stderr, "=== cpu2gpu_trace PASS ===\n");
 }
