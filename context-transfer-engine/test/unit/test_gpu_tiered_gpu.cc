@@ -196,14 +196,6 @@ extern "C" int run_gpu_tiered_test(
     CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator(); return -1;
   }
 
-  hipc::MemoryBackendId scratch_id(201, 0);
-  hipc::GpuMalloc scratch_backend;
-  scratch_backend.shm_init(scratch_id, 4*1024*1024, "", 0);
-
-  hipc::MemoryBackendId heap_id(202, 0);
-  hipc::GpuMalloc heap_backend;
-  heap_backend.shm_init(heap_id, 4*1024*1024, "", 0);
-
   // Alloc one contiguous buffer for both write and read
   // (single MakeAlloc call — second call would reinitialize the allocator)
   chi::u64 write_bytes = blob_size * num_blobs;
@@ -237,8 +229,9 @@ extern "C" int run_gpu_tiered_test(
   CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_id, data_backend.data_,
                                      data_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
-  gpu_info.backend = scratch_backend;
+  // Use the orchestrator's shared allocator backend
+  chi::IpcManagerGpu gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
   // Result: [0]=test result, [1]=done counter
   int *d_result;
@@ -247,12 +240,6 @@ extern "C" int run_gpu_tiered_test(
   volatile int *d_progress;
   cudaMallocHost((void**)&d_progress, sizeof(int));
   *d_progress = 0;
-
-  if (scratch_backend.data_)
-    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
-  if (heap_backend.data_)
-    cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
-  cudaDeviceSynchronize();
 
   void *stream = hshm::GpuApi::CreateStream();
   gpu_tiered_test_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(

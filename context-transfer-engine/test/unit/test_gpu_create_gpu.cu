@@ -45,8 +45,6 @@
 #include <chimaera/pool_query.h>
 #include <chimaera/singletons.h>
 #include <hermes_shm/util/gpu_api.h>
-#include <hermes_shm/memory/backend/gpu_shm_mmap.h>
-#include <hermes_shm/memory/backend/gpu_malloc.h>
 #include <time.h>
 
 /**
@@ -171,32 +169,15 @@ extern "C" int run_gpu_create_test(const char *pool_name,
                                    int *out_return_code) {
   fprintf(stderr, "[GPU_CREATE_DEBUG] run_gpu_create_test started\n"); fflush(stderr);
 
-  // Primary backend for GPU kernel task allocations
-  hipc::MemoryBackendId backend_id(20, 0);
-  hipc::GpuShmMmap gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024,
-                             "/gpu_create_test", 0))
-    return -100;
-
-  // FutureShm backend (UVM, CPU+GPU accessible)
-  hipc::MemoryBackendId g2c_backend_id(21, 0);
-  hipc::GpuShmMmap g2c_backend;
-  if (!g2c_backend.shm_init(g2c_backend_id, 4 * 1024 * 1024,
-                              "/gpu_create_g2c", 0))
-    return -104;
-
-  fprintf(stderr, "[GPU_CREATE_DEBUG] backends initialized\n"); fflush(stderr);
-
-  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                     gpu_backend.data_capacity_);
-
-  // Set up IpcManagerGpuInfo for GPU→CPU path
-  chi::IpcManagerGpuInfo gpu_info;
-  gpu_info.backend = static_cast<hipc::MemoryBackend &>(gpu_backend);
-  gpu_info.gpu2cpu_queue = CHI_CPU_IPC->GetGpuQueue(0);
-  gpu_info.gpu2cpu_backend = static_cast<hipc::MemoryBackend &>(g2c_backend);
+  // Use the orchestrator's shared allocator backend
+  chi::IpcManagerGpuInfo gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
   fprintf(stderr, "[GPU_CREATE_DEBUG] gpu_info set up, launching kernel\n"); fflush(stderr);
+
+  // Pause orchestrator FIRST — cudaMallocManaged and cudaStreamCreate are
+  // device-synchronizing and deadlock with the persistent CDP kernel.
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Allocate result, return_code, and stop flag in MANAGED memory so
   // CPU can poll d_result and set d_stop without cudaStreamSynchronize.
@@ -208,13 +189,13 @@ extern "C" int run_gpu_create_test(const char *pool_name,
   cudaError_t ma3 = cudaMallocManaged(&d_stop, sizeof(int));
   fprintf(stderr, "[GPU_CREATE_DEBUG] cudaMallocManaged: %d %d %d, ptrs: %p %p %p\n",
           ma1, ma2, ma3, d_result, d_return_code, d_stop); fflush(stderr);
-  if (!d_result || !d_return_code || !d_stop) return -106;
+  if (!d_result || !d_return_code || !d_stop) {
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
+    return -106;
+  }
   *d_result = 0;
   *d_return_code = -1;
   *d_stop = 0;
-  // Note: NO cudaDeviceSynchronize() here — a persistent orchestrator GPU kernel
-  // may be running, and synchronizing would block forever. UVM ensures the
-  // initial values are visible to the GPU kernel via hardware coherence.
 
   // Clear sticky CUDA errors from previous tests
   cudaGetLastError();
@@ -228,7 +209,10 @@ extern "C" int run_gpu_create_test(const char *pool_name,
                                                   cudaStreamNonBlocking);
   fprintf(stderr, "[GPU_CREATE_DEBUG] stream created: %p err=%d\n",
           (void*)stream_handle, (int)sc_err); fflush(stderr);
-  if (sc_err != cudaSuccess) return -202;
+  if (sc_err != cudaSuccess) {
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
+    return -202;
+  }
 
   // Copy pool_name to managed memory so the GPU kernel can dereference it.
   // String literals in host .rodata are NOT accessible from GPU device code.
@@ -246,12 +230,16 @@ extern "C" int run_gpu_create_test(const char *pool_name,
   fprintf(stderr, "[GPU_CREATE_DEBUG] kernel launched, err=%s\n",
           cudaGetErrorString(launch_err)); fflush(stderr);
   if (launch_err != cudaSuccess) {
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFree(d_result);
     cudaFree(d_return_code);
     cudaFree(d_stop);
     cudaStreamDestroy(stream_handle);
     return -201;
   }
+
+  // Resume GPU orchestrator so it processes tasks
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   fprintf(stderr, "[GPU_CREATE_DEBUG] entering poll loop\n"); fflush(stderr);
 

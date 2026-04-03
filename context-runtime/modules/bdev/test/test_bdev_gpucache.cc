@@ -294,13 +294,19 @@ TEST_CASE("bdev_gpu_hbm_gpu_write_read", "[gpu_bdev]") {
   // Brief delay to ensure UpdateTask reaches and is processed by GPU worker
   std::this_thread::sleep_for(200ms);
 
-  // GPU-side AllocateBlocks
+  // GPU-side AllocateBlocks (pause: IpcCpu2Gpu uses cudaMalloc internally)
+  ipc->GetGpuIpcManager()->PauseGpuOrchestrator();
   auto alloc_f = client.AsyncAllocateBlocks(chi::PoolQuery::LocalGpuBcast(), kDataSize);
+  ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
   alloc_f.Wait();
   REQUIRE(alloc_f->return_code_ == 0);
   REQUIRE(alloc_f->blocks_.size() > 0);
   chi::priv::vector<chimaera::bdev::Block> gpu_blocks = alloc_f->blocks_;
   INFO("GPU AllocateBlocks succeeded: " + std::to_string(gpu_blocks.size()) + " block(s)");
+
+  // Pause orchestrator — cudaMallocHost is device-synchronizing and
+  // deadlocks with the persistent CDP kernel.
+  ipc->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Allocate UVM buffers for GPU-accessible source and destination data
   char *src_uvm = AllocUvm(kDataSize);
@@ -310,19 +316,23 @@ TEST_CASE("bdev_gpu_hbm_gpu_write_read", "[gpu_bdev]") {
   memset(src_uvm, 0xAB, kDataSize);
   memset(dst_uvm, 0x00, kDataSize);
 
-  // GPU-side Write: GPU container memcpy(hbm + offset, src_uvm, size)
+  // GPU-side Write: Send while paused (MallocAndCopy is device-synchronizing),
+  // then resume orchestrator to process.
   hipc::ShmPtr<> write_data = UvmToShmPtr(src_uvm);
   auto write_f = client.AsyncWrite(chi::PoolQuery::LocalGpuBcast(),
                                     gpu_blocks, write_data, kDataSize);
+  ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
   write_f.Wait();
   REQUIRE(write_f->return_code_ == 0);
   REQUIRE(write_f->bytes_written_ == kDataSize);
   INFO("GPU Write succeeded");
 
-  // GPU-side Read: GPU container memcpy(dst_uvm, hbm + offset, size)
+  // GPU-side Read: same pattern — pause, send, resume, wait
+  ipc->GetGpuIpcManager()->PauseGpuOrchestrator();
   hipc::ShmPtr<> read_data = UvmToShmPtr(dst_uvm);
   auto read_f = client.AsyncRead(chi::PoolQuery::LocalGpuBcast(),
                                    gpu_blocks, read_data, kDataSize);
+  ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
   read_f.Wait();
   REQUIRE(read_f->return_code_ == 0);
   REQUIRE(read_f->bytes_read_ == kDataSize);

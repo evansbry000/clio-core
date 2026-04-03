@@ -75,24 +75,18 @@ __global__ void gpu_leaf_task_kernel(
 }
 
 extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
-  // GPU memory backend (device memory for GPU→GPU device-scope atomics)
-  hipc::MemoryBackendId backend_id(30, 0);
-  hipc::GpuMalloc gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "", 0))
-    return -100;
+  // Use the orchestrator's shared allocator backend
+  chi::IpcManagerGpuInfo gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
-  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                     gpu_backend.data_capacity_);
+  // Pause orchestrator FIRST — cudaMallocHost and cudaStreamCreate are
+  // device-synchronizing and deadlock with the persistent CDP kernel.
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Pinned result
   int *d_result;
   cudaMallocHost(&d_result, sizeof(int));
   *d_result = 0;
-
-  // Pause orchestrator then fetch gpu_info (queue pointers rebuilt by Pause)
-  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
-  chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
 
   printf("[CTE-TEST] gpu2gpu=%p gpu2gpu_lanes=%u\n",
          (void*)gpu_info.gpu2gpu_queue,
@@ -197,14 +191,13 @@ __global__ void gpu_subtask_kernel(
 extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
                                      chi::u32 test_value,
                                      chi::u32 *out_result_value) {
-  // GPU memory backend (device memory for GPU→GPU device-scope atomics)
-  hipc::MemoryBackendId backend_id(32, 0);
-  hipc::GpuMalloc gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "", 0))
-    return -100;
+  // Use the orchestrator's shared allocator backend
+  chi::IpcManagerGpuInfo gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
-  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                     gpu_backend.data_capacity_);
+  // Pause orchestrator FIRST — cudaMallocHost and cudaStreamCreate are
+  // device-synchronizing and deadlock with the persistent CDP kernel.
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Pinned results
   int *d_result;
@@ -213,11 +206,6 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
   cudaMallocHost(&d_rv, sizeof(chi::u32));
   *d_result = 0;
   *d_rv = 0;
-
-  // Pause orchestrator then fetch gpu_info (queue pointers rebuilt by Pause)
-  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
-  chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
 
   void *stream = hshm::GpuApi::CreateStream();
   gpu_subtask_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(

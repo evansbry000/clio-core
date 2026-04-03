@@ -156,27 +156,14 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
     wrp_cte::core::TagId tag_id,
     chi::u64 blob_size) {
 
-  // Create GPU memory backend for kernel allocations (NewTask, FutureShm, etc.)
-  hipc::MemoryBackendId backend_id(20, 0);
-  hipc::GpuShmMmap gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024,
-                             "/cte_gpu_initiated", 0))
-    return -100;
+  // Use the orchestrator's shared allocator backend
+  chi::IpcManagerGpuInfo gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
-  // Register backend so host-side ShmPtr resolution works
-  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                     gpu_backend.data_capacity_);
-
-  // Allocate GPU heap for CHI_PRIV_ALLOC (BuddyAllocator for serialization)
-  hipc::MemoryBackendId heap_id(21, 0);
-  hipc::GpuMalloc gpu_heap;
-  if (!gpu_heap.shm_init(heap_id, 4 * 1024 * 1024, "", 0))
-    return -102;
-
-  // Use GetClientGpuInfo for complete queue/backend setup, then override
-  // the primary backend and heap backend with our custom ones
-  chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
+  // Pause orchestrator FIRST — cudaMallocManaged, cudaMallocHost, and
+  // cudaStreamCreate are device-synchronizing and deadlock with the
+  // persistent CDP kernel.
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Allocate UVM buffers (accessible from both CPU and GPU)
   // Using cudaMallocManaged so device-scope fences ensure cross-warp
@@ -185,7 +172,10 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
   char *out_data = nullptr;
   cudaMallocManaged(&blob_data, blob_size);
   cudaMallocManaged(&out_data, blob_size);
-  if (!blob_data || !out_data) return -101;
+  if (!blob_data || !out_data) {
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
+    return -101;
+  }
 
   // Fill source with test pattern, zero output
   memset(blob_data, 0xAB, blob_size);
@@ -196,9 +186,6 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
   volatile int *d_result;
   cudaMallocHost(const_cast<int **>(&d_result), sizeof(int));
   *d_result = 0;
-
-  // Pause GPU orchestrator to free SMs for kernel launch, then resume
-  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   void *stream = hshm::GpuApi::CreateStream();
   gpu_putblob_getblob_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
