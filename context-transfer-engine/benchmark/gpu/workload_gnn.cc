@@ -181,7 +181,7 @@ __global__ void gnn_cte_kernel(
             (chi::u32)0, shm);
         auto get_future = CHI_IPC->Send(get_task);
         if (!get_future.GetFutureShmPtr().IsNull()) {
-          get_future.Wait();
+          get_future.WaitGpu();
         } else {
           alloc_failed = true;
           break;
@@ -477,7 +477,7 @@ int run_workload_gnn(const WorkloadConfig &cfg, const char *mode,
           total_warps, emb_dim, d_load_done, d_done);
 
       CHI_CPU_IPC->ResumeGpuOrchestrator();
-      auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
+      auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_CPU_IPC->GetGpuIpcManager()->gpu_orchestrator_);
       auto *ctrl = orch ? orch->control_ : nullptr;
       if(ctrl){int w=0;while(ctrl->running_flag==0&&w<5000){std::this_thread::sleep_for(std::chrono::milliseconds(1));++w;}}
       int64_t tus=(int64_t)cfg.timeout_sec*1000000,el=0;

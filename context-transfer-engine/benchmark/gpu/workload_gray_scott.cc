@@ -480,7 +480,7 @@ int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
           total_warps, L, d_done);
 
       CHI_CPU_IPC->ResumeGpuOrchestrator();
-      auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
+      auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_CPU_IPC->GetGpuIpcManager()->gpu_orchestrator_);
       auto *ctrl = orch ? orch->control_ : nullptr;
       if(ctrl){int w=0;while(ctrl->running_flag==0&&w<5000){std::this_thread::sleep_for(std::chrono::milliseconds(1));++w;}}
       int64_t tus=(int64_t)cfg.timeout_sec*1000000,el=0;

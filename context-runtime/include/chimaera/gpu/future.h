@@ -316,6 +316,25 @@ class Future {
   HSHM_CROSS_FUN bool Wait(float max_sec = 0, bool reuse_task = false);
 
   /**
+   * Inline GPU wait: volatile poll for FUTURE_COMPLETE.
+   * Use this when the library-linked Wait doesn't see completion flags
+   * (cross-TU CUDA device-linking visibility issue).
+   */
+  HSHM_INLINE_CROSS_FUN void WaitGpu() {
+#if HSHM_IS_GPU
+    if (threadIdx.x != 0) return;
+    if (future_shm_.IsNull()) return;
+    auto fshm_full = GetFutureShm();
+    if (fshm_full.IsNull()) return;
+    volatile unsigned int *fp =
+        reinterpret_cast<volatile unsigned int *>(
+            &fshm_full.ptr_->flags_.bits_.x);
+    while (!((*fp) & FutureT::FUTURE_COMPLETE)) {}
+    hipc::threadfence();
+#endif
+  }
+
+  /**
    * CPU-to-GPU wait path (POD transfer via cudaMemcpy).
    * Polls device-resident flags via D-to-H copy, then copies
    * the completed task back to host memory.

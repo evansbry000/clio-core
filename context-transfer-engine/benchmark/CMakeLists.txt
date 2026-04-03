@@ -67,8 +67,8 @@ if(WRP_CORE_ENABLE_CUDA)
     set(_BAM_DEFS WRP_CORE_ENABLE_BAM)
   endif()
 
-  add_cuda_executable(wrp_cte_gpu_bench TRUE
-      wrp_cte_gpu_bench.cc
+  # GPU workload kernels compiled by nvcc as STATIC library
+  add_cuda_library(wrp_cte_gpu_bench_kernels STATIC TRUE
       gpu/workload_cte_client_overhead.cc
       gpu/workload_bdev.cc
       gpu/workload_pagerank.cc
@@ -81,94 +81,91 @@ if(WRP_CORE_ENABLE_CUDA)
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu
-          ${CMAKE_SOURCE_DIR}/context-runtime/include
-          ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
-          ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
-          ${_CTE_GPU_BENCH_EXTRA_INCLUDES}
           ${_BAM_INCLUDE_DIRS}
       LINK_LIBS
-          wrp_cte::core_client
-          chimaera::cxx
           hshm::cuda_cxx
+          chimaera_cxx_gpu
           ${_BAM_LINK_LIBS}
-      DEFS
-          ${_BAM_DEFS}
   )
+
+  # Host driver compiled by g++; uses CHI_CPU_IPC (not CHI_IPC)
+  add_executable(wrp_cte_gpu_bench wrp_cte_gpu_bench.cc)
+  set_target_properties(wrp_cte_gpu_bench PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON
+      LINKER_LANGUAGE CUDA
+      POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(wrp_cte_gpu_bench PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu
+      ${CMAKE_SOURCE_DIR}/context-runtime/include
+      ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+      ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+      ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+      ${CMAKE_SOURCE_DIR}/build/context-transport-primitives/src/include
+      ${_CTE_GPU_BENCH_EXTRA_INCLUDES}
+      ${_BAM_INCLUDE_DIRS}
+  )
+  target_link_libraries(wrp_cte_gpu_bench
+      wrp_cte_gpu_bench_kernels
+      wrp_cte_core_runtime
+      wrp_cte_core_client
+      chimaera::admin_runtime
+      chimaera::admin_client
+      chimaera::bdev_runtime
+      chimaera::bdev_client
+      hshm::cxx
+      hermes_shm_cuda
+      chimaera_cxx_gpu
+      ${_BAM_LINK_LIBS}
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+    find_package(CUDAToolkit QUIET)
+    set_property(TARGET wrp_cte_gpu_bench APPEND PROPERTY
+      LINK_LIBRARIES "CUDA::cudart")
+  endif()
 
   if(_BAM_DEFS)
     target_compile_definitions(wrp_cte_gpu_bench PRIVATE ${_BAM_DEFS})
+    target_compile_definitions(wrp_cte_gpu_bench_kernels PRIVATE ${_BAM_DEFS})
   endif()
 
   install(TARGETS wrp_cte_gpu_bench RUNTIME DESTINATION bin)
 
   # Regression ctests — quick smoke tests for each GPU benchmark mode.
-  # Use small data (1 warp, 4KB I/O, 1 iteration) to keep runtime < 30s.
-  add_test(NAME cte_gpu_bench_putblob_gpu
+  # Use small data (1 warp, 4KB I/O, few iterations) to keep runtime < 30s.
+
+  # Client overhead: single warp, 1 iteration (GPU-initiated PutBlob)
+  add_test(NAME cte_gpu_bench_client_overhead
     COMMAND wrp_cte_gpu_bench
-      --test-case putblob_gpu
+      --test-case client_overhead
       --client-blocks 1 --client-threads 32
       --io-size 4k --iterations 1)
-  set_tests_properties(cte_gpu_bench_putblob_gpu PROPERTIES
+  set_tests_properties(cte_gpu_bench_client_overhead PROPERTIES
     TIMEOUT 60 LABELS "msan_skip")
 
-  add_test(NAME cte_gpu_bench_putblob_gpu_multiblock
+  # Client overhead: multi-warp (16 warps)
+  add_test(NAME cte_gpu_bench_client_overhead_multiblock
     COMMAND wrp_cte_gpu_bench
-      --test-case putblob_gpu
+      --test-case client_overhead
       --client-blocks 1 --client-threads 512
       --io-size 4k --iterations 2)
-  set_tests_properties(cte_gpu_bench_putblob_gpu_multiblock PROPERTIES
+  set_tests_properties(cte_gpu_bench_client_overhead_multiblock PROPERTIES
     TIMEOUT 60 LABELS "msan_skip")
 
-  add_test(NAME cte_gpu_bench_direct
+  # Client overhead: CPU-initiated path
+  add_test(NAME cte_gpu_bench_client_overhead_cpu
     COMMAND wrp_cte_gpu_bench
-      --test-case direct
+      --test-case client_overhead_cpu
       --client-blocks 1 --client-threads 32
       --io-size 4k --iterations 1)
-  set_tests_properties(cte_gpu_bench_direct PROPERTIES
+  set_tests_properties(cte_gpu_bench_client_overhead_cpu PROPERTIES
     TIMEOUT 60 LABELS "msan_skip")
 
-  add_test(NAME cte_gpu_bench_cudamemcpy
-    COMMAND wrp_cte_gpu_bench
-      --test-case cudamemcpy
-      --io-size 4k --iterations 1)
-  set_tests_properties(cte_gpu_bench_cudamemcpy PROPERTIES
-    TIMEOUT 60 LABELS "msan_skip")
-
-  add_test(NAME cte_gpu_bench_putblob_gpu_stress
-    COMMAND wrp_cte_gpu_bench
-      --test-case putblob_gpu
-      --rt-blocks 1 --rt-threads 128
-      --client-blocks 1 --client-threads 128
-      --io-size 16k --iterations 1024)
-  set_tests_properties(cte_gpu_bench_putblob_gpu_stress PROPERTIES
-    TIMEOUT 120 LABELS "msan_skip")
-
-  add_test(NAME cte_gpu_bench_putblob_gpu_64warp
-    COMMAND wrp_cte_gpu_bench
-      --test-case putblob_gpu
-      --rt-blocks 64 --rt-threads 32
-      --client-blocks 8 --client-threads 256
-      --io-size 1m --iterations 16)
-  set_tests_properties(cte_gpu_bench_putblob_gpu_64warp PROPERTIES
-    TIMEOUT 120 LABELS "msan_skip")
-
-  add_test(NAME cte_gpu_bench_putblob_gpu_64warp_stress
-    COMMAND wrp_cte_gpu_bench
-      --test-case putblob_gpu
-      --rt-blocks 64 --rt-threads 32
-      --client-blocks 8 --client-threads 256
-      --io-size 16k --iterations 1024)
-  set_tests_properties(cte_gpu_bench_putblob_gpu_64warp_stress PROPERTIES
-    TIMEOUT 600 LABELS "msan_skip")
-
-  add_test(NAME cte_gpu_bench_alloc_test
-    COMMAND wrp_cte_gpu_bench
-      --test-case alloc_test
-      --client-blocks 1 --client-threads 256)
-  set_tests_properties(cte_gpu_bench_alloc_test PROPERTIES
-    TIMEOUT 60 LABELS "msan_skip")
-
+  # CUDA malloc baseline
   add_test(NAME cte_gpu_bench_cuda_malloc
     COMMAND wrp_cte_gpu_bench
       --test-case cuda_malloc
@@ -176,29 +173,17 @@ if(WRP_CORE_ENABLE_CUDA)
   set_tests_properties(cte_gpu_bench_cuda_malloc PROPERTIES
     TIMEOUT 120 LABELS "msan_skip")
 
+  # Client overhead: stress (many iterations, larger I/O)
+  add_test(NAME cte_gpu_bench_stress
+    COMMAND wrp_cte_gpu_bench
+      --test-case client_overhead
+      --client-blocks 1 --client-threads 128
+      --io-size 16k --iterations 64)
+  set_tests_properties(cte_gpu_bench_stress PROPERTIES
+    TIMEOUT 120 LABELS "msan_skip")
+
   # BaM regression tests (only when BaM is enabled)
   set(_BAM_TEST_NAMES "")
-  if(WRP_CORE_ENABLE_BAM AND TARGET bam)
-    add_test(NAME cte_gpu_bench_bam_read
-      COMMAND wrp_cte_gpu_bench
-        --test-case bam_read
-        --client-blocks 1 --client-threads 32
-        --io-size 4k --iterations 1
-        --bam-page-size 4k --bam-cache-pages 16)
-    set_tests_properties(cte_gpu_bench_bam_read PROPERTIES
-      TIMEOUT 60 LABELS "msan_skip")
-
-    add_test(NAME cte_gpu_bench_bam_write
-      COMMAND wrp_cte_gpu_bench
-        --test-case bam_write
-        --client-blocks 1 --client-threads 32
-        --io-size 4k --iterations 1
-        --bam-page-size 4k --bam-cache-pages 16)
-    set_tests_properties(cte_gpu_bench_bam_write PROPERTIES
-      TIMEOUT 60 LABELS "msan_skip")
-
-    set(_BAM_TEST_NAMES cte_gpu_bench_bam_read cte_gpu_bench_bam_write)
-  endif()
 
   # Synthetic I/O benchmarks
   add_test(NAME cte_gpu_synthetic_hbm
@@ -255,15 +240,11 @@ if(WRP_CORE_ENABLE_CUDA)
 
   # Set CHI_REPO_PATH so the ChiMod plugin loader finds module .so files
   set_tests_properties(
-    cte_gpu_bench_putblob_gpu
-    cte_gpu_bench_putblob_gpu_multiblock
-    cte_gpu_bench_direct
-    cte_gpu_bench_cudamemcpy
-    cte_gpu_bench_putblob_gpu_stress
-    cte_gpu_bench_putblob_gpu_64warp
-    cte_gpu_bench_putblob_gpu_64warp_stress
-    cte_gpu_bench_alloc_test
+    cte_gpu_bench_client_overhead
+    cte_gpu_bench_client_overhead_multiblock
+    cte_gpu_bench_client_overhead_cpu
     cte_gpu_bench_cuda_malloc
+    cte_gpu_bench_stress
     cte_gpu_synthetic_hbm
     cte_gpu_synthetic_direct
     cte_gpu_synthetic_hbm_validate

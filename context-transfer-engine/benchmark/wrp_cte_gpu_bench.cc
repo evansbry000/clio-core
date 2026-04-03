@@ -532,7 +532,7 @@ int main(int argc, char **argv) {
     // Register target on GPU via SendCpuToGpu (POD copy path)
     HIPRINT("Registering GPU target via SendCpuToGpu...");
     {
-      auto *ipc = CHI_IPC;
+      auto *ipc = CHI_CPU_IPC;
       auto reg_task = ipc->NewTask<wrp_cte::core::RegisterTargetTask>(
           chi::CreateTaskId(), gpu_pool_id,
           chi::PoolQuery::LocalGpuBcast(),
@@ -556,7 +556,7 @@ int main(int argc, char **argv) {
     wrp_cte::core::TagId tag_id;
     HIPRINT("Creating GPU tag via SendCpuToGpu...");
     {
-      auto *ipc = CHI_IPC;
+      auto *ipc = CHI_CPU_IPC;
       auto tag_task = ipc->NewTask<wrp_cte::core::GetOrCreateTagTask<wrp_cte::core::CreateParams>>(
           chi::CreateTaskId(), gpu_pool_id,
           chi::PoolQuery::LocalGpuBcast(),

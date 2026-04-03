@@ -70,14 +70,14 @@ __global__ void gpu_bdev_alloc_free_kernel(
         break;
       }
       auto alloc_future = CHI_IPC->Send(alloc_task);
-      alloc_future.Wait();
+      alloc_future.WaitGpu();
 
       // Free
       auto free_task = CHI_IPC->NewTask<chimaera::bdev::FreeBlocksTask>(
           chi::CreateTaskId(), bdev_client.pool_id_, pool_query, alloc_task->blocks_);
       if (!free_task.IsNull()) {
         auto free_future = CHI_IPC->Send(free_task);
-        free_future.Wait();
+        free_future.WaitGpu();
       }
     }
   }
@@ -139,7 +139,7 @@ __global__ void gpu_bdev_read_write_kernel(
         __threadfence_system();
       } else {
         auto alloc_future = CHI_IPC->Send(alloc_task);
-        alloc_future.Wait();
+        alloc_future.WaitGpu();
 
         d_progress[warp_id] = 2;
         __threadfence_system();
@@ -173,7 +173,7 @@ __global__ void gpu_bdev_read_write_kernel(
             break;
           }
           auto write_future = CHI_IPC->Send(write_task);
-          write_future.Wait();
+          write_future.WaitGpu();
           long long t1 = clock64();
           write_acc += (t1 - t0);
 
@@ -195,7 +195,7 @@ __global__ void gpu_bdev_read_write_kernel(
             break;
           }
           auto read_future = CHI_IPC->Send(read_task);
-          read_future.Wait();
+          read_future.WaitGpu();
           long long t3 = clock64();
           read_acc += (t3 - t2);
         }
@@ -205,7 +205,7 @@ __global__ void gpu_bdev_read_write_kernel(
             chi::CreateTaskId(), bdev_client.pool_id_, pool_query, alloc_task->blocks_);
         if (!free_task.IsNull()) {
           auto free_future = CHI_IPC->Send(free_task);
-          free_future.Wait();
+          free_future.WaitGpu();
         }
 
         d_write_clk[warp_id] = write_acc;
@@ -323,7 +323,7 @@ int run_bdev_alloc_free(
 
   CHI_CPU_IPC->ResumeGpuOrchestrator();
   auto *orchestrator = static_cast<chi::gpu::WorkOrchestrator *>(
-      CHI_IPC->gpu_orchestrator_);
+      CHI_CPU_IPC->GetGpuIpcManager()->gpu_orchestrator_);
   auto *ctrl = orchestrator ? orchestrator->control_ : nullptr;
   if (ctrl) {
     int wait_ms = 0;
@@ -493,7 +493,7 @@ int run_bdev_read_write(
 
   CHI_CPU_IPC->ResumeGpuOrchestrator();
   auto *orchestrator = static_cast<chi::gpu::WorkOrchestrator *>(
-      CHI_IPC->gpu_orchestrator_);
+      CHI_CPU_IPC->GetGpuIpcManager()->gpu_orchestrator_);
   auto *ctrl = orchestrator ? orchestrator->control_ : nullptr;
   if (ctrl) {
     int wait_ms = 0;

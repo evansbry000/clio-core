@@ -65,7 +65,7 @@ __global__ void gpu_cte_setup_kernel(
       target_size,
       chi::PoolQuery::Local(), bdev_pool_id);
   auto reg_future = ipc->Send(reg_task);
-  reg_future.Wait();
+  reg_future.WaitGpu();
 
   if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (reg_future.IsNull() || reg_task->return_code_ != 0) {
@@ -84,7 +84,7 @@ __global__ void gpu_cte_setup_kernel(
       "gpu_bench_tag",
       wrp_cte::core::TagId::GetNull());
   auto tag_future = ipc->Send(tag_task);
-  tag_future.Wait();
+  tag_future.WaitGpu();
 
   if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (tag_future.IsNull() || tag_task->return_code_ != 0) {
@@ -231,7 +231,7 @@ __global__ void gpu_client_overhead_kernel(
         alloc_failed = true;
       } else {
         // All lanes enter Wait (RecvGpu uses __syncwarp)
-        future.Wait();
+        future.WaitGpu();
       }
       __syncwarp();
     }
@@ -392,7 +392,7 @@ int run_cte_client_overhead(
   }
 
   auto *orchestrator = static_cast<chi::gpu::WorkOrchestrator *>(
-      CHI_IPC->gpu_orchestrator_);
+      CHI_CPU_IPC->GetGpuIpcManager()->gpu_orchestrator_);
   auto *ctrl = orchestrator ? orchestrator->control_ : nullptr;
 
   CHI_CPU_IPC->ResumeGpuOrchestrator();

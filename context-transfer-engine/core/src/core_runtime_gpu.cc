@@ -454,7 +454,7 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
       chi::CreateTaskId(), target_info.bdev_client_.pool_id_,
       target_info.target_query_, size);
   auto alloc_future = CHI_IPC->Send(alloc_task_ptr);
-  alloc_future.Wait();
+  alloc_future.WaitGpu();
 
   if (alloc_task_ptr->blocks_.empty()) {
     task->return_code_ = 8;  // Allocation failed
@@ -468,7 +468,7 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
       chi::CreateTaskId(), target_info.bdev_client_.pool_id_,
       warp_query, alloc_task_ptr->blocks_, task->blob_data_, size);
   auto write_future = CHI_IPC->Send(write_task_ptr);
-  write_future.Wait();
+  write_future.WaitGpu();
 
   if (write_task_ptr->return_code_ != 0) {
     task->return_code_ = 9;  // Write failed
@@ -602,7 +602,7 @@ HSHM_GPU_FUN void GpuRuntime::GetBlob(
       chi::CreateTaskId(), blocks[0].bdev_client_.pool_id_,
       warp_query, read_blocks, task->blob_data_, size);
   auto read_future = CHI_IPC->Send(read_task_ptr);
-  read_future.Wait();
+  read_future.WaitGpu();
 
   if (read_task_ptr->return_code_ != 0) {
     task->return_code_ = 4;  // Read failed

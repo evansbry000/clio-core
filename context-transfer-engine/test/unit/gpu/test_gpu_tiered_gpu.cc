@@ -87,19 +87,7 @@ __global__ void gpu_tiered_test_kernel(
       put_task->return_code_ = -1;
 
       auto f = ipc->Send(put_task);
-      // Inline poll: bypass library Wait to avoid cross-TU visibility issues
-      {
-        auto fshm_full = f.GetFutureShm();
-        if (!fshm_full.IsNull()) {
-          chi::gpu::FutureShm *fshm = fshm_full.ptr_;
-          volatile unsigned int *fp =
-              reinterpret_cast<volatile unsigned int *>(&fshm->flags_.bits_.x);
-          while (!((*fp) & chi::gpu::FutureShm::FUTURE_COMPLETE)) {
-            // spin
-          }
-          __threadfence();
-        }
-      }
+      f.WaitGpu();
 
       if (put_task->GetReturnCode() != 0) {
         *d_result = -(200 + b); __threadfence_system(); return;
@@ -142,19 +130,7 @@ __global__ void gpu_tiered_test_kernel(
       get_task->return_code_ = -1;
 
       auto f = ipc->Send(get_task);
-      // Inline poll: bypass library Wait
-      {
-        auto fshm_full = f.GetFutureShm();
-        if (!fshm_full.IsNull()) {
-          chi::gpu::FutureShm *fshm = fshm_full.ptr_;
-          volatile unsigned int *fp =
-              reinterpret_cast<volatile unsigned int *>(&fshm->flags_.bits_.x);
-          while (!((*fp) & chi::gpu::FutureShm::FUTURE_COMPLETE)) {
-            // spin
-          }
-          __threadfence();
-        }
-      }
+      f.WaitGpu();
 
       if (get_task->GetReturnCode() != 0) {
         *d_result = -(400 + b); __threadfence_system(); return;
