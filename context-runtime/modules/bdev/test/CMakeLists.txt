@@ -84,6 +84,36 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
 endif()
 
+  # GPU kernel bdev tests (compiled by nvcc for GPU→GPU and GPU→CPU paths)
+  add_cuda_executable(chimaera_bdev_gpu_kernel_tests FALSE
+    test_bdev_gpu_kernels.cc
+    ${CHIMAERA_ROOT}/src/gpu/work_orchestrator_gpu.cc
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/src/MOD_NAME_runtime_gpu.cc
+    ${CHIMAERA_ROOT}/modules/bdev/src/bdev_runtime_gpu.cc
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/src/core_runtime_gpu.cc
+    INCLUDE_DIRS
+      ${CHIMAERA_ROOT}/include
+      ${CHIMAERA_ROOT}/test
+      ${CHIMAERA_ROOT}/modules/admin/include
+      ${CHIMAERA_ROOT}/modules/bdev/include
+      ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+      ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+    LINK_LIBS
+      chimaera_cxx_gpu
+      hshm::cuda_cxx
+      chimaera::cxx
+      chimaera_bdev_client
+      hshm::cxx
+      CUDA::cudart
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(chimaera_bdev_gpu_kernel_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME chimaera_bdev_gpu_kernel_tests
+           COMMAND chimaera_bdev_gpu_kernel_tests)
+
 # Enable CTest integration if testing is enabled
 if(WRP_CORE_ENABLE_TESTS)
   # GPU bdev tests

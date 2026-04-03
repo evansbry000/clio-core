@@ -265,10 +265,10 @@ TEST_CASE("bdev_gpu_pinned_cpu_write_read", "[gpu_bdev]") {
 }
 
 // ============================================================================
-// Test: kHbm bdev — GPU-side AllocateBlocks + Write + Read via LocalGpuBcast
+// Test: kHbm bdev — CPU→GPU: AllocateBlocks + Write + Read via LocalGpuBcast
 // ============================================================================
 
-TEST_CASE("bdev_gpu_hbm_gpu_write_read", "[gpu_bdev]") {
+TEST_CASE("bdev_gpu_hbm_cpu2gpu_write_read", "[gpu_bdev]") {
   EnsureServerInitialized();
 
   auto *ipc = CHI_IPC;
