@@ -320,7 +320,15 @@ class Future {
    * Use this when the library-linked Wait doesn't see completion flags
    * (cross-TU CUDA device-linking visibility issue).
    */
-  HSHM_INLINE_CROSS_FUN void WaitGpu() {
+  /**
+   * Inline GPU wait: volatile poll for FUTURE_COMPLETE.
+   * Must be fully inlined at the call site to avoid cross-TU CUDA
+   * device-linking visibility issues with completion flags.
+   */
+#if HSHM_IS_GPU_COMPILER
+  __device__ __forceinline__
+#endif
+  void WaitGpu() {
 #if HSHM_IS_GPU
     if (threadIdx.x != 0) return;
     if (future_shm_.IsNull()) return;

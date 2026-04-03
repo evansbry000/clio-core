@@ -67,29 +67,9 @@ if(WRP_CORE_ENABLE_CUDA)
     set(_BAM_DEFS WRP_CORE_ENABLE_BAM)
   endif()
 
-  # GPU workload kernels compiled by nvcc as STATIC library
-  add_cuda_library(wrp_cte_gpu_bench_kernels STATIC TRUE
-      gpu/workload_cte_client_overhead.cc
-      gpu/workload_bdev.cc
-      gpu/workload_pagerank.cc
-      gpu/workload_gnn.cc
-      gpu/workload_gray_scott.cc
-      gpu/workload_llm_kvcache.cc
-      gpu/workload_synthetic.cc
-      gpu/workload_cuda_malloc.cc
-      INCLUDE_DIRS
-          ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
-          ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
-          ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu
-          ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
-          ${_BAM_INCLUDE_DIRS}
-      LINK_LIBS
-          hshm::cuda_cxx
-          chimaera_cxx_gpu
-          ${_BAM_LINK_LIBS}
-  )
-
-  # Host driver compiled by g++; uses CHI_CPU_IPC (not CHI_IPC)
+  # Host driver compiled by g++; uses CHI_CPU_IPC (not CHI_IPC).
+  # GPU workload kernels are in test_gpu_initiated_kernels (shared CUDA
+  # device-link unit with chimaera_cxx_gpu for completion flag visibility).
   add_executable(wrp_cte_gpu_bench wrp_cte_gpu_bench.cc)
   set_target_properties(wrp_cte_gpu_bench PROPERTIES
       CUDA_SEPARABLE_COMPILATION ON
@@ -109,7 +89,7 @@ if(WRP_CORE_ENABLE_CUDA)
       ${_BAM_INCLUDE_DIRS}
   )
   target_link_libraries(wrp_cte_gpu_bench
-      wrp_cte_gpu_bench_kernels
+      test_gpu_initiated_kernels
       wrp_cte_core_runtime
       wrp_cte_core_client
       chimaera::admin_runtime
@@ -130,7 +110,6 @@ if(WRP_CORE_ENABLE_CUDA)
 
   if(_BAM_DEFS)
     target_compile_definitions(wrp_cte_gpu_bench PRIVATE ${_BAM_DEFS})
-    target_compile_definitions(wrp_cte_gpu_bench_kernels PRIVATE ${_BAM_DEFS})
   endif()
 
   install(TARGETS wrp_cte_gpu_bench RUNTIME DESTINATION bin)

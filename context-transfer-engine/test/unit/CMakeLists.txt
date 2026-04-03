@@ -61,12 +61,20 @@ add_executable(test_reorganize_blob
 # Create test_gpu_core executable for GPU client API tests (AsyncPutBlob/AsyncGetBlob)
 # GPU-initiated kernel compiled via add_cuda_library (clang-cuda dual-pass)
 if(WRP_CORE_ENABLE_CUDA)
+  # Unified CUDA GPU kernel library: all CTE GPU test + benchmark kernels
+  # compiled into a single device-link unit alongside chimaera_cxx_gpu.
+  # This ensures volatile completion flag reads see CDP child writes.
+  file(GLOB _CTE_BENCH_GPU_SOURCES
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu/workload_*.cc)
   add_cuda_library(test_gpu_initiated_kernels STATIC TRUE
       gpu/test_gpu_initiated_gpu.cc
       gpu/test_gpu_coroutine_gpu.cc
       gpu/test_gpu_tiered_gpu.cc
+      ${_CTE_BENCH_GPU_SOURCES}
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+          ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
+          ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/MOD_NAME/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
       LINK_LIBS hshm::cuda_cxx chimaera_cxx_gpu
