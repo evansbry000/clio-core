@@ -1281,42 +1281,25 @@ extern "C" int run_gpu_bench_latency(
   // Use non-inline SetGpuOrchestratorBlocks to avoid ODR layout mismatch
   CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
-  // Allocate primary GPU backend (GpuMalloc, device memory): 10 MB per block.
-  // Used by PartitionedAllocator for FutureShm allocation on GPU→GPU path.
-  // Device memory avoids PCIe round-trips for gpu2gpu atomics.
-  constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
-  size_t backend_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
-
-  hipc::MemoryBackendId backend_id(100, 0);
-  hipc::GpuMalloc gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, backend_size, "", 0)) {
-    return -1;
-  }
-
-  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                     gpu_backend.data_capacity_);
-
-  // Allocate GPU heap backend (GpuMalloc, device memory): 4 MB per block.
-  // Build IpcManagerGpuInfo from runtime's full GPU info, then override backends
-  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
-
-  int *d_done;
-  cudaMallocHost(&d_done, sizeof(int));
-  *d_done = 0;
+  // Use the orchestrator's shared allocator backend
+  chi::IpcManagerGpu gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
   chi::u32 total_warps = (client_blocks * client_threads) / 32;
   if (total_warps == 0) total_warps = 1;
 
-  void *stream = hshm::GpuApi::CreateStream();
-
-  // Pause orchestrator (triggers queue rebuild if block count changed)
+  // Pause orchestrator FIRST — cudaMallocHost and cudaStreamCreate
+  // are device-synchronizing and deadlock with the persistent CDP kernel.
   CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
+
+  int *d_done;
+  cudaMallocHost(&d_done, sizeof(int));
+  *d_done = 0;
+  void *stream = hshm::GpuApi::CreateStream();
   cudaGetLastError();  // Clear any sticky CUDA errors
 
-  // Fetch gpu_info AFTER pause — queue was rebuilt by PauseGpuOrchestrator
-  gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
+  // Re-fetch gpu_info after pause (queue may have been rebuilt)
+  gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(0, 0);
 
   PrintKernelInfo("gpu_bench_client_kernel",
                   (const void *)chi_bench::gpu_bench_client_kernel,
