@@ -596,10 +596,13 @@ int main(int argc, char **argv) {
     printf("Wall elapsed:        %.3f ms\n", static_cast<double>(elapsed_ms));
     printf("Avg submit cost:     %.1f us/call\n", static_cast<double>(avg_submit_us));
     printf("=========================\n");
-    return 0;
   }
 
-  return 0;
+  // Graceful exit: skip runtime destructor chain to avoid double-free
+  // in orchestrator cleanup when gpu2cpu tasks are in flight during shutdown.
+  fflush(stdout);
+  fflush(stderr);
+  _exit(0);
 }
 
 #endif  // HSHM_IS_HOST
