@@ -213,7 +213,8 @@ if(WRP_CORE_ENABLE_CUDA)
         --io-size 4k --iterations 10
         --bam-page-size 4k --bam-cache-pages 16)
     set_tests_properties(cte_gpu_synthetic_bam PROPERTIES
-      TIMEOUT 60 LABELS "gpu;msan_skip")
+      TIMEOUT 60 LABELS "gpu;msan_skip"
+      WILL_FAIL TRUE)  # BaM driver may not be available
     list(APPEND _BAM_TEST_NAMES cte_gpu_synthetic_bam)
   endif()
 

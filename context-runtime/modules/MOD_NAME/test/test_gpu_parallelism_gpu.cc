@@ -48,8 +48,8 @@ extern "C" int run_gpu_parallelism_test(
   }
   cudaMemset(g_d_counter, 0, sizeof(unsigned int));
 
-  // Direct NewTask/Send — client Async* is host-only
-  auto *ipc = CHI_IPC;
+  // Direct NewTask/Send — use CHI_CPU_IPC (not CHI_IPC which is nullptr in nvcc host pass)
+  auto *ipc = CHI_CPU_IPC;
   chi::u32 gpu_id = 0;
   chi::u32 test_value = 42;
   chi::u64 counter_addr = reinterpret_cast<chi::u64>(g_d_counter);

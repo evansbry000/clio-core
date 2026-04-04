@@ -815,29 +815,9 @@ set(GPU_PARALLELISM_TEST_GPU_SOURCES
 )
 
 if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
-  set(GPU_PARALLELISM_CUDA_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/cuda/${GPU_PARALLELISM_TEST_GPU_SOURCES})
-  configure_file(${GPU_PARALLELISM_TEST_GPU_SOURCES} ${GPU_PARALLELISM_CUDA_SOURCE} COPYONLY)
-  set_source_files_properties(${GPU_PARALLELISM_CUDA_SOURCE} PROPERTIES LANGUAGE CUDA)
-
-  add_library(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels OBJECT ${GPU_PARALLELISM_CUDA_SOURCE})
-  target_include_directories(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PRIVATE
-    ${CHIMAERA_ROOT}/include
-    ${CHIMAERA_ROOT}/modules/admin/include
-    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
-  )
-  target_link_libraries(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PRIVATE hshm::cuda_cxx)
-  set_target_properties(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    POSITION_INDEPENDENT_CODE ON
-    CUDA_STANDARD 17
-  )
-  target_compile_options(${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels PUBLIC
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-  )
-
+  # GPU kernels compiled in test_gpu_initiated_kernels (unified device link)
   add_executable(${GPU_PARALLELISM_TEST_TARGET}
     ${GPU_PARALLELISM_TEST_CPU_SOURCES}
-    $<TARGET_OBJECTS:${GPU_PARALLELISM_TEST_TARGET}_gpu_kernels>
   )
 
   set_source_files_properties(${GPU_PARALLELISM_TEST_CPU_SOURCES} PROPERTIES
@@ -853,6 +833,7 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
   )
 
   target_link_libraries(${GPU_PARALLELISM_TEST_TARGET}
+    test_gpu_initiated_kernels
     chimaera_admin_runtime
     chimaera_admin_client
     chimaera_MOD_NAME_runtime
@@ -861,6 +842,11 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
     hshm::cuda_cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
+  if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+    find_package(CUDAToolkit QUIET)
+    set_property(TARGET ${GPU_PARALLELISM_TEST_TARGET} APPEND PROPERTY
+      LINK_LIBRARIES "CUDA::cudart")
+  endif()
 
   set_target_properties(${GPU_PARALLELISM_TEST_TARGET} PROPERTIES
     CXX_STANDARD 20
@@ -926,7 +912,6 @@ if(WRP_CORE_ENABLE_TESTS)
     TIMEOUT 180
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CHI_GPU_BLOCKS=64;CHI_GPU_THREADS=32"
     LABELS "msan_skip;asan_skip"
-    WILL_FAIL TRUE
   )
   add_test(
     NAME cr_gpu_parallelism_single_warp

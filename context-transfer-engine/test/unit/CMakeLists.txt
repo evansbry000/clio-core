@@ -64,13 +64,17 @@ if(WRP_CORE_ENABLE_CUDA)
   # Unified CUDA GPU kernel library: all CTE GPU test + benchmark kernels
   # compiled into a single device-link unit alongside chimaera_cxx_gpu.
   # This ensures volatile completion flag reads see CDP child writes.
+  # Glob all GPU workload/test kernel sources that need unified device linking
   file(GLOB _CTE_BENCH_GPU_SOURCES
       ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu/workload_*.cc)
+  file(GLOB _CR_MOD_GPU_SOURCES
+      ${CMAKE_SOURCE_DIR}/context-runtime/modules/MOD_NAME/test/test_gpu_*_gpu.cc)
   add_cuda_library(test_gpu_initiated_kernels STATIC TRUE
       gpu/test_gpu_initiated_gpu.cc
       gpu/test_gpu_coroutine_gpu.cc
       gpu/test_gpu_tiered_gpu.cc
       ${_CTE_BENCH_GPU_SOURCES}
+      ${_CR_MOD_GPU_SOURCES}
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark

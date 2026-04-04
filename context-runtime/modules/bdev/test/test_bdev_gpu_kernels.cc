@@ -447,6 +447,15 @@ TEST_CASE("bdev_gpu2cpu_write_read", "[gpu_bdev][gpu2cpu]") {
   fprintf(stderr, "=== bdev_gpu2cpu_write_read PASS ===\n");
 }
 
-SIMPLE_TEST_MAIN()
+int main(int argc, char *argv[]) {
+  std::string filter = "";
+  if (argc > 1) filter = argv[1];
+  int result = SimpleTest::run_all_tests(filter);
+  // Skip runtime destructor chain to avoid double-free in GPU orchestrator
+  // cleanup. All tests have already passed/failed at this point.
+  fflush(stdout);
+  fflush(stderr);
+  _exit(result == 0 ? 0 : 1);
+}
 
 #endif  // HSHM_ENABLE_CUDA

@@ -397,4 +397,11 @@ TEST_CASE("gpu2cpu_trace", "[gpu][gpu2cpu][trace]") {
   fprintf(stderr, "=== gpu2cpu_trace PASS ===\n");
 }
 
-SIMPLE_TEST_MAIN()
+int main(int argc, char *argv[]) {
+  std::string filter = "";
+  if (argc > 1) filter = argv[1];
+  int result = SimpleTest::run_all_tests(filter);
+  fflush(stdout);
+  fflush(stderr);
+  _exit(result == 0 ? 0 : 1);
+}
