@@ -203,7 +203,10 @@ static HSHM_GPU_FUN void FixupTaskImpl(
     case Method::kRead:
       task.template Cast<ReadTask>().ptr_->FixupAfterCopy();
       break;
-    default: break;  // UpdateTask, FreeBlocks are fully POD
+    case Method::kFreeBlocks:
+      task.template Cast<FreeBlocksTask>().ptr_->FixupAfterCopy();
+      break;
+    default: break;
   }
 }
 

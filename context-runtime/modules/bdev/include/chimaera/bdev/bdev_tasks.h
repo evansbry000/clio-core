@@ -404,6 +404,11 @@ struct FreeBlocksTask : public chi::Task {
     // No additional output parameters
   }
 
+  /** Fix up SVO pointer after POD copy (e.g., CPU→GPU memcpy) */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    blocks_.FixupSvoPtr();
+  }
+
   /**
    * Copy from another FreeBlocksTask (assumes this task is already constructed)
    * @param other Pointer to the source task to copy from
