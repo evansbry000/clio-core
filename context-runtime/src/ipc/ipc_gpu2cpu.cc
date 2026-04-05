@@ -30,7 +30,7 @@ hipc::FullPtr<Task> IpcGpu2Cpu::RuntimeRecv(
   ctx.copy_space = future_shm->copy_space;
   ctx.shm_info_ = &future_shm->input_;
 
-  chi::priv::vector<char> recv_buf;
+  chi::priv::vector<char> recv_buf(CHI_PRIV_ALLOC);
   recv_buf.reserve(256);
   DefaultLoadArchive local_archive(recv_buf);
   recv_transport->Recv(local_archive, ctx);

@@ -1826,7 +1826,7 @@ HSHM_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
     hshm::lbm::LbmContext ctx;
     ctx.copy_space = future_full->copy_space;
     ctx.shm_info_ = &future_full->output_;
-    chi::priv::vector<char> load_buf;
+    chi::priv::vector<char> load_buf(CHI_PRIV_ALLOC);
     load_buf.reserve(256);
     DefaultLoadArchive load_ar(load_buf);
     load_ar.SetMsgType(LocalMsgType::kSerializeOut);

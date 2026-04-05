@@ -1527,7 +1527,7 @@ chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
   }
 
   // Create DefaultLoadArchive from the serialized data
-  chi::priv::vector<char> load_buf;
+  chi::priv::vector<char> load_buf(CHI_PRIV_ALLOC);
   load_buf.reserve(task->serialized_data_.size());
   for (size_t i = 0; i < task->serialized_data_.size(); ++i) {
     load_buf.push_back(task->serialized_data_[i]);
