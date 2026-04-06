@@ -112,6 +112,7 @@ if(WRP_CORE_ENABLE_CUDA)
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+if(WRP_CORE_ENABLE_CUDA)
 add_executable(test_cte_gpu_coroutine
     gpu/test_gpu_coroutine.cc
 )
@@ -149,6 +150,7 @@ set_target_properties(test_gpu_create PROPERTIES
     LINKER_LANGUAGE CUDA
     POSITION_INDEPENDENT_CODE ON
 )
+endif()  # WRP_CORE_ENABLE_CUDA (GPU test executables)
 
 # Include directories for all tests - using unified simple_test.h framework
 target_include_directories(cte_core_unit_tests PRIVATE
@@ -187,6 +189,7 @@ target_include_directories(test_reorganize_blob PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
 )
 
+if(WRP_CORE_ENABLE_CUDA)
 target_include_directories(test_cte_gpu_coroutine PRIVATE
   ${CMAKE_SOURCE_DIR}/context-runtime/test  # For simple_test.h with g_test_finalize
   ${CMAKE_SOURCE_DIR}/context-runtime/modules/MOD_NAME/include
@@ -208,6 +211,7 @@ target_include_directories(test_gpu_tiered PRIVATE
   ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
   ${CMAKE_SOURCE_DIR}/build/context-transport-primitives/src/include
 )
+endif()  # WRP_CORE_ENABLE_CUDA (GPU include dirs)
 
 # Link against required libraries using simple_test.h framework (NOT Catch2)
 target_link_libraries(cte_core_unit_tests
@@ -317,6 +321,7 @@ target_link_libraries(test_reorganize_blob
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
 
+if(WRP_CORE_ENABLE_CUDA)
 # Link test_cte_gpu_coroutine
 target_link_libraries(test_cte_gpu_coroutine
     wrp_cte_core_runtime
@@ -326,65 +331,59 @@ target_link_libraries(test_cte_gpu_coroutine
     chimaera::bdev_runtime
     chimaera::bdev_client
     hshm::cxx
-    $<$<BOOL:${HSHM_ENABLE_CUDA}>:hermes_shm_cuda>
-    $<$<BOOL:${WRP_CORE_ENABLE_CUDA}>:test_gpu_initiated_kernels>
+    hermes_shm_cuda
+    test_gpu_initiated_kernels
     ${CMAKE_THREAD_LIBS_INIT}
 )
-if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
-  find_package(CUDAToolkit QUIET)
-  set_property(TARGET test_cte_gpu_coroutine APPEND PROPERTY
-    LINK_LIBRARIES "CUDA::cudart")
-endif()
 
-# Link test_gpu_core - using simple_test.h framework (NOT Catch2)
+# Link test_gpu_core
 target_link_libraries(test_gpu_core
-    wrp_cte_core_runtime         # CTE core runtime library
-    wrp_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
-    hshm::cxx                    # HermesShm library
-    $<$<BOOL:${HSHM_ENABLE_CUDA}>:hermes_shm_cuda>  # CUDA support for cudaMallocHost
-    $<$<BOOL:${WRP_CORE_ENABLE_CUDA}>:test_gpu_initiated_kernels>  # GPU-initiated test kernels
-    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+    wrp_cte_core_runtime
+    wrp_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    hshm::cxx
+    hermes_shm_cuda
+    test_gpu_initiated_kernels
+    ${CMAKE_THREAD_LIBS_INIT}
 )
-if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
-  set_property(TARGET test_gpu_core APPEND PROPERTY
-    LINK_LIBRARIES "CUDA::cudart")
-endif()
 
-# Link test_gpu_create - using simple_test.h framework (NOT Catch2)
+# Link test_gpu_create
 target_link_libraries(test_gpu_create
-    wrp_cte_core_runtime         # CTE core runtime library
-    wrp_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
-    hshm::cxx                    # HermesShm library (CPU)
-    hermes_shm_cuda              # HermesShm CUDA library (for GPU kernels)
-    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+    wrp_cte_core_runtime
+    wrp_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    hshm::cxx
+    hermes_shm_cuda
+    ${CMAKE_THREAD_LIBS_INIT}
 )
 
-# Link test_gpu_tiered - split compilation (host g++, kernel nvcc)
+# Link test_gpu_tiered
 target_link_libraries(test_gpu_tiered
-    wrp_cte_core_runtime         # CTE core runtime library
-    wrp_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
-    hshm::cxx                    # HermesShm library (CPU)
-    hermes_shm_cuda              # HermesShm CUDA library (for GPU kernels)
-    $<$<BOOL:${WRP_CORE_ENABLE_CUDA}>:test_gpu_initiated_kernels>
-    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+    wrp_cte_core_runtime
+    wrp_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    hshm::cxx
+    hermes_shm_cuda
+    test_gpu_initiated_kernels
+    ${CMAKE_THREAD_LIBS_INIT}
 )
-if(WRP_CORE_ENABLE_CUDA AND CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+
+if(CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
   find_package(CUDAToolkit QUIET)
-  set_property(TARGET test_gpu_tiered APPEND PROPERTY
-    LINK_LIBRARIES "CUDA::cudart")
+  set_property(TARGET test_cte_gpu_coroutine APPEND PROPERTY LINK_LIBRARIES "CUDA::cudart")
+  set_property(TARGET test_gpu_core APPEND PROPERTY LINK_LIBRARIES "CUDA::cudart")
+  set_property(TARGET test_gpu_tiered APPEND PROPERTY LINK_LIBRARIES "CUDA::cudart")
 endif()
+endif()  # WRP_CORE_ENABLE_CUDA (GPU link libraries)
 
 # Note: Include directories are provided automatically via linked ChiMod targets
 # wrp_cte_core_client provides ${WRP_CTE_ROOT}/core/include via transitive includes
@@ -975,7 +974,11 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob test_cte_gpu_coroutine test_gpu_core test_gpu_create
+set(_CTE_TEST_TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob)
+if(WRP_CORE_ENABLE_CUDA)
+  list(APPEND _CTE_TEST_TARGETS test_cte_gpu_coroutine test_gpu_core test_gpu_create)
+endif()
+install(TARGETS ${_CTE_TEST_TARGETS}
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin

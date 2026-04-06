@@ -169,7 +169,9 @@ fi
 # Initialize and update git submodules recursively (if in a git repository)
 if [ -d ".git" ]; then
     echo -e "${BLUE}>>> Initializing git submodules...${NC}"
-    git submodule update --init --recursive
+    git submodule update --init --recursive 2>/dev/null || {
+        echo -e "${YELLOW}Some submodules failed to update (worktrees or optional repos). Continuing...${NC}"
+    }
     echo ""
 elif [ -d "context-transport-primitives" ] && [ "$(ls -A context-transport-primitives 2>/dev/null)" ]; then
     echo -e "${GREEN}>>> Submodules already present${NC}"

@@ -84,6 +84,7 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
 endif()
 
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   # GPU kernel bdev tests (compiled by nvcc for GPU→GPU and GPU→CPU paths)
   add_cuda_executable(chimaera_bdev_gpu_kernel_tests FALSE
     test_bdev_gpu_kernels.cc
@@ -113,6 +114,7 @@ endif()
   )
   add_test(NAME chimaera_bdev_gpu_kernel_tests
            COMMAND chimaera_bdev_gpu_kernel_tests)
+endif()
 
 # Enable CTest integration if testing is enabled
 if(WRP_CORE_ENABLE_TESTS)

@@ -3,6 +3,9 @@ set -ex
 
 PRESET="${IOWARP_PRESET:-release}"
 
+# Clean any stale build directory (preset uses ${sourceDir}/build)
+rm -rf build
+
 # Suppress GCC false positive warnings from aggressive inlining
 export CXXFLAGS="${CXXFLAGS:-} -Wno-array-bounds -Wno-maybe-uninitialized -Wno-stringop-overflow"
 
