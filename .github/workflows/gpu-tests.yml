@@ -56,7 +56,7 @@ jobs:
     - name: Verify CUDA
       run: nvcc --version
 
-    # ── Install Miniconda + rattler-build ─────────────────────────────
+    # ── Install Miniconda + conda-build ──────────────────────────────
     - name: Install Miniconda
       uses: conda-incubator/setup-miniconda@v3
       with:
@@ -64,9 +64,9 @@ jobs:
         python-version: '3.12'
         activate-environment: iowarp
 
-    - name: Install rattler-build
+    - name: Install conda-build
       shell: bash -el {0}
-      run: conda install -y rattler-build -c conda-forge
+      run: conda install -y conda-build -c conda-forge
 
     # ── Build CUDA conda package via install.sh ──────────────────────
     - name: Build CUDA conda package
