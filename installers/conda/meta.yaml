@@ -10,7 +10,7 @@ source:
 
 build:
   number: 0
-  string: {{ preset }}_h{{ PKG_HASH }}
+  string: {{ preset.replace('-', '_') }}_h{{ PKG_HASH }}
   script_env:
     - IOWARP_PRESET
 

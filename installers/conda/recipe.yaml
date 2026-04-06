@@ -1,13 +1,10 @@
-# IOWarp Core - Conda Recipe (rattler-build format)
+# IOWarp Core - Conda Recipe (rattler-build format, DEPRECATED)
 #
-# This recipe supports two modes:
-#   1. Preset mode: Uses CMakePresets.json directly for reproducible binary builds
-#   2. Custom mode: Allows individual cmake flag overrides for source builds
+# NOTE: This project now uses conda-build (meta.yaml) instead of rattler-build.
+# This file is kept for reference only. The active recipe is meta.yaml.
 #
-# Usage:
-#   rattler-build build --recipe installers/conda/ --variant-config installers/conda/variants/release.yaml
-#   rattler-build build --recipe installers/conda/ --variant-config installers/conda/variants/cuda.yaml
-#   rattler-build build --recipe installers/conda/ --variant-config installers/conda/variants/custom.yaml
+# The CI workflow and install.sh both use conda-build:
+#   conda build installers/conda/ -c conda-forge --no-anaconda-upload
 
 context:
   version: "1.0.0"
