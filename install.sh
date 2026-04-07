@@ -195,9 +195,15 @@ mkdir -p "$OUTPUT_DIR"
 
 export IOWARP_PRESET="$PRESET"
 
+# Match the build Python version to the target environment so that
+# the built package's python pin is satisfiable at install time.
+TARGET_PYTHON="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+echo -e "${BLUE}Target Python version: $TARGET_PYTHON${NC}"
+
 if conda build "$RECIPE_DIR" \
     --output-folder "$OUTPUT_DIR" \
     -c conda-forge \
+    --python="$TARGET_PYTHON" \
     --no-anaconda-upload; then
     BUILD_SUCCESS=true
 else
@@ -223,9 +229,10 @@ if [ "$BUILD_SUCCESS" = true ]; then
     echo "  $PACKAGE_PATH"
     echo ""
 
-    # Install directly into current environment
+    # Install using local output directory as a channel so that conda
+    # resolves run dependencies (installing by file path skips dep resolution).
     echo -e "${BLUE}>>> Installing iowarp-core into current environment...${NC}"
-    if conda install -y -c conda-forge "$PACKAGE_PATH"; then
+    if conda install -y -c "$OUTPUT_DIR" -c conda-forge iowarp-core; then
         echo ""
         echo -e "${GREEN}======================================================================"
         echo -e "IOWarp Core installed successfully!"
