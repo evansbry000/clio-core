@@ -151,11 +151,19 @@ u32 AliquemDedicatedSched::RuntimeMapTask(Worker *worker,
     }
   }
 
+  // --- Phase 2.5: Epoch Decay Mechanism ---
+  // If the lowest deficit exceeds a threshold, halve all deficits
+  // to prevent overflow and allow historical recovery.
+  if (lowest_deficit > 1000000) {
+    for (int i = 0; i < 8; ++i) {
+      uint64_t current = worker_deficits_[i].load(std::memory_order_relaxed);
+      worker_deficits_[i].store(current >> 1, std::memory_order_relaxed);
+    }
+  }
+
   // Absolute fallback: use scheduler worker if no I/O workers
   if (selected == nullptr) {
-    if (!io_workers_.empty() && io_workers_[0] != nullptr) {
-      selected_idx = io_workers_[0]->GetId();
-    } else if (scheduler_worker_ != nullptr) {
+    if (scheduler_worker_ != nullptr) {
       return scheduler_worker_->GetId();
     } else {
       return 0;

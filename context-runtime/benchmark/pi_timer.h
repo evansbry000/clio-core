@@ -9,7 +9,7 @@ namespace chi {
  * Overhead: ~1-2 CPU cycles (single MRS instruction).
  *
  * Returns the virtual counter value in ticks (frequency depends on system).
- * On Raspberry Pi 4, typically 19.2 MHz (i.e., ~52 nanoseconds per tick).
+ * On Raspberry Pi 4, typically 54 MHz (i.e., ~18.5 nanoseconds per tick).
  */
 inline uint64_t get_cntvct_el0() {
   uint64_t tval;
