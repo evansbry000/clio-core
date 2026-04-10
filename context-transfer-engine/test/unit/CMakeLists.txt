@@ -799,6 +799,15 @@ set_tests_properties(
 add_test(NAME cte_reorganize_all
     COMMAND test_reorganize_blob)
 
+set_tests_properties(
+    cte_reorganize_all
+    PROPERTIES
+        TIMEOUT 300  # 5 minute timeout
+        LABELS "unit;reorganize;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+)
+
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
 # GPU coroutine subtask tests (gpu2gpu dispatch + coroutine suspend/resume)
 add_test(NAME cte_gpu_coroutine
     COMMAND test_cte_gpu_coroutine)
@@ -811,14 +820,6 @@ add_test(NAME cte_gpu_core_all
 # GPU create tests - AsyncCreate from GPU kernel
 add_test(NAME cte_gpu_create
     COMMAND test_gpu_create)
-
-set_tests_properties(
-    cte_reorganize_all
-    PROPERTIES
-        TIMEOUT 300  # 5 minute timeout
-        LABELS "unit;reorganize;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-)
 
 set_tests_properties(
     cte_gpu_coroutine
@@ -843,6 +844,7 @@ set_tests_properties(
         LABELS "gpu;cte;create;msan_skip"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
+endif()  # WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM
 
 # Mark all CTE tests as msan_skip (they use ZMQ via chimaera runtime which is uninstrumented)
 set_tests_properties(
@@ -932,11 +934,16 @@ set_tests_properties(
     cte_runtime_stat_targets
     cte_tiered_storage_all
     cte_reorganize_all
+    PROPERTIES LABELS "msan_skip"
+)
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
+set_tests_properties(
     cte_gpu_coroutine
     cte_gpu_core_all
     cte_gpu_create
     PROPERTIES LABELS "msan_skip"
 )
+endif()
 
 # Tests that start a full Chimaera runtime share /tmp/chimaera_iowarp SHM
 # segments and TCP/IPC ports, so they must NOT run in parallel.
@@ -953,11 +960,16 @@ set_tests_properties(
     cte_functional_all
     cte_tiered_storage_all
     cte_reorganize_all
+    PROPERTIES RESOURCE_LOCK "chimaera_runtime"
+)
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
+set_tests_properties(
     cte_gpu_coroutine
     cte_gpu_core_all
     cte_gpu_create
     PROPERTIES RESOURCE_LOCK "chimaera_runtime"
 )
+endif()
 
 # All cte_functional_* tests run test_core_functionality (9 test cases, each
 # initializing and finalizing the full chimaera runtime).  After multiple
