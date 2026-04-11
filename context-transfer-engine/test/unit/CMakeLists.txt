@@ -154,39 +154,39 @@ endif()  # WRP_CORE_ENABLE_CUDA (GPU test executables)
 
 # Include directories for all tests - using unified simple_test.h framework
 target_include_directories(cte_core_unit_tests PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_core_functionality PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_query PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_cte_config_dpe PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_tag_operations PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_core_client_config PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_core_runtime_coverage PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_tiered_storage_stress PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_reorganize_blob PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 if(WRP_CORE_ENABLE_CUDA)
@@ -196,11 +196,11 @@ target_include_directories(test_cte_gpu_coroutine PRIVATE
 )
 
 target_include_directories(test_gpu_core PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_gpu_create PRIVATE
-  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+
 )
 
 target_include_directories(test_gpu_tiered PRIVATE

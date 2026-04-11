@@ -151,7 +151,7 @@ option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
 # External Examples and Applications
 #------------------------------------------------------------------------------
 option(WRP_CORE_ENABLE_GRAY_SCOTT "Enable Gray-Scott ADIOS2 example (requires ADIOS2)" OFF)
-option(WRP_CORE_ENABLE_LLAMA "Enable llama.cpp LLM inference integration (iowarp-llm)" OFF)
+option(WRP_CORE_ENABLE_LLAMA "Enable llama.cpp LLM inference integration (llm-hooks)" OFF)
 option(WRP_CORE_ENABLE_LLAMA_SERVER "Add external/llama.cpp to the build (requires WRP_CORE_ENABLE_LLAMA=ON)" OFF)
 
 #==============================================================================
@@ -809,6 +809,9 @@ else()
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
 endif()
 
+# Global include path for simple_test.h test framework
+include_directories(${CMAKE_SOURCE_DIR}/context-runtime/test)
+
 # When building for Python wheels on x86_64, restrict to baseline x86_64 ISA
 # so the wheel runs on any x86_64 CPU. AlmaLinux 9 (manylinux_2_34) defaults
 # to x86_64_v2 (SSE4.2/POPCNT) which auditwheel rejects for x86_64 wheels.
@@ -1034,8 +1037,8 @@ if(WRP_CORE_ENABLE_LLAMA)
     if(NOT WRP_CORE_ENABLE_CTE)
         message(FATAL_ERROR "WRP_CORE_ENABLE_LLAMA requires WRP_CORE_ENABLE_CTE=ON")
     endif()
-    message(STATUS "Building iowarp-llm KV cache + weight offload libraries")
-    add_subdirectory(iowarp-llm)
+    message(STATUS "Building llm-hooks KV cache + weight offload libraries")
+    add_subdirectory(context-transfer-engine/llm-hooks)
 
     # llama.cpp full integration: add the llama.cpp subdirectory so that the
     # server patches and ggml backend are available for linking.
@@ -1059,18 +1062,18 @@ if(WRP_CORE_ENABLE_LLAMA)
 
         # Patch llama.cpp targets with IOWarp KV-cache definitions NOW — after
         # add_subdirectory(external/llama.cpp) so that server-context and llama
-        # targets actually exist.  The if(TARGET ...) guards in iowarp-llm/
+        # targets actually exist.  The if(TARGET ...) guards in llm-hooks/
         # CMakeLists.txt run before this point (ordering issue), so we do the
         # patching here instead.
         if(TARGET server-context)
             target_compile_definitions(server-context PRIVATE IOWARP_LLM_KVCACHE)
             target_link_libraries(server-context PRIVATE wrp_llm_kvcache)
-            message(STATUS "iowarp-llm: patched server-context with IOWARP_LLM_KVCACHE")
+            message(STATUS "llm-hooks: patched server-context with IOWARP_LLM_KVCACHE")
         endif()
         if(TARGET llama)
             target_compile_definitions(llama PRIVATE IOWARP_LLM_KVCACHE)
             target_link_libraries(llama PRIVATE wrp_llm_kvcache)
-            message(STATUS "iowarp-llm: patched llama with IOWARP_LLM_KVCACHE")
+            message(STATUS "llm-hooks: patched llama with IOWARP_LLM_KVCACHE")
         endif()
 
         # IOWarp weight offloading via GpuVmm — requires CUDA and wrp_llm_weights.
@@ -1080,19 +1083,19 @@ if(WRP_CORE_ENABLE_LLAMA)
             if(TARGET server-context)
                 target_compile_definitions(server-context PRIVATE IOWARP_LLM_WEIGHTS)
                 target_link_libraries(server-context PRIVATE wrp_llm_weights)
-                message(STATUS "iowarp-llm: patched server-context with IOWARP_LLM_WEIGHTS")
+                message(STATUS "llm-hooks: patched server-context with IOWARP_LLM_WEIGHTS")
             endif()
             if(TARGET llama)
                 target_compile_definitions(llama PRIVATE IOWARP_LLM_WEIGHTS)
                 target_link_libraries(llama PRIVATE wrp_llm_weights)
-                message(STATUS "iowarp-llm: patched llama with IOWARP_LLM_WEIGHTS")
+                message(STATUS "llm-hooks: patched llama with IOWARP_LLM_WEIGHTS")
             endif()
         endif()
     else()
         message(STATUS "llama.cpp server integration skipped (set WRP_CORE_ENABLE_LLAMA_SERVER=ON)")
     endif()
 else()
-    message(STATUS "iowarp-llm disabled (set WRP_CORE_ENABLE_LLAMA=ON to enable)")
+    message(STATUS "llm-hooks disabled (set WRP_CORE_ENABLE_LLAMA=ON to enable)")
 endif()
 
 #------------------------------------------------------------------------------
