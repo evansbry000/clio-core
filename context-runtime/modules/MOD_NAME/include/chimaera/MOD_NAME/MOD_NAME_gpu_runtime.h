@@ -39,12 +39,10 @@ class GpuRuntime : public chi::gpu::Container {
       chi::gpu::RunContext &rctx);
 
   HSHM_GPU_FUN void GpuSubmit(hipc::FullPtr<GpuSubmitTask> task,
-                                chi::gpu::RunContext &rctx) {
+                               chi::gpu::RunContext &rctx) {
     task->result_value_ = (task->test_value_ * 3) + task->gpu_id_;
 #if !HSHM_IS_HOST
-    if (task->counter_addr_) {
-      atomicAdd(reinterpret_cast<unsigned int*>(task->counter_addr_), 1u);
-    }
+    atomicAdd(&task->counter_value_, 1u);
 #endif
   }
 
