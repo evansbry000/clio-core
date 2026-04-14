@@ -40,12 +40,20 @@ static void EnsureInit() {
                           "test_transparent_compress_config.yaml";
   setenv("CHI_SERVER_CONF", config_path.c_str(), 1);
 
-  bool success = wrp_cte::core::WRP_CTE_CLIENT_INIT();
+  // Start as server — compose will create all pools (compressor at 512.0,
+  // CTE core at 513.0, bdev at 301.0).
+  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer);
   REQUIRE(success);
   g_initialized = true;
+  SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
 
   // Wait for compose pools to initialize
-  std::this_thread::sleep_for(500ms);
+  std::this_thread::sleep_for(1s);
+
+  // Point the global CTE client at the entrypoint pool (512.0 = compressor).
+  // Don't call WRP_CTE_CLIENT_INIT — compose already created everything.
+  auto *cte_client = WRP_CTE_CLIENT;
+  cte_client->Init(wrp_cte::core::kCtePoolId);
 }
 
 TEST_CASE("Transparent PutBlob through compressor",
@@ -124,12 +132,4 @@ TEST_CASE("Transparent GetBlob through compressor",
   INFO("GetBlob returned correct data - round-trip verified");
 }
 
-int main(int argc, char *argv[]) {
-  std::string filter = "";
-  if (argc > 1) filter = argv[1];
-  int result = SimpleTest::run_all_tests(filter);
-  if (g_initialized) {
-    chi::CHIMAERA_FINALIZE();
-  }
-  return result;
-}
+SIMPLE_TEST_MAIN()
