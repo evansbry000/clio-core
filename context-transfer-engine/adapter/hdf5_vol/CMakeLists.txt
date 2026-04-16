@@ -22,6 +22,14 @@ if(NOT HAS_H5VL_CONNECTOR)
   return()
 endif()
 
+# Require HDF5 >= 2.0 for H5Pget_vol and updated VOL struct layouts
+if(HDF5_VERSION VERSION_LESS "2.0.0")
+  message(WARNING "HDF5 ${HDF5_VERSION} found but >= 2.0.0 required for VOL connector. "
+                  "HDF5 VOL adapter will not be built. "
+                  "Install HDF5 2.x: sudo apt install libhdf5-dev (Ubuntu 24.04+)")
+  return()
+endif()
+
 message(STATUS "Building HDF5 VOL adapter (iowarp_hdf5_vol)")
 
 add_library(iowarp_hdf5_vol SHARED
