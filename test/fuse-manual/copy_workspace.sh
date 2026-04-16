@@ -34,17 +34,39 @@ fi
 info "Copying /workspace into $MOUNT_POINT/workspace/ ..."
 info "  (excluding build dirs, .git, caches)"
 
-rsync -a --info=progress2 \
-    --exclude='build*' \
-    --exclude='.git' \
-    --exclude='.ppi-jarvis' \
-    --exclude='.jarvis-private' \
-    --exclude='.jarvis-shared' \
-    --exclude='.ssh-host' \
-    --exclude='__pycache__' \
-    --exclude='node_modules' \
-    --exclude='.cache' \
-    /workspace/ "$MOUNT_POINT/workspace/"
+EXCLUDES="build|build_debug|build_release|build_socket|\.git|\.ppi-jarvis|\.jarvis-private|\.jarvis-shared|\.ssh-host|__pycache__|node_modules|\.cache"
+
+if command -v rsync &>/dev/null; then
+    rsync -a --info=progress2 \
+        --exclude='build*' \
+        --exclude='.git' \
+        --exclude='.ppi-jarvis' \
+        --exclude='.jarvis-private' \
+        --exclude='.jarvis-shared' \
+        --exclude='.ssh-host' \
+        --exclude='__pycache__' \
+        --exclude='node_modules' \
+        --exclude='.cache' \
+        /workspace/ "$MOUNT_POINT/workspace/"
+else
+    info "rsync not found, using find+cp (slower)..."
+    cd /workspace
+    find . -not -path "./.git/*" \
+           -not -path "./build*" \
+           -not -path "./.ppi-jarvis/*" \
+           -not -path "./.jarvis-private/*" \
+           -not -path "./.jarvis-shared/*" \
+           -not -path "./.ssh-host/*" \
+           -not -path "./__pycache__/*" \
+           -not -path "./.cache/*" \
+           -not -name "*.o" \
+           -type f | while IFS= read -r f; do
+        dir="$MOUNT_POINT/workspace/$(dirname "$f")"
+        mkdir -p "$dir" 2>/dev/null || true
+        cp "$f" "$dir/" 2>/dev/null || true
+    done
+    cd - >/dev/null
+fi
 
 ok "Copy complete"
 
