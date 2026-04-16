@@ -1,32 +1,16 @@
 # ------------------------------------------------------------------------------
 # IOWarp HDF5 VOL Connector
+# Requires: WRP_CTE_ENABLE_HDF5_VOL=ON and HDF5 >= 2.0
 # ------------------------------------------------------------------------------
-cmake_minimum_required(VERSION 3.10)
 
-# Require HDF5 >= 1.12 for VOL connector support (H5VLconnector.h)
 if(NOT HDF5_FOUND)
-  find_package(HDF5 COMPONENTS C QUIET)
-  if(NOT HDF5_FOUND)
-    message(WARNING "HDF5 not found. HDF5 VOL adapter will not be built.")
-    return()
-  endif()
-endif()
-
-# Check for H5VLconnector.h (only in HDF5 >= 1.12)
-include(CheckIncludeFile)
-set(CMAKE_REQUIRED_INCLUDES ${HDF5_INCLUDE_DIRS} ${HDF5_C_INCLUDE_DIRS})
-check_include_file("H5VLconnector.h" HAS_H5VL_CONNECTOR)
-if(NOT HAS_H5VL_CONNECTOR)
-  message(WARNING "HDF5 VOL connector API not found (requires HDF5 >= 1.12). "
-                  "HDF5 VOL adapter will not be built.")
+  message(WARNING "HDF5 not found. HDF5 VOL adapter will not be built.")
   return()
 endif()
 
-# Require HDF5 >= 2.0 for H5Pget_vol and updated VOL struct layouts
 if(HDF5_VERSION VERSION_LESS "2.0.0")
   message(WARNING "HDF5 ${HDF5_VERSION} found but >= 2.0.0 required for VOL connector. "
-                  "HDF5 VOL adapter will not be built. "
-                  "Install HDF5 2.x: sudo apt install libhdf5-dev (Ubuntu 24.04+)")
+                  "HDF5 VOL adapter will not be built.")
   return()
 endif()
 

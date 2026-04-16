@@ -64,7 +64,7 @@ if (WRP_CTE_ENABLE_FUSE_ADAPTER)
 endif()
 
 # HDF5 VOL connector (requires HDF5 >= 2.0, does not require ELF)
-if (WRP_CORE_ENABLE_HDF5)
+if (WRP_CTE_ENABLE_HDF5_VOL)
     add_subdirectory(hdf5_vol)
 endif()
 

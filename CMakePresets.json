@@ -261,7 +261,7 @@
                 "WRP_CORE_ENABLE_PYTHON": "ON",
                 "WRP_CORE_ENABLE_ZMQ": "ON",
                 "WRP_CORE_ENABLE_CEREAL": "ON",
-                "WRP_CORE_ENABLE_HDF5": "ON",
+                "WRP_CTE_ENABLE_HDF5_VOL": "ON",
                 "WRP_CORE_ENABLE_MPI": "ON",
                 "HSHM_LOG_LEVEL": "1",
                 "WRP_CORE_ENABLE_IO_URING": "ON"
@@ -270,7 +270,7 @@
         {
             "name": "release-adapter",
             "displayName": "Release + Adapters (ADIOS2, HDF5 VOL, FUSE)",
-            "description": "Release build with ADIOS2, HDF5 VOL, and FUSE3 adapters enabled. HDF5 VOL connector is built automatically when HDF5 is present (WRP_CORE_ENABLE_HDF5=ON). Requires HDF5 >= 1.12 and libfuse3-dev on the build host.",
+            "description": "Release build with ADIOS2, HDF5 VOL, and FUSE3 adapters enabled. HDF5 VOL connector enabled via WRP_CTE_ENABLE_HDF5_VOL=ON. Requires HDF5 >= 1.12 and libfuse3-dev on the build host.",
             "generator": "Unix Makefiles",
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
@@ -286,7 +286,7 @@
                 "WRP_CORE_ENABLE_ELF": "OFF",
                 "WRP_CORE_ENABLE_ZMQ": "ON",
                 "WRP_CORE_ENABLE_CEREAL": "ON",
-                "WRP_CORE_ENABLE_HDF5": "ON",
+                "WRP_CTE_ENABLE_HDF5_VOL": "ON",
                 "WRP_CORE_ENABLE_MPI": "ON",
                 "WRP_CORE_ENABLE_IO_URING": "ON",
                 "WRP_CORE_ENABLE_RPATH": "ON",
@@ -318,7 +318,7 @@
                 "WRP_CORE_ENABLE_ZMQ": "ON",
                 "WRP_CORE_ENABLE_CEREAL": "ON",
                 "WRP_CORE_ENABLE_MPI": "OFF",
-                "WRP_CORE_ENABLE_HDF5": "OFF",
+                "WRP_CTE_ENABLE_HDF5_VOL": "OFF",
                 "WRP_CORE_ENABLE_ELF": "OFF",
                 "WRP_CTE_ENABLE_COMPRESS": "OFF",
                 "WRP_CORE_ENABLE_ENCRYPT": "OFF",
@@ -352,7 +352,7 @@
                 "WRP_CORE_ENABLE_CONDA": "OFF",
                 "WRP_CORE_ENABLE_ELF": "OFF",
                 "WRP_CORE_ENABLE_RPATH": "OFF",
-                "WRP_CORE_ENABLE_HDF5": "OFF",
+                "WRP_CTE_ENABLE_HDF5_VOL": "OFF",
                 "WRP_CORE_ENABLE_BENCHMARKS": "OFF",
                 "HSHM_LOG_LEVEL": "1"
             },
