@@ -85,7 +85,8 @@ RUN cd /tmp \
        -DCPPZMQ_BUILD_TESTS=OFF \
     && cmake --install cppzmq-build && rm -rf /tmp/cppzmq-*
 
-# HDF5 2.1.1 (Ubuntu 24.04 apt only has 1.10)
+# HDF5 2.1.1 (Ubuntu 24.04 apt only has 1.10). The iowarp_hdf5_vol adapter
+# must match this version; see context-transfer-engine/adapter/hdf5_vol/.
 RUN cd /tmp \
     && wget -q https://github.com/HDFGroup/hdf5/releases/download/2.1.1/hdf5-2.1.1.tar.gz \
     && tar xzf hdf5-2.1.1.tar.gz && cd hdf5-2.1.1 \
@@ -156,7 +157,11 @@ def iowarp_clone_and_build(branch: str, preset: str) -> str:
     """
     return rf"""
 # Clone and build IOWarp ({branch} @ preset: {preset})
-RUN git clone --recurse-submodules --depth 1 --branch {branch} \
+# Submodules are NOT recursed at clone time: external/jarvis-cd pulls its own
+# `awesome-scienctific-applications` submodule via an SSH URL that fails in
+# containers, and the core build does not need it. We init only the HTTPS
+# submodules that the build actually touches.
+RUN git clone --depth 1 --branch {branch} \
     https://github.com/iowarp/clio-core.git /opt/iowarp
 
 WORKDIR /opt/iowarp
